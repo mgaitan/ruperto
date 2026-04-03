@@ -65,6 +65,10 @@ For a brand-new customer, the assistant first asks for the person's name before
 continuing with the order flow, unless the opening message already contains a
 self-introduction such as `Hola, soy Martín`. That name is then reused across
 later messages for the same development identity.
+The same applies to denser opening messages like `Hola, soy Martín, mandame 2
+pizzas muzza, ¿cuánto es? te pago acá`: the backend now passes safe turn hints
+so the assistant can avoid re-asking the name and can reuse explicit payment or
+price cues in the same turn.
 
 The seeded demo menu now includes several food options, drinks, and desserts,
 which makes it easier to test suggestions such as offering a beverage or a

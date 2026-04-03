@@ -39,12 +39,16 @@ Reglas operativas:
 - Para cualquier dato del negocio tenés que usar herramientas.
 - Hace una sola pregunta por vez cuando falten datos.
 - Si no conocés el nombre del cliente, pedilo al comienzo antes de avanzar con el pedido.
+- Si el cliente manda varias definiciones en un solo mensaje, resolvé en ese mismo turno
+  todo lo explícito que puedas: nombre, items, cantidades, precio consultado y preferencia de pago.
 - Prioriza cerrar el pedido con la menor fricción posible.
 - Si el cliente ya es conocido y hay una memoria útil, podés mencionarla con naturalidad.
 - Si preguntan por demora o tiempo estimado, usá la herramienta de demora disponible.
 - Si el local está cerrado, podés seguir ayudando pero avisá claramente cuándo vuelve a abrir.
 - Si el cliente ya eligió una comida y todavía no sumó bebida ni postre,
   podés sugerir una opción de bebida o postre de forma breve y natural.
+- Si el cliente ya expresó una preferencia de pago en el mensaje actual, no la repreguntes.
+- Si el cliente pregunta cuánto sale, incluí el total o subtotal actual cuando ya lo puedas calcular.
 - Si el cliente pide algo fuera del alcance del bot, deriva a una persona.
 """.strip()
 
@@ -93,6 +97,7 @@ class AssistantDeps:
     session_factory: async_sessionmaker[AsyncSession]
     customer_id: int
     conversation_id: int
+    turn_context_hint: str | None = None
 
 
 async def with_repository[RepositoryResult](
@@ -127,7 +132,7 @@ ordering_agent = cast(
 async def business_context(ctx: RunContext[AssistantDeps]) -> str:
     """Provide dynamic business context to the model."""
     store = await with_repository(ctx, lambda repository: repository.get_store_profile())
-    return (
+    context = (
         f"Atendes {store.store_name}. "
         f"Bot: {store.bot_name}. "
         f"Ubicacion: {store.store_location or 'No especificada'}. "
@@ -135,6 +140,9 @@ async def business_context(ctx: RunContext[AssistantDeps]) -> str:
         f"Personalidad deseada: {store.assistant_personality}. "
         f"Idioma de interfaz: {store.locale}."
     )
+    if ctx.deps.turn_context_hint is None:
+        return context
+    return f"{context} Contexto del turno: {ctx.deps.turn_context_hint}"
 
 
 @ordering_agent.tool
@@ -350,6 +358,10 @@ class OrderingAssistantService:
                 session_factory=self.session_factory,
                 customer_id=customer.id,
                 conversation_id=conversation.id,
+                turn_context_hint=self._build_turn_context_hint(
+                    customer=customer,
+                    message_text=message_text,
+                ),
             )
 
             direct_reply = await self._maybe_handle_missing_customer_name(
@@ -587,6 +599,100 @@ class OrderingAssistantService:
         if not candidate_tokens:
             return None
         return candidate_tokens[0].title()
+
+    def _build_turn_context_hint(
+        self,
+        *,
+        customer: CustomerSnapshot,
+        message_text: str,
+    ) -> str | None:
+        """Build safe guidance for dense first-turn customer messages."""
+        hints: list[str] = []
+        introduced_name = self._extract_name_from_introduction(message_text)
+        if customer.name is not None and introduced_name == customer.name:
+            hints.append(
+                f"El cliente ya se presentó en este mensaje como {customer.name}. No vuelvas a pedirle el nombre."
+            )
+
+        payment_hint = self._detect_payment_method_hint(message_text)
+        if payment_hint is PaymentMethod.CASH:
+            hints.append(
+                "El cliente expresó intención de pagar en efectivo al recibir o retirar. "
+                "Si el pedido ya está suficientemente definido, podés registrar esa forma de pago."
+            )
+        elif payment_hint is PaymentMethod.TRANSFER:
+            hints.append(
+                "El cliente expresó intención de pagar por transferencia. "
+                "Si el pedido ya está suficientemente definido, podés registrar esa forma de pago."
+            )
+        elif payment_hint is PaymentMethod.CARD_LINK:
+            hints.append(
+                "El cliente pidió pagar con link o tarjeta. "
+                "Si el pedido ya está suficientemente definido, podés registrar esa forma de pago."
+            )
+
+        if self._message_requests_total(message_text):
+            hints.append(
+                "El cliente quiere saber cuánto sale en este mismo turno. "
+                "Si ya podés calcularlo con herramientas, informá el total o subtotal actual."
+            )
+
+        if not hints:
+            return None
+        return " ".join(hints)
+
+    def _detect_payment_method_hint(self, message_text: str) -> PaymentMethod | None:
+        """Infer payment intent from common Argentine customer phrasing."""
+        lowered = message_text.casefold()
+        if any(
+            phrase in lowered
+            for phrase in ("transferencia", "transferir", "te transfiero", "te hago una transferencia")
+        ):
+            return PaymentMethod.TRANSFER
+        if any(
+            phrase in lowered
+            for phrase in (
+                "link de pago",
+                "link",
+                "tarjeta",
+                "mercado pago",
+                "mp",
+            )
+        ):
+            return PaymentMethod.CARD_LINK
+        if any(
+            phrase in lowered
+            for phrase in (
+                "efectivo",
+                "pago acá",
+                "te pago acá",
+                "pago aca",
+                "te pago aca",
+                "al recibir",
+                "cuando llegue",
+                "cuando llegues",
+                "al retirar",
+            )
+        ):
+            return PaymentMethod.CASH
+        return None
+
+    def _message_requests_total(self, message_text: str) -> bool:
+        """Return whether the user explicitly asked for the order amount."""
+        lowered = message_text.casefold()
+        return any(
+            phrase in lowered
+            for phrase in (
+                "cuánto es",
+                "cuanto es",
+                "cuánto sale",
+                "cuanto sale",
+                "cuánto sería",
+                "cuanto seria",
+                "precio",
+                "total",
+            )
+        )
 
     def _build_name_prompt(self, *, conversation_id: int) -> str:
         """Build the first-contact greeting asking for the customer's name."""
