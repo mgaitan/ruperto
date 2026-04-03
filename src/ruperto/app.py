@@ -60,6 +60,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "environment": runtime.settings.environment,
             "store_name": runtime.settings.store_name,
             "bot_name": runtime.settings.bot_name,
+            "store_locale": runtime.settings.store_locale,
         }
 
     @app.get("/healthz")

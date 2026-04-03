@@ -14,6 +14,7 @@ The current MVP direction is a transactional assistant focused on:
 
 - customer identification by channel identity, starting with phone number,
 - menu and order guidance,
+- Spanish (Argentina)-first customer and staff interactions,
 - future-ready channel adapters, beginning with WhatsApp via Kapso,
 - a small admin surface for active orders, customers, menu, and store settings.
 

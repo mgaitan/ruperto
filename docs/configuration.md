@@ -32,8 +32,13 @@ RUPERTO_STORE_DESCRIPTION
 RUPERTO_ASSISTANT_PERSONALITY
   Short description of the assistant tone and behavior.
 
+RUPERTO_STORE_LOCALE
+  Primary locale used by the business-facing configuration and the assistant.
+  The current default is `es-AR`, which is the main language for customer and
+  staff interactions in the MVP.
+
 RUPERTO_GEMINI_MODEL
-  Google Gemini model name reserved for the future PydanticAI integration.
+  Google Gemini model name used by the PydanticAI ordering assistant.
   The initial value is `gemini-2.5-flash`.
 
 RUPERTO_GEMINI_API_KEY

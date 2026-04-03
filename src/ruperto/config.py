@@ -27,11 +27,12 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///./ruperto.db"
     auto_init_db: bool = True
 
-    store_name: str = "Demo Rotiseria"
+    store_name: str = "Demo Rotisería"
     bot_name: str = "Ruperto"
     store_location: str | None = None
-    store_description: str = "Conversational ordering assistant for food businesses."
-    assistant_personality: str = "Warm, concise, and reliable."
+    store_description: str = "Rotisería de barrio con pedidos asistidos por chat."
+    assistant_personality: str = "Amable, ágil y confiable."
+    store_locale: str = "es-AR"
 
     gemini_model: str = "gemini-2.5-flash"
     gemini_api_key: SecretStr | None = None
@@ -49,6 +50,7 @@ class Settings(BaseSettings):
             "store_location": self.store_location,
             "store_description": self.store_description,
             "assistant_personality": self.assistant_personality,
+            "store_locale": self.store_locale,
             "gemini_model": self.gemini_model,
             "gemini_api_key_configured": self.gemini_api_key is not None,
             "kapso_api_key_configured": self.kapso_api_key is not None,

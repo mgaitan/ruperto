@@ -71,4 +71,6 @@ Description: A minimalist configurable agent
 
 - The public language is English: all committable text and Github interactions must be in simple English (including documentation, comments, docstrings, commit messages, PR descriptions, etc.).
 - However, when interacting with the developer in chat, respond in the language they use.
+- Use UTF-8 text by default. Do not strip accents or replace valid Spanish text with ASCII fallbacks in user-facing copy, chat replies, labels, docs, or comments unless there is a real technical constraint explicitly confirmed for that context.
+- For Spanish text visible to humans, write correct Spanish with accents and punctuation. Example: write `no está disponible`, never `no esta disponible`.
 - Avoid sexist or exclusionary language. Always prefer gender-neutral phrasing.

@@ -1,39 +1,15 @@
-"""Database bootstrap helpers for the first service milestone."""
+"""Database bootstrap helpers for the ordering MVP."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
 
-from sqlalchemy import String, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from ruperto.bootstrap import DEMO_MENU_ITEMS
 from ruperto.config import Settings
-
-
-def utc_now() -> datetime:
-    """Return a timezone-aware UTC timestamp."""
-    return datetime.now(tz=UTC)
-
-
-class Base(DeclarativeBase):
-    """Shared declarative base for ORM models."""
-
-
-class StoreProfile(Base):
-    """Persist the minimal store metadata required by the assistant."""
-
-    __tablename__ = "store_profile"
-
-    id: Mapped[int] = mapped_column(primary_key=True, default=1)
-    store_name: Mapped[str] = mapped_column(String(length=120))
-    bot_name: Mapped[str] = mapped_column(String(length=120))
-    store_location: Mapped[str | None] = mapped_column(String(length=255), nullable=True)
-    store_description: Mapped[str] = mapped_column(String(length=500))
-    assistant_personality: Mapped[str] = mapped_column(String(length=255))
-    created_at: Mapped[datetime] = mapped_column(default=utc_now)
-    updated_at: Mapped[datetime] = mapped_column(default=utc_now, onupdate=utc_now)
+from ruperto.models import Base, MenuItem, StoreProfile
 
 
 @dataclass(slots=True)
@@ -47,7 +23,7 @@ class DatabaseRuntime:
 def create_database_runtime(settings: Settings) -> DatabaseRuntime:
     """Create the async engine and session factory for the configured database."""
     engine = create_async_engine(settings.database_url)
-    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
     return DatabaseRuntime(engine=engine, session_factory=session_factory)
 
 
@@ -74,9 +50,25 @@ async def init_database(*, settings: Settings, runtime: DatabaseRuntime | None =
                     store_location=settings.store_location,
                     store_description=settings.store_description,
                     assistant_personality=settings.assistant_personality,
+                    locale=settings.store_locale,
                 )
             )
-            await session.commit()
+        menu_count = await session.scalar(select(func.count(MenuItem.id)))
+        if menu_count == 0:
+            session.add_all(
+                [
+                    MenuItem(
+                        sku=item.sku,
+                        name=item.name,
+                        description=item.description,
+                        category=item.category,
+                        price_cents=item.price_cents,
+                        image_url=item.image_url,
+                    )
+                    for item in DEMO_MENU_ITEMS
+                ]
+            )
+        await session.commit()
     return active_runtime
 
 

@@ -19,9 +19,9 @@ def build_settings(tmp_path: Path, *, auto_init_db: bool = True) -> Settings:
         environment="test",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'app.db'}",
         auto_init_db=auto_init_db,
-        store_name="Test Rotiseria",
+        store_name="Test Rotisería",
         bot_name="Test Bot",
-        store_location="Cordoba",
+        store_location="Córdoba",
     )
 
 
@@ -32,8 +32,9 @@ def test_root_endpoint(tmp_path: Path):
         response = client.get("/")
 
     assert response.status_code == HTTP_OK
-    assert response.json()["store_name"] == "Test Rotiseria"
+    assert response.json()["store_name"] == "Test Rotisería"
     assert response.json()["bot_name"] == "Test Bot"
+    assert response.json()["store_locale"] == "es-AR"
 
 
 def test_healthcheck_initializes_database(tmp_path: Path):

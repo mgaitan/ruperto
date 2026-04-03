@@ -27,6 +27,9 @@ You can inspect the effective non-secret settings with:
 uv run ruperto show-settings
 ```
 
+The bootstrap profile defaults to an `es-AR` locale so the MVP can keep
+customer and staff-facing interactions in Spanish (Argentina) from the start.
+
 ## 3. Run the API locally
 
 ```bash
