@@ -47,10 +47,13 @@ Reglas operativas:
 - Si el cliente pide algo fuera del alcance del bot, deriva a una persona.
 """.strip()
 
-NAME_PROMPT_TEXT = "👋 Antes de seguir con el pedido, ¿me decís tu nombre?"
 NAME_CONFIRMATION_TEMPLATE = "¡Gracias, {name}! 😄 ¿Qué querés pedir hoy?"
 MAX_NAME_WORDS = 3
 CLOSED_STORE_PREFIX = "{message_text} "
+NAME_PROMPT_VARIANTS = (
+    "👋 Hola, soy {bot_name}, el asistente de pedidos de {store_name}. Antes de seguir, ¿me decís tu nombre?",
+    "🍽️ Hola, te habla {bot_name}, el asistente de pedidos de {store_name}. Para arrancar, ¿cómo te llamás?",
+)
 
 
 @dataclass(slots=True)
@@ -415,7 +418,10 @@ class OrderingAssistantService:
             )
 
         reply = AssistantReply(
-            reply_text=self._decorate_closed_store_text(NAME_PROMPT_TEXT, availability),
+            reply_text=self._decorate_closed_store_text(
+                self._build_name_prompt(conversation_id=conversation_id),
+                availability,
+            ),
             next_step=AssistantNextStep.ASK_NAME,
             handoff=False,
         )
@@ -494,6 +500,14 @@ class OrderingAssistantService:
         if any(term in lowered for term in blocked_terms):
             return None
         return cleaned.title()
+
+    def _build_name_prompt(self, *, conversation_id: int) -> str:
+        """Build the first-contact greeting asking for the customer's name."""
+        template = NAME_PROMPT_VARIANTS[conversation_id % len(NAME_PROMPT_VARIANTS)]
+        return template.format(
+            bot_name=self.settings.bot_name,
+            store_name=self.settings.store_name,
+        )
 
     def _decorate_reply_with_store_availability(
         self,

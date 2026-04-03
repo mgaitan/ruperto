@@ -319,7 +319,11 @@ async def test_assistant_asks_for_name_before_taking_the_first_order(tmp_path: P
     )
 
     assert first_reply.reply.next_step == AssistantNextStep.ASK_NAME
-    assert "tu nombre" in first_reply.reply.reply_text.lower()
+    assert "Ruperto Test" in first_reply.reply.reply_text
+    assert "Rotisería Test" in first_reply.reply.reply_text
+    assert (
+        "tu nombre" in first_reply.reply.reply_text.lower() or "cómo te llamás" in first_reply.reply.reply_text.lower()
+    )
     assert second_reply.customer.name == "Martina"
     assert second_reply.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
     assert "¿Qué querés pedir hoy?" in second_reply.reply.reply_text
@@ -376,6 +380,8 @@ async def test_name_candidate_heuristics_cover_edge_cases(tmp_path: Path):
         service._extract_latest_assistant_text([ModelRequest(parts=[ToolReturnPart(tool_name="x", content={})])])
         is None
     )
+    assert "Ruperto Test" in service._build_name_prompt(conversation_id=1)
+    assert "Rotisería Test" in service._build_name_prompt(conversation_id=1)
 
     await runtime.engine.dispose()
 
