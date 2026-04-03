@@ -40,11 +40,24 @@ Then open:
 
 - `http://127.0.0.1:8000/`
 - `http://127.0.0.1:8000/healthz`
+- `http://127.0.0.1:8000/api/store-profile`
+- `http://127.0.0.1:8000/api/menu-items`
+- `http://127.0.0.1:8000/api/customers`
+- `http://127.0.0.1:8000/api/orders`
 
 When invoking modules directly from source, set {term}`PYTHONPATH` so imports resolve cleanly:
 
 ```bash
 PYTHONPATH=src uv run -m ruperto --help
+```
+
+To simulate a customer conversation without WhatsApp, post to the development
+channel endpoint:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/dev/messages \
+  -H 'content-type: application/json' \
+  -d '{"external_user_id":"cliente-demo","message_text":"Hola, quiero pedir"}'
 ```
 
 ## 4. Run quality checks

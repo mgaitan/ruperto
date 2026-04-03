@@ -37,6 +37,9 @@ You should then have:
 
 - API root at `http://127.0.0.1:8000/`
 - health check at `http://127.0.0.1:8000/healthz`
+- store profile at `http://127.0.0.1:8000/api/store-profile`
+- menu listing at `http://127.0.0.1:8000/api/menu-items`
+- development chat endpoint at `http://127.0.0.1:8000/api/dev/messages`
 
 ## Development
 
