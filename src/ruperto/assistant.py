@@ -83,6 +83,45 @@ INTRO_NAME_STOP_WORDS = {
     "aca",
     "pago",
 }
+ORDER_INTENT_HINTS = (
+    "quiero",
+    "quisiera",
+    "mandame",
+    "mandáme",
+    "sumame",
+    "sumáme",
+    "agregame",
+    "agregáme",
+    "dame",
+    "pedime",
+    "pedíme",
+    "para pedir",
+    "te pido",
+    "llevo",
+)
+INFORMATIONAL_MENU_HINTS = (
+    "tenés",
+    "tenes",
+    "tienen",
+    "hay",
+    "qué tienen",
+    "que tienen",
+    "qué hay",
+    "que hay",
+    "mostrame",
+    "mostrame el menú",
+    "menu",
+)
+EXPLICIT_CONFIRMATION_HINTS = (
+    "confirmo",
+    "confirmá",
+    "confirma",
+    "dale",
+    "listo",
+    "cerralo",
+    "cerrá el pedido",
+    "confirmar pedido",
+)
 NAME_PROMPT_VARIANTS = (
     "👋 Hola, soy {bot_name}, el asistente de pedidos de {store_name}. Antes de seguir, ¿me decís tu nombre?",
     "🍽️ Hola, te habla {bot_name}, el asistente de pedidos de {store_name}. Para arrancar, ¿cómo te llamás?",
@@ -98,6 +137,30 @@ class AssistantDeps:
     customer_id: int
     conversation_id: int
     turn_context_hint: str | None = None
+    allow_order_mutations: bool = True
+    allow_order_confirmation: bool = False
+
+
+@dataclass(slots=True, frozen=True)
+class TurnPolicy:
+    """Deterministic guardrails derived from the latest customer message."""
+
+    allow_order_mutations: bool
+    allow_order_confirmation: bool
+
+
+class InformationalTurnMutationError(ValueError):
+    """Raised when the model tries to mutate an order during an informational turn."""
+
+    def __init__(self) -> None:
+        super().__init__("Este turno es solo informativo: no cambies el pedido todavía.")
+
+
+class MissingConfirmationSignalError(ValueError):
+    """Raised when the model tries to confirm without an explicit user confirmation."""
+
+    def __init__(self) -> None:
+        super().__init__("No confirmes el pedido sin una señal explícita del cliente en este turno.")
 
 
 async def with_repository[RepositoryResult](
@@ -226,6 +289,8 @@ async def add_item_to_current_order(
     notes: str | None = None,
 ) -> OrderSnapshot:
     """Add one menu item to the current draft order."""
+    if not ctx.deps.allow_order_mutations:
+        raise InformationalTurnMutationError
     return await with_repository(
         ctx,
         lambda repository: repository.add_item_to_current_order(
@@ -245,6 +310,8 @@ async def set_order_delivery_type(
     delivery_type: DeliveryType,
 ) -> OrderSnapshot:
     """Set the delivery mode for the active order."""
+    if not ctx.deps.allow_order_mutations:
+        raise InformationalTurnMutationError
     return await with_repository(
         ctx,
         lambda repository: repository.set_order_delivery_type(
@@ -262,6 +329,8 @@ async def set_order_delivery_address(
     address: str,
 ) -> OrderSnapshot:
     """Set the delivery address for the active order."""
+    if not ctx.deps.allow_order_mutations:
+        raise InformationalTurnMutationError
     return await with_repository(
         ctx,
         lambda repository: repository.set_order_delivery_address(
@@ -279,6 +348,8 @@ async def set_order_payment_method(
     payment_method: PaymentMethod,
 ) -> OrderSnapshot:
     """Set the payment method for the active order."""
+    if not ctx.deps.allow_order_mutations:
+        raise InformationalTurnMutationError
     return await with_repository(
         ctx,
         lambda repository: repository.set_order_payment_method(
@@ -293,6 +364,8 @@ async def set_order_payment_method(
 @ordering_agent.tool
 async def confirm_current_order(ctx: RunContext[AssistantDeps]) -> OrderSnapshot:
     """Confirm the active order once it contains items."""
+    if not ctx.deps.allow_order_confirmation:
+        raise MissingConfirmationSignalError
     return await with_repository(
         ctx,
         lambda repository: repository.confirm_current_order(
@@ -353,6 +426,7 @@ class OrderingAssistantService:
                 message_text=message_text,
             )
             availability = await repository.get_store_availability(timezone_name=self.settings.store_timezone)
+            turn_policy = self._analyze_turn_policy(message_text)
             deps = AssistantDeps(
                 settings=self.settings,
                 session_factory=self.session_factory,
@@ -362,6 +436,8 @@ class OrderingAssistantService:
                     customer=customer,
                     message_text=message_text,
                 ),
+                allow_order_mutations=turn_policy.allow_order_mutations,
+                allow_order_confirmation=turn_policy.allow_order_confirmation,
             )
 
             direct_reply = await self._maybe_handle_missing_customer_name(
@@ -603,6 +679,20 @@ class OrderingAssistantService:
         if not candidate_tokens:
             return None
         return candidate_tokens[0].title()
+
+    def _analyze_turn_policy(self, message_text: str) -> TurnPolicy:
+        """Return deterministic mutation/confirmation guardrails for the current turn."""
+        lowered = message_text.casefold()
+        has_order_intent = any(hint in lowered for hint in ORDER_INTENT_HINTS)
+        asks_menu_information = any(hint in lowered for hint in INFORMATIONAL_MENU_HINTS)
+        explicit_confirmation = any(hint in lowered for hint in EXPLICIT_CONFIRMATION_HINTS)
+
+        allow_order_mutations = has_order_intent or not asks_menu_information
+        allow_order_confirmation = explicit_confirmation or has_order_intent
+        return TurnPolicy(
+            allow_order_mutations=allow_order_mutations,
+            allow_order_confirmation=allow_order_confirmation,
+        )
 
     def _build_turn_context_hint(
         self,

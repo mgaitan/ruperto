@@ -11,10 +11,19 @@ from pydantic import SecretStr
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from ruperto.assistant import OrderingAssistantService, build_google_model, get_store_availability
+from ruperto.assistant import (
+    OrderingAssistantService,
+    add_item_to_current_order,
+    build_google_model,
+    confirm_current_order,
+    get_store_availability,
+    set_order_delivery_address,
+    set_order_delivery_type,
+    set_order_payment_method,
+)
 from ruperto.config import Settings
 from ruperto.db import create_database_runtime, init_database
-from ruperto.models import Channel, PaymentMethod
+from ruperto.models import Channel, DeliveryType, PaymentMethod
 from ruperto.repository import BusinessRepository
 from ruperto.schemas import AssistantNextStep, CustomerSnapshot, StoreAvailabilitySnapshot, StoreBusinessHoursSnapshot
 
@@ -183,7 +192,7 @@ def delay_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
 async def test_build_google_model(tmp_path: Path):
     """The production Gemini model can be constructed from settings."""
     model = build_google_model(build_settings(tmp_path))
-    assert model.model_name == "gemini-2.5-flash"
+    assert model.model_name == "gemini-2.5-flash-lite"
 
 
 async def test_assistant_handles_order_flow_in_spanish(tmp_path: Path):
@@ -514,6 +523,64 @@ async def test_turn_context_hint_mentions_other_payment_cues(tmp_path: Path):
     assert "link o tarjeta" in card_link_hint
 
     await runtime.engine.dispose()
+
+
+async def test_turn_policy_blocks_order_mutations_for_menu_only_questions(tmp_path: Path):
+    """Pure menu questions should not be allowed to mutate or confirm orders."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+
+    policy = service._analyze_turn_policy("Hola Ruperto, soy Martín. ¿Tenés pizzas?")
+
+    assert policy.allow_order_mutations is False
+    assert policy.allow_order_confirmation is False
+
+    await runtime.engine.dispose()
+
+
+async def test_turn_policy_allows_order_building_but_not_confirmation_by_default(tmp_path: Path):
+    """Normal ordering intents can mutate and confirm during the same turn."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+
+    policy = service._analyze_turn_policy("Hola, quiero 2 pizzas muzza y te pago acá")
+
+    assert policy.allow_order_mutations is True
+    assert policy.allow_order_confirmation is True
+
+    await runtime.engine.dispose()
+
+
+async def test_turn_policy_allows_confirmation_when_customer_explicitly_confirms(tmp_path: Path):
+    """Confirmation should require an explicit customer signal in the latest turn."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+
+    policy = service._analyze_turn_policy("Dale, confirmá el pedido")
+
+    assert policy.allow_order_mutations is True
+    assert policy.allow_order_confirmation is True
+
+    await runtime.engine.dispose()
+
+
+async def test_order_tools_reject_informational_turns(mocker):
+    """Mutation and confirmation tools fail fast on informational-only turns."""
+    ctx = mocker.Mock()
+    ctx.deps.allow_order_mutations = False
+    ctx.deps.allow_order_confirmation = False
+
+    with pytest.raises(ValueError, match="solo informativo"):
+        await add_item_to_current_order(ctx, "pizza-muzzarella", 1)
+    with pytest.raises(ValueError, match="solo informativo"):
+        await set_order_delivery_type(ctx, DeliveryType.DELIVERY)
+    with pytest.raises(ValueError, match="solo informativo"):
+        await set_order_delivery_address(ctx, "Lavalle 123")
+    with pytest.raises(ValueError, match="solo informativo"):
+        await set_order_payment_method(ctx, PaymentMethod.CASH)
+
+    with pytest.raises(ValueError, match="señal explícita"):
+        await confirm_current_order(ctx)
 
 
 async def test_assistant_mentions_next_opening_when_store_is_closed(tmp_path: Path):
