@@ -1,0 +1,14 @@
+# Changes here will be overwritten by Copier.
+_commit: 0.4.3
+_src_path: gh:mgaitan/python-package-copier-template
+author_email: gaitan@gmail.com
+author_fullname: Martín Gaitán
+author_username: mgaitan
+copyright_license: BSD-3-Clause
+gh_repo_create: private
+project_description: A minimalist configurable agent
+project_name: ruperto
+python_package_command_line_name: ruperto
+python_package_distribution_name: ruperto
+python_package_import_name: ruperto
+repository_name: ruperto
