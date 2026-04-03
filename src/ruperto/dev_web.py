@@ -77,6 +77,8 @@ def extract_latest_tool_reply(messages: Sequence[ModelMessage]) -> str | None:
         if not isinstance(message, ModelRequest):
             continue
         for part in reversed(message.parts):
+            if isinstance(part, UserPromptPart):
+                return None
             if isinstance(part, ToolReturnPart) and part.tool_name == WEB_TOOL_NAME:
                 return str(part.content)
     return None

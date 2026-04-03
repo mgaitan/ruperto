@@ -99,6 +99,20 @@ def test_extract_latest_tool_reply_skips_non_requests():
     assert extract_latest_tool_reply(messages) == "Pedido confirmado"
 
 
+def test_extract_latest_tool_reply_ignores_previous_turn_replies():
+    """A new user prompt must force a fresh backend tool call."""
+    messages: Sequence[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content="Quiero una pizza")]),
+        ModelRequest(parts=[ToolReturnPart(tool_name=WEB_TOOL_NAME, content="Tenemos muzza")]),
+        ModelResponse(parts=[TextPart(content="Tenemos muzza")], model_name="test"),
+        ModelRequest(parts=[UserPromptPart(content="¿Tenés otras?")]),
+    ]
+
+    assert extract_latest_tool_reply(messages) is None
+    response = build_web_chat_response(messages)
+    assert response.parts[0].part_kind == "tool-call"
+
+
 def test_build_web_identity_uses_chat_id():
     """Development web identities derive from the frontend chat id."""
     assert build_web_identity("chat-123") == "web:chat-123"
