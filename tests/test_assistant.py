@@ -14,9 +14,9 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from ruperto.assistant import OrderingAssistantService, build_google_model, get_store_availability
 from ruperto.config import Settings
 from ruperto.db import create_database_runtime, init_database
-from ruperto.models import Channel
+from ruperto.models import Channel, PaymentMethod
 from ruperto.repository import BusinessRepository
-from ruperto.schemas import AssistantNextStep, StoreAvailabilitySnapshot, StoreBusinessHoursSnapshot
+from ruperto.schemas import AssistantNextStep, CustomerSnapshot, StoreAvailabilitySnapshot, StoreBusinessHoursSnapshot
 
 pytestmark = pytest.mark.anyio
 MIN_HISTORY_MESSAGES = 10
@@ -414,6 +414,12 @@ async def test_name_candidate_heuristics_cover_edge_cases(tmp_path: Path):
         service._extract_latest_assistant_text([ModelRequest(parts=[ToolReturnPart(tool_name="x", content={})])])
         is None
     )
+    assert service._detect_payment_method_hint("te pago acá") is PaymentMethod.CASH
+    assert service._detect_payment_method_hint("te transfiero") is PaymentMethod.TRANSFER
+    assert service._detect_payment_method_hint("te pido link de pago") is PaymentMethod.CARD_LINK
+    assert service._detect_payment_method_hint("hola") is None
+    assert service._message_requests_total("cuánto es?") is True
+    assert service._message_requests_total("dame una pizza") is False
     assert "Ruperto Test" in service._build_name_prompt(conversation_id=1)
     assert "Rotisería Test" in service._build_name_prompt(conversation_id=1)
 
@@ -438,6 +444,46 @@ async def test_assistant_uses_name_introduced_in_the_first_message(tmp_path: Pat
     assert reply.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
     assert "Hola Martín" in reply.reply.reply_text
     assert "¿me decís tu nombre?" not in reply.reply.reply_text
+
+    await runtime.engine.dispose()
+
+
+async def test_turn_context_hint_guides_compact_customer_messages(tmp_path: Path):
+    """Compact first-turn messages generate safe context hints for the model."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    hint = service._build_turn_context_hint(
+        customer=CustomerSnapshot(id=1, name="Martín", phone_number=None, default_address=None),
+        message_text="Hola, soy Martín Gaitán, mandame 2 pizzas muzza. ¿Cuánto es? Te pago acá.",
+    )
+
+    assert hint is not None
+    assert "No vuelvas a pedirle el nombre" in hint
+    assert "efectivo" in hint
+    assert "cuánto sale" in hint or "total o subtotal" in hint
+
+    await runtime.engine.dispose()
+
+
+async def test_turn_context_hint_mentions_other_payment_cues(tmp_path: Path):
+    """Turn hints also describe transfer and link-based payment cues."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    customer = CustomerSnapshot(id=1, name="Martín", phone_number=None, default_address=None)
+
+    transfer_hint = service._build_turn_context_hint(
+        customer=customer,
+        message_text="Hola, soy Martín. Quiero una pizza y te transfiero.",
+    )
+    card_link_hint = service._build_turn_context_hint(
+        customer=customer,
+        message_text="Hola, soy Martín. Quiero una pizza y mandame link de pago.",
+    )
+
+    assert transfer_hint is not None
+    assert "transferencia" in transfer_hint
+    assert card_link_hint is not None
+    assert "link o tarjeta" in card_link_hint
 
     await runtime.engine.dispose()
 

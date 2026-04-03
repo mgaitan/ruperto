@@ -57,6 +57,9 @@ Store opening hours are now configurable through `GET/PUT /api/store-hours`,
 and customer replies mention the next opening time whenever the store is closed.
 The demo catalog now includes multiple food options plus drinks and desserts so
 local development can exercise simple add-on suggestions.
+Compact customer messages are also handled more naturally now, so the assistant
+can reuse cues such as a self-introduction, a payment hint like `te pago acá`,
+and a same-turn price question without asking for the same detail twice.
 
 ## Development
 
