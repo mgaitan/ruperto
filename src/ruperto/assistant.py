@@ -420,7 +420,7 @@ class OrderingAssistantService:
             return None
 
         if self._is_waiting_for_name(history):
-            if name := self._extract_name_candidate(message_text):
+            if name := self._extract_customer_name(message_text):
                 updated_customer = await repository.update_customer_name(customer.id, name)
                 reply = AssistantReply(
                     reply_text=self._decorate_closed_store_text(
@@ -564,6 +564,10 @@ class OrderingAssistantService:
         if any(term in lowered for term in blocked_terms):
             return None
         return cleaned.title()
+
+    def _extract_customer_name(self, message_text: str) -> str | None:
+        """Extract a customer name from either a short reply or a longer introduction."""
+        return self._extract_name_candidate(message_text) or self._extract_name_from_introduction(message_text)
 
     def _extract_name_from_introduction(self, message_text: str) -> str | None:
         """Extract a first name from a longer self-introduction message."""
