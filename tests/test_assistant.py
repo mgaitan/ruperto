@@ -382,6 +382,33 @@ async def test_assistant_reasks_for_name_when_the_reply_is_not_a_name(tmp_path: 
     await runtime.engine.dispose()
 
 
+async def test_assistant_accepts_a_natural_introduction_while_waiting_for_name(tmp_path: Path):
+    """The name-capture flow accepts a natural sentence, not only a bare name."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+
+    await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-presentacion-natural",
+        message_text="Hola, quiero pedir",
+        model=FunctionModel(transactional_model),
+    )
+    reply = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-presentacion-natural",
+        message_text="Qué tal, me llamo Pedro Guti y tengo hambre",
+        model=FunctionModel(transactional_model),
+    )
+
+    assert reply.customer.name == "Pedro"
+    assert reply.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
+    assert "¿Qué querés pedir hoy?" in reply.reply.reply_text
+
+    await runtime.engine.dispose()
+
+
 async def test_name_candidate_heuristics_cover_edge_cases(tmp_path: Path):
     """Name extraction accepts short names and rejects noisy ordering content."""
     runtime = create_database_runtime(build_settings(tmp_path))
@@ -401,6 +428,7 @@ async def test_name_candidate_heuristics_cover_edge_cases(tmp_path: Path):
     assert service._extract_name_candidate("hola quiero pizza") is None
     assert service._extract_name_candidate("Juan Carlos Perez Gomez") is None
     assert service._extract_name_candidate("Ana María López") == "Ana María López"
+    assert service._extract_customer_name("Qué tal, me llamo Pedro Guti y tengo hambre") == "Pedro"
     assert (
         service._extract_latest_assistant_text(
             [
