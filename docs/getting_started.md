@@ -33,7 +33,7 @@ customer and staff-facing interactions in Spanish (Argentina) from the start.
 ## 3. Run the API locally
 
 ```bash
-uv run fastapi dev src/ruperto/app.py
+uv run fastapi dev
 ```
 
 Then open:
@@ -59,6 +59,19 @@ curl -X POST http://127.0.0.1:8000/api/dev/messages \
   -H 'content-type: application/json' \
   -d '{"external_user_id":"cliente-demo","message_text":"Hola, quiero pedir"}'
 ```
+
+Or launch the built-in PydanticAI web client for development:
+
+```bash
+uv run ruperto web-chat
+```
+
+Then open `http://127.0.0.1:7932/`.
+
+In this mode there is no WhatsApp phone number, so Ruperto identifies the user
+with a stable development identity derived from the web chat id:
+`web:<chat-id>`. If you continue in the same web chat, the stored customer,
+order, and conversation history are reused automatically.
 
 ## 4. Run quality checks
 
