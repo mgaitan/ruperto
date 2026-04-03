@@ -29,7 +29,7 @@ KITCHEN_LOAD_DELAY_MINUTES = 18
 EMPTY_DRAFT_DELAY_MINUTES = 15
 DEFAULT_WEEKLY_HOURS = 7
 UPDATED_WEEKLY_HOURS = 2
-MIN_MENU_ITEMS = 14
+MIN_MENU_ITEMS = 35
 
 
 async def build_repository(tmp_path: Path) -> tuple[BusinessRepository, DatabaseRuntime]:

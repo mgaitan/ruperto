@@ -70,9 +70,11 @@ pizzas muzza, ¿cuánto es? te pago acá`: the backend now passes safe turn hint
 so the assistant can avoid re-asking the name and can reuse explicit payment or
 price cues in the same turn.
 
-The seeded demo menu now includes several food options, drinks, and desserts,
-which makes it easier to test suggestions such as offering a beverage or a
-dessert after the customer chooses a main dish.
+The seeded demo menu now includes a broader synthetic catalog with pizzas,
+hamburgers, lomitos, milanesas, wraps, empanadas, drinks, and desserts. That
+makes it easier to test more realistic conversations, including follow-up
+suggestions such as offering a beverage or a dessert after the customer
+chooses a main dish.
 
 Or launch the built-in PydanticAI web client for development:
 
