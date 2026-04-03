@@ -23,12 +23,15 @@ from ruperto.assistant import (
 )
 from ruperto.config import Settings
 from ruperto.db import create_database_runtime, init_database
-from ruperto.models import Channel, DeliveryType, PaymentMethod
+from ruperto.models import Channel, DeliveryType, OrderStatus, PaymentMethod
 from ruperto.repository import BusinessRepository
 from ruperto.schemas import (
     AssistantNextStep,
     AssistantReply,
     CustomerSnapshot,
+    DelayEstimateSnapshot,
+    OrderItemSnapshot,
+    OrderSnapshot,
     StoreAvailabilitySnapshot,
     StoreBusinessHoursSnapshot,
 )
@@ -498,6 +501,7 @@ async def test_turn_context_hint_guides_compact_customer_messages(tmp_path: Path
     hint = service._build_turn_context_hint(
         customer=CustomerSnapshot(id=1, name="Martín", phone_number=None, default_address=None),
         message_text="Hola, soy Martín Gaitán, mandame 2 pizzas muzza. ¿Cuánto es? Te pago acá.",
+        current_order=None,
     )
 
     assert hint is not None
@@ -517,10 +521,12 @@ async def test_turn_context_hint_mentions_other_payment_cues(tmp_path: Path):
     transfer_hint = service._build_turn_context_hint(
         customer=customer,
         message_text="Hola, soy Martín. Quiero una pizza y te transfiero.",
+        current_order=None,
     )
     card_link_hint = service._build_turn_context_hint(
         customer=customer,
         message_text="Hola, soy Martín. Quiero una pizza y mandame link de pago.",
+        current_order=None,
     )
 
     assert transfer_hint is not None
@@ -531,12 +537,97 @@ async def test_turn_context_hint_mentions_other_payment_cues(tmp_path: Path):
     await runtime.engine.dispose()
 
 
+async def test_turn_context_hint_describes_missing_checkout_fields(tmp_path: Path):
+    """Draft orders add explicit hints about whichever checkout field is still missing."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    draft_order = OrderSnapshot(
+        id=1,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=None,
+        delivery_address=None,
+        payment_method=None,
+        total_amount_cents=1150000,
+        total_amount_display="$ 11.500",
+        items=[
+            OrderItemSnapshot(
+                menu_item_id=1,
+                name="Hamburguesa BBQ",
+                quantity=1,
+                unit_price_cents=1150000,
+                unit_price_display="$ 11.500",
+                notes=None,
+            )
+        ],
+    )
+
+    hint = service._build_turn_context_hint(
+        customer=CustomerSnapshot(id=1, name="Martín", phone_number=None, default_address="Lavalle 12333"),
+        message_text="Efectivo",
+        current_order=draft_order,
+    )
+
+    assert hint is not None
+    assert "Pedido en curso" in hint
+    assert "envío o retiro" in hint
+
+    await runtime.engine.dispose()
+
+
+async def test_turn_context_hint_describes_missing_address_and_payment(tmp_path: Path):
+    """Draft context hints also cover missing address and missing payment details."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    order = OrderSnapshot(
+        id=1,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=DeliveryType.DELIVERY,
+        delivery_address=None,
+        payment_method=None,
+        total_amount_cents=950000,
+        total_amount_display="$ 9.500",
+        items=[
+            OrderItemSnapshot(
+                menu_item_id=1,
+                name="Hamburguesa completa",
+                quantity=1,
+                unit_price_cents=950000,
+                unit_price_display="$ 9.500",
+                notes=None,
+            )
+        ],
+    )
+
+    address_hint = service._build_turn_context_hint(
+        customer=CustomerSnapshot(id=1, name="Martín", phone_number=None, default_address=None),
+        message_text="Efectivo",
+        current_order=order,
+    )
+    assert address_hint is not None
+    assert "Falta pedir la dirección" in address_hint
+
+    order.delivery_address = "Lavalle 12333"
+    payment_hint = service._build_turn_context_hint(
+        customer=CustomerSnapshot(id=1, name="Martín", phone_number=None, default_address=None),
+        message_text="Efectivo",
+        current_order=order,
+    )
+    assert payment_hint is not None
+    assert "medio de pago" in payment_hint
+
+    await runtime.engine.dispose()
+
+
 async def test_turn_policy_blocks_order_mutations_for_menu_only_questions(tmp_path: Path):
     """Pure menu questions should not be allowed to mutate or confirm orders."""
     runtime = create_database_runtime(build_settings(tmp_path))
     service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
 
-    policy = service._analyze_turn_policy("Hola Ruperto, soy Martín. ¿Tenés pizzas?")
+    policy = service._analyze_turn_policy("Hola Ruperto, soy Martín. ¿Tenés pizzas?", current_order=None)
 
     assert policy.allow_order_mutations is False
     assert policy.allow_order_confirmation is False
@@ -549,7 +640,7 @@ async def test_turn_policy_allows_order_building_but_not_confirmation_by_default
     runtime = create_database_runtime(build_settings(tmp_path))
     service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
 
-    policy = service._analyze_turn_policy("Hola, quiero 2 pizzas muzza y te pago acá")
+    policy = service._analyze_turn_policy("Hola, quiero 2 pizzas muzza y te pago acá", current_order=None)
 
     assert policy.allow_order_mutations is True
     assert policy.allow_order_confirmation is True
@@ -562,7 +653,41 @@ async def test_turn_policy_allows_confirmation_when_customer_explicitly_confirms
     runtime = create_database_runtime(build_settings(tmp_path))
     service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
 
-    policy = service._analyze_turn_policy("Dale, confirmá el pedido")
+    policy = service._analyze_turn_policy("Dale, confirmá el pedido", current_order=None)
+
+    assert policy.allow_order_mutations is True
+    assert policy.allow_order_confirmation is True
+
+    await runtime.engine.dispose()
+
+
+async def test_turn_policy_allows_payment_answer_to_confirm_existing_draft(tmp_path: Path):
+    """A payment-only answer can complete checkout when a draft with items already exists."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    current_order = OrderSnapshot(
+        id=1,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=DeliveryType.PICKUP,
+        delivery_address=None,
+        payment_method=None,
+        total_amount_cents=1150000,
+        total_amount_display="$ 11.500",
+        items=[
+            OrderItemSnapshot(
+                menu_item_id=1,
+                name="Hamburguesa BBQ",
+                quantity=1,
+                unit_price_cents=1150000,
+                unit_price_display="$ 11.500",
+                notes=None,
+            )
+        ],
+    )
+
+    policy = service._analyze_turn_policy("efectivo", current_order=current_order)
 
     assert policy.allow_order_mutations is True
     assert policy.allow_order_confirmation is True
@@ -691,7 +816,8 @@ async def test_ground_reply_keeps_safe_informational_text(tmp_path: Path):
     service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
     original = service._ground_reply_for_turn_policy(
         AssistantReply(reply_text="Tenemos hamburguesas y pizzas 🍔🍕", next_step=AssistantNextStep.CHOOSE_ITEMS),
-        service._analyze_turn_policy("¿Tenés hamburguesas?"),
+        service._analyze_turn_policy("¿Tenés hamburguesas?", current_order=None),
+        current_order=None,
     )
 
     assert original.reply_text == "Tenemos hamburguesas y pizzas 🍔🍕"
@@ -708,11 +834,215 @@ async def test_ground_reply_falls_back_when_every_sentence_is_suspicious(tmp_pat
             reply_text="Ya registré tu pedido. El pago es en efectivo. Gracias por tu compra.",
             next_step=AssistantNextStep.COMPLETE,
         ),
-        service._analyze_turn_policy("¿Tenés hamburguesas?"),
+        service._analyze_turn_policy("¿Tenés hamburguesas?", current_order=None),
+        current_order=None,
     )
 
     assert grounded.reply_text == "Puedo contarte las opciones y los precios, pero todavía no armé ningún pedido."
     assert grounded.next_step == AssistantNextStep.CHOOSE_ITEMS
+
+    await runtime.engine.dispose()
+
+
+async def test_ground_reply_does_not_claim_no_order_when_a_draft_already_exists(tmp_path: Path):
+    """Informational cleanup should avoid saying there is no order when a draft already exists."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    current_order = OrderSnapshot(
+        id=1,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=None,
+        delivery_address=None,
+        payment_method=None,
+        total_amount_cents=1150000,
+        total_amount_display="$ 11.500",
+        items=[
+            OrderItemSnapshot(
+                menu_item_id=1,
+                name="Hamburguesa BBQ",
+                quantity=1,
+                unit_price_cents=1150000,
+                unit_price_display="$ 11.500",
+                notes=None,
+            )
+        ],
+    )
+
+    grounded = service._ground_reply_for_turn_policy(
+        AssistantReply(
+            reply_text="No tenemos bebidas. Ya registré tu pedido y el pago es en efectivo.",
+            next_step=AssistantNextStep.CHOOSE_ITEMS,
+        ),
+        service._analyze_turn_policy("¿Tenés bebidas?", current_order=current_order),
+        current_order=current_order,
+    )
+
+    assert "Todavía no armé ningún pedido" not in grounded.reply_text
+
+    await runtime.engine.dispose()
+
+
+async def test_ground_reply_falls_back_to_no_changes_when_draft_exists(tmp_path: Path):
+    """If every suspicious sentence is removed but a draft exists, mention no changes instead of no order."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    current_order = OrderSnapshot(
+        id=1,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=None,
+        delivery_address=None,
+        payment_method=None,
+        total_amount_cents=1150000,
+        total_amount_display="$ 11.500",
+        items=[
+            OrderItemSnapshot(
+                menu_item_id=1,
+                name="Hamburguesa BBQ",
+                quantity=1,
+                unit_price_cents=1150000,
+                unit_price_display="$ 11.500",
+                notes=None,
+            )
+        ],
+    )
+
+    grounded = service._ground_reply_for_turn_policy(
+        AssistantReply(
+            reply_text="Ya registré tu pedido. El pago es en efectivo.",
+            next_step=AssistantNextStep.COMPLETE,
+        ),
+        service._analyze_turn_policy("¿Tenés bebidas?", current_order=current_order),
+        current_order=current_order,
+    )
+
+    assert "no hice cambios en tu pedido" in grounded.reply_text.lower()
+
+    await runtime.engine.dispose()
+
+
+async def test_guide_reply_with_current_order_asks_for_missing_delivery_and_payment(tmp_path: Path):
+    """Draft guidance should deterministically ask for whichever checkout field is still missing."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    customer = CustomerSnapshot(id=1, name="Pirulo", phone_number=None, default_address="Lavalle 12333")
+    delay = DelayEstimateSnapshot(
+        active_orders_ahead=1,
+        base_minutes=15,
+        estimated_minutes=18,
+        display_text="18 minutos aproximadamente",
+    )
+    order = OrderSnapshot(
+        id=1,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=None,
+        delivery_address=None,
+        payment_method=None,
+        total_amount_cents=1150000,
+        total_amount_display="$ 11.500",
+        items=[
+            OrderItemSnapshot(
+                menu_item_id=1,
+                name="Hamburguesa BBQ",
+                quantity=1,
+                unit_price_cents=1150000,
+                unit_price_display="$ 11.500",
+                notes=None,
+            )
+        ],
+    )
+
+    delivery_reply = service._guide_reply_with_current_order(
+        AssistantReply(reply_text="Texto libre", next_step=AssistantNextStep.CHOOSE_ITEMS),
+        customer=customer,
+        current_order=order,
+        delay=delay,
+    )
+    assert delivery_reply.next_step == AssistantNextStep.CHOOSE_DELIVERY
+    assert "envío o retirás" in delivery_reply.reply_text.lower()
+
+    order.delivery_type = DeliveryType.DELIVERY
+    address_reply = service._guide_reply_with_current_order(
+        AssistantReply(reply_text="Texto libre", next_step=AssistantNextStep.CHOOSE_ITEMS),
+        customer=customer,
+        current_order=order,
+        delay=delay,
+    )
+    assert address_reply.next_step == AssistantNextStep.ASK_ADDRESS
+    assert "lavalle 12333" in address_reply.reply_text.lower()
+
+    order.delivery_address = "Lavalle 12333"
+    payment_reply = service._guide_reply_with_current_order(
+        AssistantReply(reply_text="Texto libre", next_step=AssistantNextStep.CHOOSE_ITEMS),
+        customer=customer,
+        current_order=order,
+        delay=delay,
+    )
+    assert payment_reply.next_step == AssistantNextStep.CHOOSE_PAYMENT
+    assert "efectivo" in payment_reply.reply_text.lower()
+
+    order.payment_method = PaymentMethod.CASH
+    unchanged_reply = service._guide_reply_with_current_order(
+        AssistantReply(reply_text="Texto libre", next_step=AssistantNextStep.CHOOSE_ITEMS),
+        customer=customer,
+        current_order=order,
+        delay=delay,
+    )
+    assert unchanged_reply.reply_text == "Texto libre"
+
+    order.delivery_address = None
+    customer_without_default = CustomerSnapshot(id=1, name="Pirulo", phone_number=None, default_address=None)
+    address_without_default = service._guide_reply_with_current_order(
+        AssistantReply(reply_text="Texto libre", next_step=AssistantNextStep.CHOOSE_ITEMS),
+        customer=customer_without_default,
+        current_order=order.model_copy(update={"payment_method": None}),
+        delay=delay,
+    )
+    assert "pasame la dirección de envío" in address_without_default.reply_text.lower()
+
+    await runtime.engine.dispose()
+
+
+async def test_turn_context_hint_mentions_known_delivery_address_for_draft(tmp_path: Path):
+    """Turn hints should mention the saved address when delivery still needs confirmation."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    customer = CustomerSnapshot(id=1, name="Pirulo", phone_number=None, default_address="Lavalle 12333")
+    order = OrderSnapshot(
+        id=1,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=DeliveryType.DELIVERY,
+        delivery_address=None,
+        payment_method=None,
+        total_amount_cents=1150000,
+        total_amount_display="$ 11.500",
+        items=[
+            OrderItemSnapshot(
+                menu_item_id=1,
+                name="Hamburguesa BBQ",
+                quantity=1,
+                unit_price_cents=1150000,
+                unit_price_display="$ 11.500",
+                notes=None,
+            )
+        ],
+    )
+
+    hint = service._build_turn_context_hint(
+        customer=customer,
+        message_text="¿Cuánto falta?",
+        current_order=order,
+    )
+
+    assert hint is not None
+    assert "dirección conocida del cliente: lavalle 12333" in hint.lower()
 
     await runtime.engine.dispose()
 

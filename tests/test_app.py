@@ -97,6 +97,8 @@ def dev_message_model(messages: list[ModelMessage], info: AgentInfo) -> ModelRes
     sequence: list[tuple[str, dict[str, Any]]] = [
         ("update_customer_name", {"name": "Martina"}),
         ("add_item_to_current_order", {"sku": "hamburguesa-completa", "quantity": 1}),
+        ("set_order_delivery_type", {"delivery_type": "pickup"}),
+        ("set_order_payment_method", {"payment_method": "cash"}),
         ("confirm_current_order", {}),
     ]
     for tool_name, arguments in sequence:

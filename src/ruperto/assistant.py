@@ -429,6 +429,11 @@ class OrderingAssistantService:
                 customer_id=customer.id,
             )
             history = await repository.load_conversation_messages(conversation.id)
+            current_order_before_run = await repository.get_current_order(
+                customer.id,
+                conversation.id,
+                create_if_missing=False,
+            )
             customer = await self._capture_customer_name_from_message(
                 repository=repository,
                 customer=customer,
@@ -436,7 +441,7 @@ class OrderingAssistantService:
                 message_text=message_text,
             )
             availability = await repository.get_store_availability(timezone_name=self.settings.store_timezone)
-            turn_policy = self._analyze_turn_policy(message_text)
+            turn_policy = self._analyze_turn_policy(message_text, current_order=current_order_before_run)
             deps = AssistantDeps(
                 settings=self.settings,
                 session_factory=self.session_factory,
@@ -445,6 +450,7 @@ class OrderingAssistantService:
                 turn_context_hint=self._build_turn_context_hint(
                     customer=customer,
                     message_text=message_text,
+                    current_order=current_order_before_run,
                 ),
                 allow_order_mutations=turn_policy.allow_order_mutations,
                 allow_order_confirmation=turn_policy.allow_order_confirmation,
@@ -482,8 +488,19 @@ class OrderingAssistantService:
                 customer_id,
                 conversation_id,
             )
+            delay = (
+                await repository.get_estimated_delay(customer_id, conversation_id)
+                if current_order is not None and current_order.items
+                else None
+            )
             reply = self._decorate_reply_with_store_availability(result.output, availability)
-            reply = self._ground_reply_for_turn_policy(reply, turn_policy)
+            reply = self._ground_reply_for_turn_policy(reply, turn_policy, current_order=current_order)
+            reply = self._guide_reply_with_current_order(
+                reply,
+                customer=refreshed_customer,
+                current_order=current_order,
+                delay=delay,
+            )
             if not turn_policy.allow_order_mutations:
                 current_order = None
             await session.commit()
@@ -693,15 +710,20 @@ class OrderingAssistantService:
             return None
         return candidate_tokens[0].title()
 
-    def _analyze_turn_policy(self, message_text: str) -> TurnPolicy:
+    def _analyze_turn_policy(self, message_text: str, *, current_order: OrderSnapshot | None) -> TurnPolicy:
         """Return deterministic mutation/confirmation guardrails for the current turn."""
         lowered = message_text.casefold()
         has_order_intent = any(hint in lowered for hint in ORDER_INTENT_HINTS)
         asks_menu_information = any(hint in lowered for hint in INFORMATIONAL_MENU_HINTS)
         explicit_confirmation = any(hint in lowered for hint in EXPLICIT_CONFIRMATION_HINTS)
+        payment_hint = self._detect_payment_method_hint(message_text)
 
         allow_order_mutations = has_order_intent or not asks_menu_information
-        allow_order_confirmation = explicit_confirmation or has_order_intent
+        allow_order_confirmation = (
+            explicit_confirmation
+            or has_order_intent
+            or (payment_hint is not None and current_order is not None and bool(current_order.items))
+        )
         return TurnPolicy(
             allow_order_mutations=allow_order_mutations,
             allow_order_confirmation=allow_order_confirmation,
@@ -712,6 +734,7 @@ class OrderingAssistantService:
         *,
         customer: CustomerSnapshot,
         message_text: str,
+        current_order: OrderSnapshot | None,
     ) -> str | None:
         """Build safe guidance for dense first-turn customer messages."""
         hints: list[str] = []
@@ -743,12 +766,49 @@ class OrderingAssistantService:
                 "El cliente quiere saber cuánto sale en este mismo turno. "
                 "Si ya podés calcularlo con herramientas, informá el total o subtotal actual."
             )
+        hints.extend(self._build_current_order_context_hints(customer=customer, current_order=current_order))
 
         if not hints:
             return None
         return " ".join(hints)
 
-    def _ground_reply_for_turn_policy(self, reply: AssistantReply, turn_policy: TurnPolicy) -> AssistantReply:
+    def _build_current_order_context_hints(
+        self,
+        *,
+        customer: CustomerSnapshot,
+        current_order: OrderSnapshot | None,
+    ) -> list[str]:
+        """Describe the current draft and the next missing checkout field."""
+        if current_order is None or not current_order.items:
+            return []
+
+        items_text = ", ".join(f"{item.quantity} x {item.name}" for item in current_order.items)
+        hints = [f"Pedido en curso: {items_text}. Total actual: {current_order.total_amount_display}."]
+        if current_order.delivery_type is None:
+            hints.append("Antes de confirmar, falta definir si es envío o retiro.")
+            return hints
+
+        if current_order.delivery_type == DeliveryType.DELIVERY and current_order.delivery_address is None:
+            if customer.default_address:
+                hints.append(
+                    "Falta confirmar la dirección de envío. "
+                    f"Dirección conocida del cliente: {customer.default_address}."
+                )
+            else:
+                hints.append("Falta pedir la dirección de envío antes de confirmar.")
+            return hints
+
+        if current_order.payment_method is None:
+            hints.append("Falta definir el medio de pago antes de confirmar.")
+        return hints
+
+    def _ground_reply_for_turn_policy(
+        self,
+        reply: AssistantReply,
+        turn_policy: TurnPolicy,
+        *,
+        current_order: OrderSnapshot | None,
+    ) -> AssistantReply:
         """Strip unsupported order-completion claims from informational turns."""
         if turn_policy.allow_order_mutations:
             return reply
@@ -763,9 +823,11 @@ class OrderingAssistantService:
         ]
         if safe_sentences:
             safe_text = " ".join(safe_sentences)
+        elif current_order is not None and current_order.items:
+            safe_text = "Puedo contarte las opciones y los precios, pero no hice cambios en tu pedido en este mensaje."
         else:
             safe_text = "Puedo contarte las opciones y los precios, pero todavía no armé ningún pedido."
-        if "todavía no armé ningún pedido" not in safe_text.casefold():
+        if current_order is None and "todavía no armé ningún pedido" not in safe_text.casefold():
             safe_text = f"{safe_text} Todavía no armé ningún pedido."
         return reply.model_copy(
             update={
@@ -773,6 +835,60 @@ class OrderingAssistantService:
                 "next_step": AssistantNextStep.CHOOSE_ITEMS,
             }
         )
+
+    def _guide_reply_with_current_order(
+        self,
+        reply: AssistantReply,
+        *,
+        customer: CustomerSnapshot,
+        current_order: OrderSnapshot | None,
+        delay: DelayEstimateSnapshot | None,
+    ) -> AssistantReply:
+        """Prefer deterministic checkout guidance once a draft already exists."""
+        if current_order is None or not current_order.items or current_order.status.value != "draft":
+            return reply
+
+        if current_order.delivery_type is None:
+            delay_text = f" La demora estimada es de {delay.display_text}." if delay is not None else ""
+            item_summary = ", ".join(f"{item.quantity} x {item.name}" for item in current_order.items)
+            return reply.model_copy(
+                update={
+                    "reply_text": (
+                        f"Perfecto, {customer.name or 'che'}: por ahora llevo {item_summary} "
+                        f"por {current_order.total_amount_display}.{delay_text} "
+                        "¿Querés envío o retirás por el local?"
+                    ),
+                    "next_step": AssistantNextStep.CHOOSE_DELIVERY,
+                }
+            )
+
+        if current_order.delivery_type == DeliveryType.DELIVERY and current_order.delivery_address is None:
+            if customer.default_address:
+                reply_text = (
+                    f"Perfecto. ¿Te lo envío a {customer.default_address}? Si preferís otra dirección, pasámela."
+                )
+            else:
+                reply_text = "Perfecto. Pasame la dirección de envío, por favor."
+            return reply.model_copy(
+                update={
+                    "reply_text": reply_text,
+                    "next_step": AssistantNextStep.ASK_ADDRESS,
+                }
+            )
+
+        if current_order.payment_method is None:
+            delay_text = f" La demora estimada es de {delay.display_text}." if delay is not None else ""
+            return reply.model_copy(
+                update={
+                    "reply_text": (
+                        f"Perfecto. El total es {current_order.total_amount_display}.{delay_text} "
+                        "¿Cómo querés pagar: efectivo, transferencia o link de pago?"
+                    ),
+                    "next_step": AssistantNextStep.CHOOSE_PAYMENT,
+                }
+            )
+
+        return reply
 
     def _detect_payment_method_hint(self, message_text: str) -> PaymentMethod | None:
         """Infer payment intent from common Argentine customer phrasing."""

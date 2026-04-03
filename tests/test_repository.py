@@ -282,6 +282,36 @@ async def test_order_creation_and_failures_have_explicit_messages(tmp_path: Path
     await close_repository(repository, runtime)
 
 
+async def test_confirm_current_order_requires_delivery_choice_address_and_payment(tmp_path: Path):
+    """Draft confirmation requires the core checkout fields before closing the order."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="checkout-user")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="checkout-user",
+        customer_id=customer.id,
+    )
+
+    await repository.add_item_to_current_order(
+        customer.id,
+        conversation.id,
+        sku="hamburguesa-bbq",
+        quantity=1,
+    )
+    with pytest.raises(ValueError, match=re.escape("Necesito saber si es envío o retiro antes de confirmar.")):
+        await repository.confirm_current_order(customer.id, conversation.id)
+
+    await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.DELIVERY)
+    with pytest.raises(ValueError, match=re.escape("Necesito la dirección de entrega antes de confirmar.")):
+        await repository.confirm_current_order(customer.id, conversation.id)
+
+    await repository.set_order_delivery_address(customer.id, conversation.id, "Lavalle 12333")
+    with pytest.raises(ValueError, match=re.escape("Necesito definir el medio de pago antes de confirmar.")):
+        await repository.confirm_current_order(customer.id, conversation.id)
+
+    await close_repository(repository, runtime)
+
+
 async def test_delay_estimate_without_order_returns_store_default(tmp_path: Path):
     """The repository can provide a generic delay estimate before any order exists."""
     repository, runtime = await build_repository(tmp_path)
@@ -369,6 +399,8 @@ async def test_delay_estimate_adds_extra_time_for_large_orders(tmp_path: Path):
         quantity=3,
     )
     await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.DELIVERY)
+    await repository.set_order_delivery_address(customer.id, conversation.id, "Lavalle 12333")
+    await repository.set_order_payment_method(customer.id, conversation.id, PaymentMethod.CASH)
     await repository.confirm_current_order(customer.id, conversation.id)
     delay = await repository.get_estimated_delay(customer.id, conversation.id)
 
@@ -395,6 +427,8 @@ async def test_delay_estimate_reflects_kitchen_load_from_previous_active_orders(
         sku="pizza-muzzarella",
         quantity=1,
     )
+    await repository.set_order_delivery_type(first_customer.id, first_conversation.id, DeliveryType.PICKUP)
+    await repository.set_order_payment_method(first_customer.id, first_conversation.id, PaymentMethod.CASH)
     first_order = await repository.confirm_current_order(first_customer.id, first_conversation.id)
     assert first_order.status == OrderStatus.CONFIRMED
 

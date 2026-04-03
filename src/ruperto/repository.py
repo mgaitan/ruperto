@@ -134,6 +134,28 @@ class OrderNotFoundError(ValueError):
         super().__init__("No se encontró el pedido solicitado.")
 
 
+class IncompleteOrderError(ValueError):
+    """Raised when trying to confirm a draft missing required checkout data."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+    @classmethod
+    def missing_delivery_type(cls) -> IncompleteOrderError:
+        """Return the error raised when delivery mode is still unknown."""
+        return cls("Necesito saber si es envío o retiro antes de confirmar.")
+
+    @classmethod
+    def missing_delivery_address(cls) -> IncompleteOrderError:
+        """Return the error raised when the draft still lacks a delivery address."""
+        return cls("Necesito la dirección de entrega antes de confirmar.")
+
+    @classmethod
+    def missing_payment_method(cls) -> IncompleteOrderError:
+        """Return the error raised when the draft still lacks a payment method."""
+        return cls("Necesito definir el medio de pago antes de confirmar.")
+
+
 class BusinessRepository:
     """Repository facade covering the core MVP entities."""
 
@@ -515,6 +537,12 @@ class BusinessRepository:
         items = await self._load_order_items(order.id)
         if not items:
             raise EmptyOrderError
+        if order.delivery_type is None:
+            raise IncompleteOrderError.missing_delivery_type()
+        if order.delivery_type == DeliveryType.DELIVERY and not order.delivery_address:
+            raise IncompleteOrderError.missing_delivery_address()
+        if order.payment_method is None:
+            raise IncompleteOrderError.missing_payment_method()
 
         order.status = OrderStatus.CONFIRMED
         order.updated_at = utc_now()
