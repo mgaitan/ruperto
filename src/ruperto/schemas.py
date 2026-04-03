@@ -35,6 +35,25 @@ class StoreProfileSnapshot(BaseSchema):
     currency_code: str
 
 
+class StoreBusinessHoursSnapshot(BaseSchema):
+    """One opening-hours row for the weekly store schedule."""
+
+    id: int
+    store_id: int
+    weekday: int
+    opens_at: str | None
+    closes_at: str | None
+    closed: bool
+
+
+class StoreAvailabilitySnapshot(BaseModel):
+    """Current store availability for conversational messaging."""
+
+    is_open: bool
+    message_text: str
+    next_open_text: str | None = None
+
+
 class CustomerSnapshot(BaseSchema):
     """Current customer data known by the system."""
 
@@ -91,6 +110,15 @@ class CustomerMemorySnapshot(BaseModel):
     recent_items: list[str] = Field(default_factory=list)
 
 
+class DelayEstimateSnapshot(BaseModel):
+    """Operational delay estimate exposed to the assistant."""
+
+    active_orders_ahead: int
+    base_minutes: int
+    estimated_minutes: int
+    display_text: str
+
+
 class AssistantNextStep(StrEnum):
     """High-level next steps for the ordering conversation."""
 
@@ -119,3 +147,31 @@ class AssistantTurnResult(BaseModel):
     customer: CustomerSnapshot
     reply: AssistantReply
     current_order: OrderSnapshot | None = None
+
+
+class DevMessageRequest(BaseModel):
+    """Payload accepted by the development chat endpoint."""
+
+    external_user_id: str = Field(min_length=1)
+    message_text: str = Field(min_length=1)
+
+
+class OrderStatusUpdateRequest(BaseModel):
+    """Payload accepted by staff endpoints to update one order status."""
+
+    status: OrderStatus
+
+
+class StoreBusinessHoursUpdateEntry(BaseModel):
+    """One staff-supplied business-hours row."""
+
+    weekday: int = Field(ge=0, le=6)
+    opens_at: str | None = None
+    closes_at: str | None = None
+    closed: bool = False
+
+
+class StoreBusinessHoursUpdateRequest(BaseModel):
+    """Payload accepted by staff endpoints to replace the weekly schedule."""
+
+    hours: list[StoreBusinessHoursUpdateEntry]

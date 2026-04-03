@@ -13,6 +13,8 @@ import pytest
 
 from ruperto import get_version, main
 
+WEB_CHAT_PORT = 9000
+
 
 def test_main():
     """Basic CLI test."""
@@ -84,3 +86,15 @@ def test_init_db(monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture):
         rows = connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
     tables = {row[0] for row in rows}
     assert "store_profile" in tables
+
+
+def test_web_chat_command_starts_dev_server(monkeypatch, mocker, tmp_path: Path):
+    """The web-chat subcommand starts the development web UI."""
+    database_path = tmp_path / "web-chat.db"
+    monkeypatch.setenv("RUPERTO_DATABASE_URL", f"sqlite+aiosqlite:///{database_path}")
+    run_web_chat = mocker.patch("ruperto.run_web_chat", return_value=0)
+
+    assert main(["web-chat", "--host", "0.0.0.0", "--port", str(WEB_CHAT_PORT)]) == 0
+    run_web_chat.assert_called_once()
+    assert run_web_chat.call_args.kwargs["host"] == "0.0.0.0"
+    assert run_web_chat.call_args.kwargs["port"] == WEB_CHAT_PORT

@@ -7,9 +7,9 @@ from dataclasses import dataclass
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
-from ruperto.bootstrap import DEMO_MENU_ITEMS
+from ruperto.bootstrap import DEFAULT_BUSINESS_HOURS, DEMO_MENU_ITEMS
 from ruperto.config import Settings
-from ruperto.models import Base, MenuItem, StoreProfile
+from ruperto.models import Base, MenuItem, StoreBusinessHours, StoreProfile
 
 
 @dataclass(slots=True)
@@ -53,8 +53,9 @@ async def init_database(*, settings: Settings, runtime: DatabaseRuntime | None =
                     locale=settings.store_locale,
                 )
             )
-        menu_count = await session.scalar(select(func.count(MenuItem.id)))
-        if menu_count == 0:
+        existing_skus = set((await session.scalars(select(MenuItem.sku))).all())
+        missing_menu_items = [item for item in DEMO_MENU_ITEMS if item.sku not in existing_skus]
+        if missing_menu_items:
             session.add_all(
                 [
                     MenuItem(
@@ -65,7 +66,21 @@ async def init_database(*, settings: Settings, runtime: DatabaseRuntime | None =
                         price_cents=item.price_cents,
                         image_url=item.image_url,
                     )
-                    for item in DEMO_MENU_ITEMS
+                    for item in missing_menu_items
+                ]
+            )
+        hours_count = await session.scalar(select(func.count(StoreBusinessHours.id)))
+        if hours_count == 0:
+            session.add_all(
+                [
+                    StoreBusinessHours(
+                        store_id=1,
+                        weekday=row.weekday,
+                        opens_at=row.opens_at,
+                        closes_at=row.closes_at,
+                        closed=row.closed,
+                    )
+                    for row in DEFAULT_BUSINESS_HOURS
                 ]
             )
         await session.commit()

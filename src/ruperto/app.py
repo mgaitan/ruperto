@@ -5,13 +5,27 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 
 from ruperto import get_version
+from ruperto.assistant import OrderingAssistantService
 from ruperto.config import Settings
 from ruperto.db import DatabaseRuntime, create_database_runtime, init_database, ping_database
+from ruperto.models import Channel, OrderStatus
+from ruperto.repository import BusinessRepository, OrderNotFoundError
+from ruperto.schemas import (
+    AssistantTurnResult,
+    CustomerSnapshot,
+    DevMessageRequest,
+    MenuItemSnapshot,
+    OrderSnapshot,
+    OrderStatusUpdateRequest,
+    StoreBusinessHoursSnapshot,
+    StoreBusinessHoursUpdateRequest,
+    StoreProfileSnapshot,
+)
 
 
 @dataclass(slots=True)
@@ -25,6 +39,11 @@ class ApplicationRuntime:
 def get_runtime(request: Request) -> ApplicationRuntime:
     """Return the initialized runtime from the current request."""
     return request.app.state.runtime
+
+
+AvailableMenuQuery = Annotated[bool, Query()]
+LimitQuery = Annotated[int, Query(ge=1, le=200)]
+OrderStatusQuery = Annotated[OrderStatus | None, Query()]
 
 
 @asynccontextmanager
@@ -41,7 +60,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await database.engine.dispose()
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901
     """Build the FastAPI application with a fully configured lifespan."""
     app = FastAPI(
         title="Ruperto API",
@@ -68,6 +87,104 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         runtime = get_runtime(request)
         await ping_database(runtime.database)
         return {"status": "ok", "database": "ok"}
+
+    @app.get("/api/store-profile", response_model=StoreProfileSnapshot)
+    async def read_store_profile(request: Request) -> StoreProfileSnapshot:
+        runtime = get_runtime(request)
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            return await repository.get_store_profile()
+
+    @app.get("/api/menu-items", response_model=list[MenuItemSnapshot])
+    async def read_menu_items(
+        request: Request,
+        only_available: AvailableMenuQuery = True,
+    ) -> list[MenuItemSnapshot]:
+        runtime = get_runtime(request)
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            return await repository.list_menu_items(only_available=only_available)
+
+    @app.get("/api/store-hours", response_model=list[StoreBusinessHoursSnapshot])
+    async def read_store_hours(request: Request) -> list[StoreBusinessHoursSnapshot]:
+        runtime = get_runtime(request)
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            return await repository.list_store_business_hours()
+
+    @app.put("/api/store-hours", response_model=list[StoreBusinessHoursSnapshot])
+    async def put_store_hours(
+        request: Request,
+        payload: StoreBusinessHoursUpdateRequest,
+    ) -> list[StoreBusinessHoursSnapshot]:
+        runtime = get_runtime(request)
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            updated_hours = await repository.replace_store_business_hours(
+                hours=[
+                    StoreBusinessHoursSnapshot(
+                        id=0,
+                        store_id=1,
+                        weekday=row.weekday,
+                        opens_at=row.opens_at,
+                        closes_at=row.closes_at,
+                        closed=row.closed,
+                    )
+                    for row in payload.hours
+                ]
+            )
+            await session.commit()
+            return updated_hours
+
+    @app.get("/api/customers", response_model=list[CustomerSnapshot])
+    async def read_customers(
+        request: Request,
+        limit: LimitQuery = 50,
+    ) -> list[CustomerSnapshot]:
+        runtime = get_runtime(request)
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            return await repository.list_customers(limit=limit)
+
+    @app.get("/api/orders", response_model=list[OrderSnapshot])
+    async def read_orders(
+        request: Request,
+        limit: LimitQuery = 50,
+        status: OrderStatusQuery = None,
+    ) -> list[OrderSnapshot]:
+        runtime = get_runtime(request)
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            return await repository.list_orders(limit=limit, status=status)
+
+    @app.patch("/api/orders/{order_id}/status", response_model=OrderSnapshot)
+    async def patch_order_status(
+        request: Request,
+        order_id: int,
+        payload: OrderStatusUpdateRequest,
+    ) -> OrderSnapshot:
+        runtime = get_runtime(request)
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            try:
+                updated_order = await repository.update_order_status(order_id, payload.status)
+            except OrderNotFoundError as error:
+                raise HTTPException(status_code=404, detail="Order not found.") from error
+            await session.commit()
+            return updated_order
+
+    @app.post("/api/dev/messages", response_model=AssistantTurnResult)
+    async def post_dev_message(request: Request, payload: DevMessageRequest) -> AssistantTurnResult:
+        runtime = get_runtime(request)
+        service = OrderingAssistantService(
+            session_factory=runtime.database.session_factory,
+            settings=runtime.settings,
+        )
+        return await service.handle_customer_message(
+            channel=Channel.DEV,
+            external_user_id=payload.external_user_id,
+            message_text=payload.message_text,
+        )
 
     return app
 

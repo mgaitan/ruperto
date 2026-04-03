@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
+from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 from pydantic_ai import ModelMessage
 from pydantic_ai.messages import ModelMessagesTypeAdapter
@@ -23,18 +25,71 @@ from ruperto.models import (
     OrderItem,
     OrderStatus,
     PaymentMethod,
+    StoreBusinessHours,
     StoreProfile,
     utc_now,
 )
 from ruperto.schemas import (
     CustomerMemorySnapshot,
     CustomerSnapshot,
+    DelayEstimateSnapshot,
     MenuItemSnapshot,
     OrderItemSnapshot,
     OrderSnapshot,
+    StoreAvailabilitySnapshot,
+    StoreBusinessHoursSnapshot,
     StoreProfileSnapshot,
     format_price_ars,
 )
+
+LARGE_ORDER_THRESHOLD_CENTS = 3000000
+DEFAULT_DELAY_MINUTES = 25
+KITCHEN_LOAD_COEFFICIENT_MINUTES = 3
+DEFAULT_PREPARATION_MINUTES = 15
+DELIVERY_EXTRA_MINUTES = 5
+ITEM_PREPARATION_MINUTES_BY_SKU = {
+    "empanadas de carne": 12,
+    "hamburguesa completa": 15,
+    "hamburguesa doble cheddar": 17,
+    "hamburguesa bbq": 16,
+    "milanesa napolitana": 18,
+    "pizza muzzarella": 20,
+    "pizza napolitana": 20,
+    "pizza fugazzeta": 21,
+    "pizza especial": 22,
+    "sanguche de milanesa": 14,
+    "gaseosa cola 1.5l": 2,
+    "agua sin gas 500ml": 1,
+    "cerveza rubia lata": 2,
+    "flan casero": 4,
+    "helado 1/4 kg": 3,
+    "brownie con nuez": 4,
+}
+ACTIVE_ORDER_STATUSES = {
+    OrderStatus.CONFIRMED,
+    OrderStatus.IN_PREPARATION,
+    OrderStatus.ALMOST_READY,
+    OrderStatus.READY_FOR_PICKUP,
+    OrderStatus.OUT_FOR_DELIVERY,
+}
+WEEKDAY_LABELS_ES = {
+    0: "lunes",
+    1: "martes",
+    2: "miércoles",
+    3: "jueves",
+    4: "viernes",
+    5: "sábado",
+    6: "domingo",
+}
+WEEKDAY_LABELS_ES = {
+    0: "lunes",
+    1: "martes",
+    2: "miércoles",
+    3: "jueves",
+    4: "viernes",
+    5: "sábado",
+    6: "domingo",
+}
 
 
 def normalize_phone_number(value: str | None) -> str | None:
@@ -72,6 +127,35 @@ class EmptyOrderError(ValueError):
         super().__init__("No se puede confirmar un pedido vacío.")
 
 
+class OrderNotFoundError(ValueError):
+    """Raised when the requested order does not exist."""
+
+    def __init__(self) -> None:
+        super().__init__("No se encontró el pedido solicitado.")
+
+
+class IncompleteOrderError(ValueError):
+    """Raised when trying to confirm a draft missing required checkout data."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+    @classmethod
+    def missing_delivery_type(cls) -> IncompleteOrderError:
+        """Return the error raised when delivery mode is still unknown."""
+        return cls("Necesito saber si es envío o retiro antes de confirmar.")
+
+    @classmethod
+    def missing_delivery_address(cls) -> IncompleteOrderError:
+        """Return the error raised when the draft still lacks a delivery address."""
+        return cls("Necesito la dirección de entrega antes de confirmar.")
+
+    @classmethod
+    def missing_payment_method(cls) -> IncompleteOrderError:
+        """Return the error raised when the draft still lacks a payment method."""
+        return cls("Necesito definir el medio de pago antes de confirmar.")
+
+
 class BusinessRepository:
     """Repository facade covering the core MVP entities."""
 
@@ -83,6 +167,75 @@ class BusinessRepository:
         row = await self.session.scalar(select(StoreProfile).where(StoreProfile.id == 1))
         assert row is not None
         return StoreProfileSnapshot.model_validate(row)
+
+    async def list_store_business_hours(self, *, store_id: int = 1) -> list[StoreBusinessHoursSnapshot]:
+        """Return the weekly opening-hours schedule for the store."""
+        rows = (
+            await self.session.scalars(
+                select(StoreBusinessHours)
+                .where(StoreBusinessHours.store_id == store_id)
+                .order_by(StoreBusinessHours.weekday.asc())
+            )
+        ).all()
+        return [self._store_business_hours_snapshot(row) for row in rows]
+
+    async def replace_store_business_hours(
+        self,
+        *,
+        hours: list[StoreBusinessHoursSnapshot],
+        store_id: int = 1,
+    ) -> list[StoreBusinessHoursSnapshot]:
+        """Replace the weekly opening-hours schedule for the store."""
+        existing_rows = (
+            await self.session.scalars(select(StoreBusinessHours).where(StoreBusinessHours.store_id == store_id))
+        ).all()
+        for row in existing_rows:
+            await self.session.delete(row)
+        await self.session.flush()
+
+        self.session.add_all(
+            [
+                StoreBusinessHours(
+                    store_id=store_id,
+                    weekday=row.weekday,
+                    opens_at=self._parse_hour_text(row.opens_at),
+                    closes_at=self._parse_hour_text(row.closes_at),
+                    closed=row.closed,
+                )
+                for row in hours
+            ]
+        )
+        await self.session.flush()
+        return await self.list_store_business_hours(store_id=store_id)
+
+    async def get_store_availability(
+        self,
+        *,
+        timezone_name: str,
+        now: datetime | None = None,
+        store_id: int = 1,
+    ) -> StoreAvailabilitySnapshot:
+        """Return whether the store is currently open and when it opens next."""
+        zone = ZoneInfo(timezone_name)
+        local_now = now.astimezone(zone) if now is not None else datetime.now(zone)
+        schedule = await self.list_store_business_hours(store_id=store_id)
+        today = next((row for row in schedule if row.weekday == local_now.weekday()), None)
+        current_time = local_now.time().replace(second=0, microsecond=0)
+
+        if self._is_open_at(today, current_time):
+            close_text = f" hasta las {today.closes_at}" if today is not None and today.closes_at is not None else ""
+            return StoreAvailabilitySnapshot(
+                is_open=True,
+                message_text=f"Estamos abiertos ahora 🍽️{close_text}.",
+                next_open_text=None,
+            )
+
+        next_open_text = self._find_next_opening_text(schedule, local_now)
+        return StoreAvailabilitySnapshot(
+            is_open=False,
+            message_text=f"Ahora estamos cerrados 😴 Abrimos {next_open_text}.",
+            next_open_text=next_open_text,
+        )
 
     async def list_menu_items(self, *, only_available: bool = True) -> list[MenuItemSnapshot]:
         """List menu items visible to customers."""
@@ -152,6 +305,15 @@ class BusinessRepository:
         customer = await self.session.get(Customer, customer_id)
         assert customer is not None
         return CustomerSnapshot.model_validate(customer)
+
+    async def list_customers(self, *, limit: int = 50) -> list[CustomerSnapshot]:
+        """List customers ordered by recent activity."""
+        rows = (
+            await self.session.scalars(
+                select(Customer).order_by(Customer.updated_at.desc(), Customer.id.desc()).limit(limit)
+            )
+        ).all()
+        return [CustomerSnapshot.model_validate(row) for row in rows]
 
     async def update_customer_name(self, customer_id: int, name: str) -> CustomerSnapshot:
         """Persist the customer name."""
@@ -269,6 +431,29 @@ class BusinessRepository:
             return None
         return await self._build_order_snapshot(order)
 
+    async def list_orders(
+        self,
+        *,
+        limit: int = 50,
+        status: OrderStatus | None = None,
+    ) -> list[OrderSnapshot]:
+        """List orders ordered by recent activity."""
+        statement = select(Order).order_by(Order.updated_at.desc(), Order.id.desc()).limit(limit)
+        if status is not None:
+            statement = statement.where(Order.status == status)
+        orders = (await self.session.scalars(statement)).all()
+        return [await self._build_order_snapshot(order) for order in orders]
+
+    async def update_order_status(self, order_id: int, status: OrderStatus) -> OrderSnapshot:
+        """Update the operational status for one order."""
+        order = await self.session.get(Order, order_id)
+        if order is None:
+            raise OrderNotFoundError
+        order.status = status
+        order.updated_at = utc_now()
+        await self.session.flush()
+        return await self._build_order_snapshot(order)
+
     async def add_item_to_current_order(
         self,
         customer_id: int,
@@ -352,6 +537,12 @@ class BusinessRepository:
         items = await self._load_order_items(order.id)
         if not items:
             raise EmptyOrderError
+        if order.delivery_type is None:
+            raise IncompleteOrderError.missing_delivery_type()
+        if order.delivery_type == DeliveryType.DELIVERY and not order.delivery_address:
+            raise IncompleteOrderError.missing_delivery_address()
+        if order.payment_method is None:
+            raise IncompleteOrderError.missing_payment_method()
 
         order.status = OrderStatus.CONFIRMED
         order.updated_at = utc_now()
@@ -384,6 +575,45 @@ class BusinessRepository:
             recent_items=recent_items,
         )
 
+    async def get_estimated_delay(self, customer_id: int, conversation_id: int) -> DelayEstimateSnapshot:
+        """Estimate the current preparation delay for the active or latest order."""
+        order = await self._get_draft_order(customer_id, conversation_id)
+        if order is None:
+            latest_order = await self.get_latest_order(customer_id, conversation_id)
+            if latest_order is None:
+                active_orders_ahead = await self.count_active_orders()
+                estimated_minutes = DEFAULT_DELAY_MINUTES + (active_orders_ahead * KITCHEN_LOAD_COEFFICIENT_MINUTES)
+                return DelayEstimateSnapshot(
+                    active_orders_ahead=active_orders_ahead,
+                    base_minutes=DEFAULT_DELAY_MINUTES,
+                    estimated_minutes=estimated_minutes,
+                    display_text=f"{estimated_minutes} minutos aproximadamente",
+                )
+            active_orders_ahead = await self.count_active_orders_ahead_by_order_id(latest_order.id)
+            return self._estimate_delay_from_snapshot(latest_order, active_orders_ahead=active_orders_ahead)
+
+        snapshot = await self._build_order_snapshot(order)
+        active_orders_ahead = await self.count_active_orders_ahead_by_order_id(order.id)
+        return self._estimate_delay_from_snapshot(snapshot, active_orders_ahead=active_orders_ahead)
+
+    async def count_active_orders(self) -> int:
+        """Count currently active non-draft orders in the kitchen pipeline."""
+        result = await self.session.scalar(select(func.count(Order.id)).where(Order.status.in_(ACTIVE_ORDER_STATUSES)))
+        return int(result or 0)
+
+    async def count_active_orders_ahead_by_order_id(self, order_id: int) -> int:
+        """Count active orders created before the given order."""
+        current_order = await self.session.get(Order, order_id)
+        assert current_order is not None
+        result = await self.session.scalar(
+            select(func.count(Order.id)).where(
+                Order.id != current_order.id,
+                Order.status.in_(ACTIVE_ORDER_STATUSES),
+                Order.created_at <= current_order.created_at,
+            )
+        )
+        return int(result or 0)
+
     def _menu_item_snapshot(self, item: MenuItem) -> MenuItemSnapshot:
         """Build a public menu snapshot."""
         return MenuItemSnapshot(
@@ -396,6 +626,17 @@ class BusinessRepository:
             price_cents=item.price_cents,
             image_url=item.image_url,
             price_display=format_price_ars(item.price_cents),
+        )
+
+    def _store_business_hours_snapshot(self, row: StoreBusinessHours) -> StoreBusinessHoursSnapshot:
+        """Build a serializable business-hours row."""
+        return StoreBusinessHoursSnapshot(
+            id=row.id,
+            store_id=row.store_id,
+            weekday=row.weekday,
+            opens_at=row.opens_at.strftime("%H:%M") if row.opens_at is not None else None,
+            closes_at=row.closes_at.strftime("%H:%M") if row.closes_at is not None else None,
+            closed=row.closed,
         )
 
     async def _get_draft_order(self, customer_id: int, conversation_id: int) -> Order | None:
@@ -458,3 +699,79 @@ class BusinessRepository:
                 for item in items
             ],
         )
+
+    def _estimate_delay_from_snapshot(
+        self,
+        order: OrderSnapshot,
+        *,
+        active_orders_ahead: int,
+    ) -> DelayEstimateSnapshot:
+        """Compute an MVP delay estimate based on preparation time and kitchen load."""
+        base_minutes = self._estimate_preparation_minutes(order)
+        estimated_minutes = base_minutes + (active_orders_ahead * KITCHEN_LOAD_COEFFICIENT_MINUTES)
+
+        return DelayEstimateSnapshot(
+            active_orders_ahead=active_orders_ahead,
+            base_minutes=base_minutes,
+            estimated_minutes=estimated_minutes,
+            display_text=f"{estimated_minutes} minutos aproximadamente",
+        )
+
+    def _estimate_preparation_minutes(self, order: OrderSnapshot) -> int:
+        """Estimate one order's base preparation time without kitchen load."""
+        if not order.items:
+            return DEFAULT_PREPARATION_MINUTES
+
+        line_minutes = [
+            ITEM_PREPARATION_MINUTES_BY_SKU.get(item.name.strip().lower(), DEFAULT_PREPARATION_MINUTES)
+            for item in order.items
+        ]
+        base_minutes = max(line_minutes)
+        total_quantity = sum(item.quantity for item in order.items)
+        distinct_items = len(order.items)
+
+        base_minutes += max(total_quantity - 1, 0) * 2
+        base_minutes += max(distinct_items - 1, 0) * 2
+        if order.delivery_type == DeliveryType.DELIVERY:
+            base_minutes += DELIVERY_EXTRA_MINUTES
+        if order.total_amount_cents >= LARGE_ORDER_THRESHOLD_CENTS:
+            base_minutes += 4
+        return base_minutes
+
+    def _is_open_at(self, row: StoreBusinessHoursSnapshot | None, current_time: time) -> bool:
+        """Return whether one schedule row covers the current time."""
+        if row is None or row.closed or row.opens_at is None or row.closes_at is None:
+            return False
+        opens_at = self._parse_hour_text(row.opens_at)
+        closes_at = self._parse_hour_text(row.closes_at)
+        assert opens_at is not None
+        assert closes_at is not None
+        return opens_at <= current_time < closes_at
+
+    def _find_next_opening_text(self, schedule: list[StoreBusinessHoursSnapshot], local_now: datetime) -> str:
+        """Find the next opening slot as a short Spanish phrase."""
+        for offset in range(8):
+            candidate_day = local_now + timedelta(days=offset)
+            row = next((item for item in schedule if item.weekday == candidate_day.weekday()), None)
+            if row is None or row.closed or row.opens_at is None:
+                continue
+
+            if offset == 0:
+                opens_at = self._parse_hour_text(row.opens_at)
+                assert opens_at is not None
+                if opens_at <= local_now.time():
+                    continue
+                return f"hoy a las {row.opens_at}"
+            if offset == 1:
+                return f"mañana a las {row.opens_at}"
+            weekday_name = WEEKDAY_LABELS_ES[candidate_day.weekday()]
+            return f"el {weekday_name} a las {row.opens_at}"
+
+        return "pronto"
+
+    def _parse_hour_text(self, value: str | None) -> time | None:
+        """Parse a `HH:MM` string into a time object."""
+        if value is None:
+            return None
+        hour_text, minute_text = value.split(":")
+        return time(hour=int(hour_text), minute=int(minute_text))

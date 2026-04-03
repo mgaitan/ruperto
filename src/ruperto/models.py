@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from enum import StrEnum
 
 from sqlalchemy import Enum as SqlEnum
-from sqlalchemy import ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import ForeignKey, String, Text, Time, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -31,6 +31,11 @@ class OrderStatus(StrEnum):
 
     DRAFT = "draft"
     CONFIRMED = "confirmed"
+    IN_PREPARATION = "in_preparation"
+    ALMOST_READY = "almost_ready"
+    READY_FOR_PICKUP = "ready_for_pickup"
+    OUT_FOR_DELIVERY = "out_for_delivery"
+    DELIVERED = "delivered"
     CANCELLED = "cancelled"
 
 
@@ -62,6 +67,22 @@ class StoreProfile(Base):
     assistant_personality: Mapped[str] = mapped_column(String(length=255))
     locale: Mapped[str] = mapped_column(String(length=32), default="es-AR")
     currency_code: Mapped[str] = mapped_column(String(length=8), default="ARS")
+    created_at: Mapped[datetime] = mapped_column(default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(default=utc_now, onupdate=utc_now)
+
+
+class StoreBusinessHours(Base):
+    """One weekly opening-hours window for the store."""
+
+    __tablename__ = "store_business_hours"
+    __table_args__ = (UniqueConstraint("store_id", "weekday", name="uq_store_business_hours"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("store_profile.id", ondelete="CASCADE"), default=1)
+    weekday: Mapped[int]
+    opens_at: Mapped[time | None] = mapped_column(Time(), nullable=True)
+    closes_at: Mapped[time | None] = mapped_column(Time(), nullable=True)
+    closed: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(default=utc_now, onupdate=utc_now)
 

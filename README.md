@@ -30,19 +30,42 @@ uv run ruperto init-db
 Run the API locally:
 
 ```bash
-uv run fastapi dev src/ruperto/app.py
+uv run fastapi dev
+```
+
+Run the development web chat UI:
+
+```bash
+uv run ruperto web-chat
 ```
 
 You should then have:
 
 - API root at `http://127.0.0.1:8000/`
 - health check at `http://127.0.0.1:8000/healthz`
+- store profile at `http://127.0.0.1:8000/api/store-profile`
+- menu listing at `http://127.0.0.1:8000/api/menu-items`
+- development chat endpoint at `http://127.0.0.1:8000/api/dev/messages`
+- development web chat at `http://127.0.0.1:7932/`
+
+The current development flow asks for the customer's name before the first
+order unless the customer already introduced themself in the opening message,
+estimates kitchen delay from preparation time plus active workload, and lets
+staff move orders through operational statuses with
+`PATCH /api/orders/{order_id}/status`.
+Store opening hours are now configurable through `GET/PUT /api/store-hours`,
+and customer replies mention the next opening time whenever the store is closed.
+The demo catalog now includes multiple food options plus drinks and desserts so
+local development can exercise simple add-on suggestions.
+Compact customer messages are also handled more naturally now, so the assistant
+can reuse cues such as a self-introduction, a payment hint like `te pago acá`,
+and a same-turn price question without asking for the same detail twice.
 
 ## Development
 
 - Install dependencies with `uv sync`.
 - Initialize the local database with `uv run ruperto init-db`.
-- Run the API locally with `make serve` or `uv run fastapi dev src/ruperto/app.py`.
+- Run the API locally with `make serve` or `uv run fastapi dev`.
 - New dependency releases are delayed by one week via `uv` cooldown (`[tool.uv].exclude-newer = "1 week"`), with per-package overrides when required (for example, `ty`).
 - Install [`prek`](https://github.com/j178/prek) as an external tool:
 

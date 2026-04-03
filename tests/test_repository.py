@@ -3,20 +3,33 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+from sqlalchemy import select
 
 from ruperto.config import Settings
 from ruperto.db import DatabaseRuntime, create_database_runtime, init_database
-from ruperto.models import Channel, DeliveryType, PaymentMethod
+from ruperto.models import Channel, DeliveryType, MenuItem, OrderStatus, PaymentMethod
 from ruperto.repository import BusinessRepository, normalize_phone_number
+from ruperto.schemas import StoreBusinessHoursSnapshot
 
 pytestmark = pytest.mark.anyio
 EXPECTED_HISTORY_MESSAGES = 2
 EXPECTED_ORDER_TOTAL = 1900000
 EXPECTED_SINGLE_BURGER_TOTAL = 950000
+EXPECTED_DELAY_MINUTES = 22
+DEFAULT_DELAY_MINUTES = 25
+DRAFT_DELAY_MINUTES = 15
+PICKUP_DELAY_MINUTES = 15
+LARGE_ORDER_DELAY_MINUTES = 31
+KITCHEN_LOAD_DELAY_MINUTES = 18
+EMPTY_DRAFT_DELAY_MINUTES = 15
+DEFAULT_WEEKLY_HOURS = 7
+UPDATED_WEEKLY_HOURS = 2
+MIN_MENU_ITEMS = 14
 
 
 async def build_repository(tmp_path: Path) -> tuple[BusinessRepository, DatabaseRuntime]:
@@ -55,14 +68,43 @@ async def test_bootstrap_seeds_store_menu_and_empty_memory(tmp_path: Path):
     memory = await repository.get_customer_memory(customer.id)
 
     assert store.locale == "es-AR"
-    assert menu
-    assert search[0].sku == "hamburguesa-completa"
+    assert len(await repository.list_store_business_hours()) == DEFAULT_WEEKLY_HOURS
+    assert len(menu) >= MIN_MENU_ITEMS
+    assert {item.sku for item in search} >= {"hamburguesa-completa", "hamburguesa-doble", "hamburguesa-bbq"}
+    assert any(item.category == "Bebidas" for item in menu)
+    assert any(item.category == "Postres" for item in menu)
     assert memory.favorite_item_name is None
     assert normalize_phone_number("+54 351-555-7788") == "+543515557788"
     assert normalize_phone_number("351 555 7788") == "3515557788"
     assert normalize_phone_number("   ") is None
 
     await close_repository(repository, runtime)
+
+
+async def test_init_database_backfills_missing_demo_menu_items(tmp_path: Path):
+    """Bootstrap adds missing demo items even when the menu already has rows."""
+    settings = Settings(
+        environment="test",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'repo-backfill.db'}",
+        store_name="Rotisería Test",
+        bot_name="Ruperto Test",
+    )
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+
+    async with runtime.session_factory() as session:
+        pizza = await session.scalar(select(MenuItem).where(MenuItem.sku == "pizza-especial"))
+        assert pizza is not None
+        await session.delete(pizza)
+        await session.commit()
+
+    await init_database(settings=settings, runtime=runtime)
+
+    async with runtime.session_factory() as session:
+        restored_pizza = await session.scalar(select(MenuItem).where(MenuItem.sku == "pizza-especial"))
+        assert restored_pizza is not None
+
+    await runtime.engine.dispose()
 
 
 async def test_customer_identity_and_message_history_are_persisted(tmp_path: Path):
@@ -175,6 +217,7 @@ async def test_order_lifecycle_and_customer_memory(tmp_path: Path):
     confirmed = await repository.confirm_current_order(customer.id, conversation.id)
     latest = await repository.get_latest_order(customer.id, conversation.id)
     memory = await repository.get_customer_memory(customer.id)
+    delay = await repository.get_estimated_delay(customer.id, conversation.id)
 
     assert draft.delivery_type == DeliveryType.DELIVERY
     assert draft.delivery_address == "Olegario Andrade 330"
@@ -184,6 +227,10 @@ async def test_order_lifecycle_and_customer_memory(tmp_path: Path):
     assert latest.status.value == "confirmed"
     assert confirmed.total_amount_cents == EXPECTED_ORDER_TOTAL
     assert confirmed.items[0].notes == "sin cebolla"
+    assert delay.base_minutes == EXPECTED_DELAY_MINUTES
+    assert delay.active_orders_ahead == 0
+    assert delay.estimated_minutes == EXPECTED_DELAY_MINUTES
+    assert delay.display_text == "22 minutos aproximadamente"
     assert memory.favorite_item_name == "Hamburguesa completa"
     assert memory.recent_items == ["Hamburguesa completa"]
 
@@ -231,5 +278,295 @@ async def test_order_creation_and_failures_have_explicit_messages(tmp_path: Path
             sku="producto-inexistente",
             quantity=1,
         )
+
+    await close_repository(repository, runtime)
+
+
+async def test_confirm_current_order_requires_delivery_choice_address_and_payment(tmp_path: Path):
+    """Draft confirmation requires the core checkout fields before closing the order."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="checkout-user")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="checkout-user",
+        customer_id=customer.id,
+    )
+
+    await repository.add_item_to_current_order(
+        customer.id,
+        conversation.id,
+        sku="hamburguesa-bbq",
+        quantity=1,
+    )
+    with pytest.raises(ValueError, match=re.escape("Necesito saber si es envío o retiro antes de confirmar.")):
+        await repository.confirm_current_order(customer.id, conversation.id)
+
+    await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.DELIVERY)
+    with pytest.raises(ValueError, match=re.escape("Necesito la dirección de entrega antes de confirmar.")):
+        await repository.confirm_current_order(customer.id, conversation.id)
+
+    await repository.set_order_delivery_address(customer.id, conversation.id, "Lavalle 12333")
+    with pytest.raises(ValueError, match=re.escape("Necesito definir el medio de pago antes de confirmar.")):
+        await repository.confirm_current_order(customer.id, conversation.id)
+
+    await close_repository(repository, runtime)
+
+
+async def test_delay_estimate_without_order_returns_store_default(tmp_path: Path):
+    """The repository can provide a generic delay estimate before any order exists."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="delay-user")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="delay-user",
+        customer_id=customer.id,
+    )
+
+    delay = await repository.get_estimated_delay(customer.id, conversation.id)
+
+    assert delay.base_minutes == DEFAULT_DELAY_MINUTES
+    assert delay.active_orders_ahead == 0
+    assert delay.estimated_minutes == DEFAULT_DELAY_MINUTES
+    assert delay.display_text == "25 minutos aproximadamente"
+
+    await close_repository(repository, runtime)
+
+
+async def test_delay_estimate_with_empty_draft_uses_base_preparation(tmp_path: Path):
+    """An empty draft still returns the default preparation base."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="delay-empty")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="delay-empty",
+        customer_id=customer.id,
+    )
+
+    await repository.get_current_order(customer.id, conversation.id)
+    delay = await repository.get_estimated_delay(customer.id, conversation.id)
+
+    assert delay.base_minutes == EMPTY_DRAFT_DELAY_MINUTES
+    assert delay.active_orders_ahead == 0
+    assert delay.estimated_minutes == EMPTY_DRAFT_DELAY_MINUTES
+
+    await close_repository(repository, runtime)
+
+
+async def test_delay_estimate_uses_draft_order_rules(tmp_path: Path):
+    """The delay estimate uses the current draft order when one exists."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="delay-draft")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="delay-draft",
+        customer_id=customer.id,
+    )
+
+    await repository.add_item_to_current_order(
+        customer.id,
+        conversation.id,
+        sku="hamburguesa-completa",
+        quantity=1,
+    )
+    draft_delay = await repository.get_estimated_delay(customer.id, conversation.id)
+    await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.PICKUP)
+    pickup_delay = await repository.get_estimated_delay(customer.id, conversation.id)
+
+    assert draft_delay.base_minutes == DRAFT_DELAY_MINUTES
+    assert draft_delay.estimated_minutes == DRAFT_DELAY_MINUTES
+    assert draft_delay.display_text == "15 minutos aproximadamente"
+    assert pickup_delay.base_minutes == PICKUP_DELAY_MINUTES
+    assert pickup_delay.estimated_minutes == PICKUP_DELAY_MINUTES
+    assert pickup_delay.display_text == "15 minutos aproximadamente"
+
+    await close_repository(repository, runtime)
+
+
+async def test_delay_estimate_adds_extra_time_for_large_orders(tmp_path: Path):
+    """Large confirmed orders add a small surcharge to the delay estimate."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="delay-large")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="delay-large",
+        customer_id=customer.id,
+    )
+
+    await repository.add_item_to_current_order(
+        customer.id,
+        conversation.id,
+        sku="milanesa-napolitana",
+        quantity=3,
+    )
+    await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.DELIVERY)
+    await repository.set_order_delivery_address(customer.id, conversation.id, "Lavalle 12333")
+    await repository.set_order_payment_method(customer.id, conversation.id, PaymentMethod.CASH)
+    await repository.confirm_current_order(customer.id, conversation.id)
+    delay = await repository.get_estimated_delay(customer.id, conversation.id)
+
+    assert delay.base_minutes == LARGE_ORDER_DELAY_MINUTES
+    assert delay.estimated_minutes == LARGE_ORDER_DELAY_MINUTES
+    assert delay.display_text == "31 minutos aproximadamente"
+
+    await close_repository(repository, runtime)
+
+
+async def test_delay_estimate_reflects_kitchen_load_from_previous_active_orders(tmp_path: Path):
+    """Earlier active orders increase the delay estimate for later orders."""
+    repository, runtime = await build_repository(tmp_path)
+
+    first_customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="load-1")
+    first_conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="load-1",
+        customer_id=first_customer.id,
+    )
+    await repository.add_item_to_current_order(
+        first_customer.id,
+        first_conversation.id,
+        sku="pizza-muzzarella",
+        quantity=1,
+    )
+    await repository.set_order_delivery_type(first_customer.id, first_conversation.id, DeliveryType.PICKUP)
+    await repository.set_order_payment_method(first_customer.id, first_conversation.id, PaymentMethod.CASH)
+    first_order = await repository.confirm_current_order(first_customer.id, first_conversation.id)
+    assert first_order.status == OrderStatus.CONFIRMED
+
+    second_customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="load-2")
+    second_conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="load-2",
+        customer_id=second_customer.id,
+    )
+    await repository.add_item_to_current_order(
+        second_customer.id,
+        second_conversation.id,
+        sku="hamburguesa-completa",
+        quantity=1,
+    )
+    delay = await repository.get_estimated_delay(second_customer.id, second_conversation.id)
+
+    assert delay.base_minutes == DRAFT_DELAY_MINUTES
+    assert delay.active_orders_ahead == 1
+    assert delay.estimated_minutes == KITCHEN_LOAD_DELAY_MINUTES
+    assert delay.display_text == "18 minutos aproximadamente"
+
+    await close_repository(repository, runtime)
+
+
+async def test_update_order_status_requires_an_existing_order(tmp_path: Path):
+    """Staff operations fail clearly when the order id does not exist."""
+    repository, runtime = await build_repository(tmp_path)
+
+    with pytest.raises(ValueError, match=re.escape("No se encontró el pedido solicitado.")):
+        await repository.update_order_status(999, OrderStatus.ALMOST_READY)
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_availability_reports_open_and_closed_windows(tmp_path: Path):
+    """The repository can tell whether the store is open and when it opens next."""
+    repository, runtime = await build_repository(tmp_path)
+
+    open_availability = await repository.get_store_availability(
+        timezone_name="America/Argentina/Cordoba",
+        now=datetime(2026, 4, 6, 15, 0, tzinfo=UTC),
+    )
+    closed_availability = await repository.get_store_availability(
+        timezone_name="America/Argentina/Cordoba",
+        now=datetime(2026, 4, 6, 5, 0, tzinfo=UTC),
+    )
+
+    assert open_availability.is_open is True
+    assert "abiertos ahora" in open_availability.message_text.lower()
+    assert closed_availability.is_open is False
+    assert closed_availability.next_open_text == "hoy a las 11:00"
+    assert "abrimos hoy a las 11:00" in closed_availability.message_text.lower()
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_business_hours_can_be_replaced(tmp_path: Path):
+    """Staff-defined schedules replace the seeded weekly hours."""
+    repository, runtime = await build_repository(tmp_path)
+
+    updated = await repository.replace_store_business_hours(
+        hours=[
+            StoreBusinessHoursSnapshot(
+                id=0,
+                store_id=1,
+                weekday=0,
+                opens_at=None,
+                closes_at=None,
+                closed=True,
+            ),
+            StoreBusinessHoursSnapshot(
+                id=0,
+                store_id=1,
+                weekday=1,
+                opens_at="18:00",
+                closes_at="23:30",
+                closed=False,
+            ),
+        ]
+    )
+
+    assert len(updated) == UPDATED_WEEKLY_HOURS
+    assert updated[0].closed is True
+    assert updated[1].opens_at == "18:00"
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_availability_can_report_tomorrow_or_later_openings(tmp_path: Path):
+    """The next opening text distinguishes tomorrow from a later weekday."""
+    repository, runtime = await build_repository(tmp_path)
+    await repository.replace_store_business_hours(
+        hours=[
+            StoreBusinessHoursSnapshot(id=0, store_id=1, weekday=0, opens_at=None, closes_at=None, closed=True),
+            StoreBusinessHoursSnapshot(id=0, store_id=1, weekday=1, opens_at="18:00", closes_at="23:00", closed=False),
+            StoreBusinessHoursSnapshot(id=0, store_id=1, weekday=2, opens_at="12:00", closes_at="23:00", closed=False),
+        ]
+    )
+
+    tomorrow_availability = await repository.get_store_availability(
+        timezone_name="America/Argentina/Cordoba",
+        now=datetime(2026, 4, 6, 5, 0, tzinfo=UTC),
+    )
+    assert tomorrow_availability.next_open_text == "mañana a las 18:00"
+
+    await repository.replace_store_business_hours(
+        hours=[
+            StoreBusinessHoursSnapshot(id=0, store_id=1, weekday=0, opens_at=None, closes_at=None, closed=True),
+            StoreBusinessHoursSnapshot(id=0, store_id=1, weekday=1, opens_at=None, closes_at=None, closed=True),
+            StoreBusinessHoursSnapshot(id=0, store_id=1, weekday=2, opens_at="12:00", closes_at="23:00", closed=False),
+        ]
+    )
+    weekday_availability = await repository.get_store_availability(
+        timezone_name="America/Argentina/Cordoba",
+        now=datetime(2026, 4, 6, 5, 0, tzinfo=UTC),
+    )
+
+    assert weekday_availability.next_open_text == "el miércoles a las 12:00"
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_availability_skips_today_when_the_shift_already_closed(tmp_path: Path):
+    """If today's shift already ended, the next opening should move to a later day."""
+    repository, runtime = await build_repository(tmp_path)
+    await repository.replace_store_business_hours(
+        hours=[
+            StoreBusinessHoursSnapshot(id=0, store_id=1, weekday=0, opens_at="11:00", closes_at="12:00", closed=False),
+            StoreBusinessHoursSnapshot(id=0, store_id=1, weekday=1, opens_at="18:00", closes_at="23:00", closed=False),
+        ]
+    )
+
+    availability = await repository.get_store_availability(
+        timezone_name="America/Argentina/Cordoba",
+        now=datetime(2026, 4, 6, 16, 0, tzinfo=UTC),
+    )
+
+    assert availability.next_open_text == "mañana a las 18:00"
 
     await close_repository(repository, runtime)
