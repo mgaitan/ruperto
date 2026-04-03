@@ -23,7 +23,7 @@ qa: ## Run local QA checks via prek
 	fi
 
 serve: ## Run the API locally with FastAPI CLI
-	@uv run fastapi dev src/ruperto/app.py
+	@uv run fastapi dev
 
 init-db: ## Initialize the local database
 	@uv run ruperto init-db

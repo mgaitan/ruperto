@@ -30,7 +30,13 @@ uv run ruperto init-db
 Run the API locally:
 
 ```bash
-uv run fastapi dev src/ruperto/app.py
+uv run fastapi dev
+```
+
+Run the development web chat UI:
+
+```bash
+uv run ruperto web-chat
 ```
 
 You should then have:
@@ -40,12 +46,13 @@ You should then have:
 - store profile at `http://127.0.0.1:8000/api/store-profile`
 - menu listing at `http://127.0.0.1:8000/api/menu-items`
 - development chat endpoint at `http://127.0.0.1:8000/api/dev/messages`
+- development web chat at `http://127.0.0.1:7932/`
 
 ## Development
 
 - Install dependencies with `uv sync`.
 - Initialize the local database with `uv run ruperto init-db`.
-- Run the API locally with `make serve` or `uv run fastapi dev src/ruperto/app.py`.
+- Run the API locally with `make serve` or `uv run fastapi dev`.
 - New dependency releases are delayed by one week via `uv` cooldown (`[tool.uv].exclude-newer = "1 week"`), with per-package overrides when required (for example, `ty`).
 - Install [`prek`](https://github.com/j178/prek) as an external tool:
 
