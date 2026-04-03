@@ -25,7 +25,13 @@ from ruperto.config import Settings
 from ruperto.db import create_database_runtime, init_database
 from ruperto.models import Channel, DeliveryType, PaymentMethod
 from ruperto.repository import BusinessRepository
-from ruperto.schemas import AssistantNextStep, CustomerSnapshot, StoreAvailabilitySnapshot, StoreBusinessHoursSnapshot
+from ruperto.schemas import (
+    AssistantNextStep,
+    AssistantReply,
+    CustomerSnapshot,
+    StoreAvailabilitySnapshot,
+    StoreBusinessHoursSnapshot,
+)
 
 pytestmark = pytest.mark.anyio
 MIN_HISTORY_MESSAGES = 10
@@ -622,6 +628,91 @@ async def test_assistant_mentions_next_opening_when_store_is_closed(tmp_path: Pa
 
     assert "ahora estamos cerrados" in reply.reply.reply_text.lower()
     assert "abrimos pronto" in reply.reply.reply_text.lower()
+
+    await runtime.engine.dispose()
+
+
+def informational_hallucination_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Return a menu answer polluted with unsupported order-completion claims."""
+    tool_returns = collect_tool_returns(messages)
+    if "lookup_customer" not in tool_returns:
+        return ModelResponse(
+            parts=[ToolCallPart("lookup_customer", {})],
+            model_name="function:test-informational-hallucination",
+        )
+    if "search_menu" not in tool_returns:
+        return ModelResponse(
+            parts=[ToolCallPart("search_menu", {"query": "hamburguesa"})],
+            model_name="function:test-informational-hallucination",
+        )
+    return ModelResponse(
+        parts=[
+            ToolCallPart(
+                info.output_tools[0].name,
+                {
+                    "reply_text": (
+                        "Tenemos hamburguesas. La completa sale $9.500 y la doble $11.900. "
+                        "Ya registré tu pedido y lo enviamos a Lavalle 12333. El pago es en efectivo."
+                    ),
+                    "next_step": "choose_items",
+                    "handoff": False,
+                },
+            )
+        ],
+        model_name="function:test-informational-hallucination",
+    )
+
+
+async def test_informational_turn_strips_hallucinated_order_claims(tmp_path: Path):
+    """Informational turns must not claim a completed order without actual order actions."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+
+    reply = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-info-limpia",
+        message_text="Hola, soy Martín. ¿Tenés hamburguesas? ¿Cuánto salen?",
+        model=FunctionModel(informational_hallucination_model),
+    )
+
+    assert "Lavalle" not in reply.reply.reply_text
+    assert "pago es" not in reply.reply.reply_text.lower()
+    assert "Todavía no armé ningún pedido." in reply.reply.reply_text
+    assert reply.current_order is None
+
+    await runtime.engine.dispose()
+
+
+async def test_ground_reply_keeps_safe_informational_text(tmp_path: Path):
+    """Safe informational replies pass through unchanged."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    original = service._ground_reply_for_turn_policy(
+        AssistantReply(reply_text="Tenemos hamburguesas y pizzas 🍔🍕", next_step=AssistantNextStep.CHOOSE_ITEMS),
+        service._analyze_turn_policy("¿Tenés hamburguesas?"),
+    )
+
+    assert original.reply_text == "Tenemos hamburguesas y pizzas 🍔🍕"
+
+    await runtime.engine.dispose()
+
+
+async def test_ground_reply_falls_back_when_every_sentence_is_suspicious(tmp_path: Path):
+    """Informational replies fallback to a safe text when nothing salvageable remains."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    grounded = service._ground_reply_for_turn_policy(
+        AssistantReply(
+            reply_text="Ya registré tu pedido. El pago es en efectivo. Gracias por tu compra.",
+            next_step=AssistantNextStep.COMPLETE,
+        ),
+        service._analyze_turn_policy("¿Tenés hamburguesas?"),
+    )
+
+    assert grounded.reply_text == "Puedo contarte las opciones y los precios, pero todavía no armé ningún pedido."
+    assert grounded.next_step == AssistantNextStep.CHOOSE_ITEMS
 
     await runtime.engine.dispose()
 
