@@ -83,6 +83,16 @@ INTRO_NAME_STOP_WORDS = {
     "aca",
     "pago",
 }
+SUSPICIOUS_INFORMATIONAL_REPLY_PATTERNS = (
+    re.compile(r"\bregistr[eé]\b", re.IGNORECASE),
+    re.compile(r"\btu pedido\b", re.IGNORECASE),
+    re.compile(r"\bpedido confirmado\b", re.IGNORECASE),
+    re.compile(r"\bse env[ií]a\b", re.IGNORECASE),
+    re.compile(r"\blo enviamos\b", re.IGNORECASE),
+    re.compile(r"\bpago es\b", re.IGNORECASE),
+    re.compile(r"\bgracias por tu compra\b", re.IGNORECASE),
+    re.compile(r"\babonar[áa]s?\b", re.IGNORECASE),
+)
 ORDER_INTENT_HINTS = (
     "quiero",
     "quisiera",
@@ -473,6 +483,9 @@ class OrderingAssistantService:
                 conversation_id,
             )
             reply = self._decorate_reply_with_store_availability(result.output, availability)
+            reply = self._ground_reply_for_turn_policy(reply, turn_policy)
+            if not turn_policy.allow_order_mutations:
+                current_order = None
             await session.commit()
             return AssistantTurnResult(
                 conversation_id=conversation_id,
@@ -734,6 +747,32 @@ class OrderingAssistantService:
         if not hints:
             return None
         return " ".join(hints)
+
+    def _ground_reply_for_turn_policy(self, reply: AssistantReply, turn_policy: TurnPolicy) -> AssistantReply:
+        """Strip unsupported order-completion claims from informational turns."""
+        if turn_policy.allow_order_mutations:
+            return reply
+        if not any(pattern.search(reply.reply_text) for pattern in SUSPICIOUS_INFORMATIONAL_REPLY_PATTERNS):
+            return reply
+
+        safe_sentences = [
+            sentence.strip()
+            for sentence in re.split(r"(?<=[.!?])\s+", reply.reply_text)
+            if sentence.strip()
+            and not any(pattern.search(sentence) for pattern in SUSPICIOUS_INFORMATIONAL_REPLY_PATTERNS)
+        ]
+        if safe_sentences:
+            safe_text = " ".join(safe_sentences)
+        else:
+            safe_text = "Puedo contarte las opciones y los precios, pero todavía no armé ningún pedido."
+        if "todavía no armé ningún pedido" not in safe_text.casefold():
+            safe_text = f"{safe_text} Todavía no armé ningún pedido."
+        return reply.model_copy(
+            update={
+                "reply_text": safe_text,
+                "next_step": AssistantNextStep.CHOOSE_ITEMS,
+            }
+        )
 
     def _detect_payment_method_hint(self, message_text: str) -> PaymentMethod | None:
         """Infer payment intent from common Argentine customer phrasing."""
