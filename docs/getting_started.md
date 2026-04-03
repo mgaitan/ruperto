@@ -41,6 +41,7 @@ Then open:
 - `http://127.0.0.1:8000/`
 - `http://127.0.0.1:8000/healthz`
 - `http://127.0.0.1:8000/api/store-profile`
+- `http://127.0.0.1:8000/api/store-hours`
 - `http://127.0.0.1:8000/api/menu-items`
 - `http://127.0.0.1:8000/api/customers`
 - `http://127.0.0.1:8000/api/orders`
@@ -85,6 +86,17 @@ curl -X PATCH http://127.0.0.1:8000/api/orders/1/status \
   -H 'content-type: application/json' \
   -d '{"status":"almost_ready"}'
 ```
+
+You can also replace the weekly opening-hours schedule:
+
+```bash
+curl -X PUT http://127.0.0.1:8000/api/store-hours \
+  -H 'content-type: application/json' \
+  -d '{"hours":[{"weekday":0,"opens_at":"11:00","closes_at":"23:00","closed":false},{"weekday":6,"opens_at":"19:00","closes_at":"23:00","closed":false}]}'
+```
+
+When the store is currently closed, customer replies mention the next opening
+time automatically.
 
 ## 4. Run quality checks
 

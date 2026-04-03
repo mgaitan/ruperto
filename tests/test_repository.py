@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from ruperto.config import Settings
 from ruperto.db import DatabaseRuntime, create_database_runtime, init_database
 from ruperto.models import Channel, DeliveryType, OrderStatus, PaymentMethod
 from ruperto.repository import BusinessRepository, normalize_phone_number
+from ruperto.schemas import StoreBusinessHoursSnapshot
 
 pytestmark = pytest.mark.anyio
 EXPECTED_HISTORY_MESSAGES = 2
@@ -24,6 +26,8 @@ PICKUP_DELAY_MINUTES = 15
 LARGE_ORDER_DELAY_MINUTES = 31
 KITCHEN_LOAD_DELAY_MINUTES = 18
 EMPTY_DRAFT_DELAY_MINUTES = 15
+DEFAULT_WEEKLY_HOURS = 7
+UPDATED_WEEKLY_HOURS = 2
 
 
 async def build_repository(tmp_path: Path) -> tuple[BusinessRepository, DatabaseRuntime]:
@@ -62,6 +66,7 @@ async def test_bootstrap_seeds_store_menu_and_empty_memory(tmp_path: Path):
     memory = await repository.get_customer_memory(customer.id)
 
     assert store.locale == "es-AR"
+    assert len(await repository.list_store_business_hours()) == DEFAULT_WEEKLY_HOURS
     assert menu
     assert search[0].sku == "hamburguesa-completa"
     assert memory.favorite_item_name is None
@@ -391,5 +396,113 @@ async def test_update_order_status_requires_an_existing_order(tmp_path: Path):
 
     with pytest.raises(ValueError, match=re.escape("No se encontró el pedido solicitado.")):
         await repository.update_order_status(999, OrderStatus.ALMOST_READY)
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_availability_reports_open_and_closed_windows(tmp_path: Path):
+    """The repository can tell whether the store is open and when it opens next."""
+    repository, runtime = await build_repository(tmp_path)
+
+    open_availability = await repository.get_store_availability(
+        timezone_name="America/Argentina/Cordoba",
+        now=datetime(2026, 4, 6, 15, 0, tzinfo=UTC),
+    )
+    closed_availability = await repository.get_store_availability(
+        timezone_name="America/Argentina/Cordoba",
+        now=datetime(2026, 4, 6, 5, 0, tzinfo=UTC),
+    )
+
+    assert open_availability.is_open is True
+    assert "abiertos ahora" in open_availability.message_text.lower()
+    assert closed_availability.is_open is False
+    assert closed_availability.next_open_text == "hoy a las 11:00"
+    assert "abrimos hoy a las 11:00" in closed_availability.message_text.lower()
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_business_hours_can_be_replaced(tmp_path: Path):
+    """Staff-defined schedules replace the seeded weekly hours."""
+    repository, runtime = await build_repository(tmp_path)
+
+    updated = await repository.replace_store_business_hours(
+        hours=[
+            StoreBusinessHoursSnapshot(
+                id=0,
+                store_id=1,
+                weekday=0,
+                opens_at=None,
+                closes_at=None,
+                closed=True,
+            ),
+            StoreBusinessHoursSnapshot(
+                id=0,
+                store_id=1,
+                weekday=1,
+                opens_at="18:00",
+                closes_at="23:30",
+                closed=False,
+            ),
+        ]
+    )
+
+    assert len(updated) == UPDATED_WEEKLY_HOURS
+    assert updated[0].closed is True
+    assert updated[1].opens_at == "18:00"
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_availability_can_report_tomorrow_or_later_openings(tmp_path: Path):
+    """The next opening text distinguishes tomorrow from a later weekday."""
+    repository, runtime = await build_repository(tmp_path)
+    await repository.replace_store_business_hours(
+        hours=[
+            StoreBusinessHoursSnapshot(id=0, store_id=1, weekday=0, opens_at=None, closes_at=None, closed=True),
+            StoreBusinessHoursSnapshot(id=0, store_id=1, weekday=1, opens_at="18:00", closes_at="23:00", closed=False),
+            StoreBusinessHoursSnapshot(id=0, store_id=1, weekday=2, opens_at="12:00", closes_at="23:00", closed=False),
+        ]
+    )
+
+    tomorrow_availability = await repository.get_store_availability(
+        timezone_name="America/Argentina/Cordoba",
+        now=datetime(2026, 4, 6, 5, 0, tzinfo=UTC),
+    )
+    assert tomorrow_availability.next_open_text == "mañana a las 18:00"
+
+    await repository.replace_store_business_hours(
+        hours=[
+            StoreBusinessHoursSnapshot(id=0, store_id=1, weekday=0, opens_at=None, closes_at=None, closed=True),
+            StoreBusinessHoursSnapshot(id=0, store_id=1, weekday=1, opens_at=None, closes_at=None, closed=True),
+            StoreBusinessHoursSnapshot(id=0, store_id=1, weekday=2, opens_at="12:00", closes_at="23:00", closed=False),
+        ]
+    )
+    weekday_availability = await repository.get_store_availability(
+        timezone_name="America/Argentina/Cordoba",
+        now=datetime(2026, 4, 6, 5, 0, tzinfo=UTC),
+    )
+
+    assert weekday_availability.next_open_text == "el miércoles a las 12:00"
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_availability_skips_today_when_the_shift_already_closed(tmp_path: Path):
+    """If today's shift already ended, the next opening should move to a later day."""
+    repository, runtime = await build_repository(tmp_path)
+    await repository.replace_store_business_hours(
+        hours=[
+            StoreBusinessHoursSnapshot(id=0, store_id=1, weekday=0, opens_at="11:00", closes_at="12:00", closed=False),
+            StoreBusinessHoursSnapshot(id=0, store_id=1, weekday=1, opens_at="18:00", closes_at="23:00", closed=False),
+        ]
+    )
+
+    availability = await repository.get_store_availability(
+        timezone_name="America/Argentina/Cordoba",
+        now=datetime(2026, 4, 6, 16, 0, tzinfo=UTC),
+    )
+
+    assert availability.next_open_text == "mañana a las 18:00"
 
     await close_repository(repository, runtime)

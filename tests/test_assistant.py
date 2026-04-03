@@ -3,19 +3,20 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 from pydantic import SecretStr
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from ruperto.assistant import OrderingAssistantService, build_google_model
+from ruperto.assistant import OrderingAssistantService, build_google_model, get_store_availability
 from ruperto.config import Settings
 from ruperto.db import create_database_runtime, init_database
 from ruperto.models import Channel
 from ruperto.repository import BusinessRepository
-from ruperto.schemas import AssistantNextStep
+from ruperto.schemas import AssistantNextStep, StoreAvailabilitySnapshot, StoreBusinessHoursSnapshot
 
 pytestmark = pytest.mark.anyio
 MIN_HISTORY_MESSAGES = 10
@@ -375,5 +376,97 @@ async def test_name_candidate_heuristics_cover_edge_cases(tmp_path: Path):
         service._extract_latest_assistant_text([ModelRequest(parts=[ToolReturnPart(tool_name="x", content={})])])
         is None
     )
+
+    await runtime.engine.dispose()
+
+
+async def test_assistant_mentions_next_opening_when_store_is_closed(tmp_path: Path):
+    """Replies are prefixed with the closed-store notice outside business hours."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        service,
+        channel=Channel.DEV,
+        external_user_id="cliente-cerrado",
+        name="Martina",
+    )
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        await repository.replace_store_business_hours(
+            hours=[
+                StoreBusinessHoursSnapshot(
+                    id=0,
+                    store_id=1,
+                    weekday=weekday,
+                    opens_at=None,
+                    closes_at=None,
+                    closed=True,
+                )
+                for weekday in range(7)
+            ]
+        )
+        await session.commit()
+
+    reply = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-cerrado",
+        message_text="Quiero una hamburguesa",
+        model=FunctionModel(transactional_model),
+    )
+
+    assert "ahora estamos cerrados" in reply.reply.reply_text.lower()
+    assert "abrimos pronto" in reply.reply.reply_text.lower()
+
+    await runtime.engine.dispose()
+
+
+async def test_store_availability_tool_uses_configured_timezone(tmp_path: Path):
+    """The availability tool delegates with the configured store timezone."""
+    settings = build_settings(tmp_path)
+    ctx = type(
+        "Ctx",
+        (),
+        {
+            "deps": type(
+                "Deps",
+                (),
+                {
+                    "settings": settings,
+                    "session_factory": object(),
+                    "customer_id": 1,
+                    "conversation_id": 1,
+                },
+            )()
+        },
+    )()
+
+    original = get_store_availability.__globals__["with_repository"]
+    mocked_with_repository = AsyncMock(return_value={"ok": True})
+    get_store_availability.__globals__["with_repository"] = mocked_with_repository
+    try:
+        result = await get_store_availability(cast(Any, ctx))
+    finally:
+        get_store_availability.__globals__["with_repository"] = original
+
+    assert result == {"ok": True}
+    mocked_with_repository.assert_awaited_once()
+
+
+async def test_closed_store_text_is_not_prefixed_twice(tmp_path: Path):
+    """Closed-store decorations stay idempotent when the prefix is already present."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    availability = StoreAvailabilitySnapshot(
+        is_open=False,
+        message_text="Ahora estamos cerrados 😴 Abrimos mañana a las 11:00.",
+        next_open_text="mañana a las 11:00",
+    )
+
+    decorated = service._decorate_closed_store_text(availability.message_text, availability)
+
+    assert decorated == availability.message_text
 
     await runtime.engine.dispose()

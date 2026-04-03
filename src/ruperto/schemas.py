@@ -35,6 +35,25 @@ class StoreProfileSnapshot(BaseSchema):
     currency_code: str
 
 
+class StoreBusinessHoursSnapshot(BaseSchema):
+    """One opening-hours row for the weekly store schedule."""
+
+    id: int
+    store_id: int
+    weekday: int
+    opens_at: str | None
+    closes_at: str | None
+    closed: bool
+
+
+class StoreAvailabilitySnapshot(BaseModel):
+    """Current store availability for conversational messaging."""
+
+    is_open: bool
+    message_text: str
+    next_open_text: str | None = None
+
+
 class CustomerSnapshot(BaseSchema):
     """Current customer data known by the system."""
 
@@ -141,3 +160,18 @@ class OrderStatusUpdateRequest(BaseModel):
     """Payload accepted by staff endpoints to update one order status."""
 
     status: OrderStatus
+
+
+class StoreBusinessHoursUpdateEntry(BaseModel):
+    """One staff-supplied business-hours row."""
+
+    weekday: int = Field(ge=0, le=6)
+    opens_at: str | None = None
+    closes_at: str | None = None
+    closed: bool = False
+
+
+class StoreBusinessHoursUpdateRequest(BaseModel):
+    """Payload accepted by staff endpoints to replace the weekly schedule."""
+
+    hours: list[StoreBusinessHoursUpdateEntry]

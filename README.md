@@ -52,6 +52,8 @@ The current development flow asks for the customer's name before the first
 order, estimates kitchen delay from preparation time plus active workload, and
 lets staff move orders through operational statuses with
 `PATCH /api/orders/{order_id}/status`.
+Store opening hours are now configurable through `GET/PUT /api/store-hours`,
+and customer replies mention the next opening time whenever the store is closed.
 
 ## Development
 

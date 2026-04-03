@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import time
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,6 +16,16 @@ class MenuSeed:
     category: str
     price_cents: int
     image_url: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BusinessHoursSeed:
+    """Static business-hours data used to bootstrap one weekly schedule."""
+
+    weekday: int
+    opens_at: time | None
+    closes_at: time | None
+    closed: bool = False
 
 
 DEMO_MENU_ITEMS: tuple[MenuSeed, ...] = (
@@ -53,4 +64,15 @@ DEMO_MENU_ITEMS: tuple[MenuSeed, ...] = (
         category="Sandwiches",
         price_cents=890000,
     ),
+)
+
+
+DEFAULT_BUSINESS_HOURS: tuple[BusinessHoursSeed, ...] = (
+    BusinessHoursSeed(weekday=0, opens_at=time(hour=11), closes_at=time(hour=23)),
+    BusinessHoursSeed(weekday=1, opens_at=time(hour=11), closes_at=time(hour=23)),
+    BusinessHoursSeed(weekday=2, opens_at=time(hour=11), closes_at=time(hour=23)),
+    BusinessHoursSeed(weekday=3, opens_at=time(hour=11), closes_at=time(hour=23)),
+    BusinessHoursSeed(weekday=4, opens_at=time(hour=11), closes_at=time(hour=23)),
+    BusinessHoursSeed(weekday=5, opens_at=time(hour=11), closes_at=time(hour=23)),
+    BusinessHoursSeed(weekday=6, opens_at=time(hour=19), closes_at=time(hour=23)),
 )

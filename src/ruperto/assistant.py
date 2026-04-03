@@ -25,6 +25,7 @@ from ruperto.schemas import (
     DelayEstimateSnapshot,
     MenuItemSnapshot,
     OrderSnapshot,
+    StoreAvailabilitySnapshot,
 )
 
 BASE_INSTRUCTIONS = """
@@ -32,6 +33,7 @@ Sos el asistente virtual de un local de comida en Argentina.
 
 Reglas operativas:
 - Respondés siempre en español de Argentina, con tono amable, claro y breve.
+- Usá algunos emojis simples y útiles cuando sumen calidez o claridad, sin exagerar.
 - No inventes productos, precios, stock, direcciones, tiempos ni pagos.
 - Para cualquier dato del negocio tenés que usar herramientas.
 - Hace una sola pregunta por vez cuando falten datos.
@@ -39,12 +41,14 @@ Reglas operativas:
 - Prioriza cerrar el pedido con la menor fricción posible.
 - Si el cliente ya es conocido y hay una memoria útil, podés mencionarla con naturalidad.
 - Si preguntan por demora o tiempo estimado, usá la herramienta de demora disponible.
+- Si el local está cerrado, podés seguir ayudando pero avisá claramente cuándo vuelve a abrir.
 - Si el cliente pide algo fuera del alcance del bot, deriva a una persona.
 """.strip()
 
-NAME_PROMPT_TEXT = "Antes de seguir con el pedido, ¿me decís tu nombre?"
-NAME_CONFIRMATION_TEMPLATE = "Gracias, {name}. ¿Qué querés pedir hoy?"
+NAME_PROMPT_TEXT = "👋 Antes de seguir con el pedido, ¿me decís tu nombre?"
+NAME_CONFIRMATION_TEMPLATE = "¡Gracias, {name}! 😄 ¿Qué querés pedir hoy?"
 MAX_NAME_WORDS = 3
+CLOSED_STORE_PREFIX = "{message_text} "
 
 
 @dataclass(slots=True)
@@ -141,6 +145,17 @@ async def get_estimated_delay(ctx: RunContext[AssistantDeps]) -> DelayEstimateSn
         lambda repository: repository.get_estimated_delay(
             ctx.deps.customer_id,
             ctx.deps.conversation_id,
+        ),
+    )
+
+
+@ordering_agent.tool
+async def get_store_availability(ctx: RunContext[AssistantDeps]) -> StoreAvailabilitySnapshot:
+    """Return whether the store is open and the next opening time."""
+    return await with_repository(
+        ctx,
+        lambda repository: repository.get_store_availability(
+            timezone_name=ctx.deps.settings.store_timezone,
         ),
     )
 
@@ -288,6 +303,7 @@ class OrderingAssistantService:
                 external_id=external_user_id,
                 customer_id=customer.id,
             )
+            availability = await repository.get_store_availability(timezone_name=self.settings.store_timezone)
             history = await repository.load_conversation_messages(conversation.id)
             deps = AssistantDeps(
                 settings=self.settings,
@@ -302,6 +318,7 @@ class OrderingAssistantService:
                 conversation_id=conversation.id,
                 history=history,
                 message_text=message_text,
+                availability=availability,
             )
             if direct_reply is not None:
                 await session.commit()
@@ -327,15 +344,16 @@ class OrderingAssistantService:
                 customer_id,
                 conversation_id,
             )
+            reply = self._decorate_reply_with_store_availability(result.output, availability)
             await session.commit()
             return AssistantTurnResult(
                 conversation_id=conversation_id,
                 customer=refreshed_customer,
-                reply=result.output,
+                reply=reply,
                 current_order=current_order,
             )
 
-    async def _maybe_handle_missing_customer_name(
+    async def _maybe_handle_missing_customer_name(  # noqa: PLR0913
         self,
         *,
         repository: BusinessRepository,
@@ -343,6 +361,7 @@ class OrderingAssistantService:
         conversation_id: int,
         history: list[ModelMessage],
         message_text: str,
+        availability: StoreAvailabilitySnapshot,
     ) -> AssistantTurnResult | None:
         """Handle the initial name-capture flow deterministically before invoking the model."""
         if customer.name is not None:
@@ -352,7 +371,10 @@ class OrderingAssistantService:
             if name := self._extract_name_candidate(message_text):
                 updated_customer = await repository.update_customer_name(customer.id, name)
                 reply = AssistantReply(
-                    reply_text=NAME_CONFIRMATION_TEMPLATE.format(name=updated_customer.name),
+                    reply_text=self._decorate_closed_store_text(
+                        NAME_CONFIRMATION_TEMPLATE.format(name=updated_customer.name),
+                        availability,
+                    ),
                     next_step=AssistantNextStep.CHOOSE_ITEMS,
                     handoff=False,
                 )
@@ -370,7 +392,10 @@ class OrderingAssistantService:
                 )
 
             reply = AssistantReply(
-                reply_text="Necesito tu nombre para seguir con el pedido. ¿Cómo te llamás?",
+                reply_text=self._decorate_closed_store_text(
+                    "🙂 Necesito tu nombre para seguir con el pedido. ¿Cómo te llamás?",
+                    availability,
+                ),
                 next_step=AssistantNextStep.ASK_NAME,
                 handoff=False,
             )
@@ -388,7 +413,7 @@ class OrderingAssistantService:
             )
 
         reply = AssistantReply(
-            reply_text=NAME_PROMPT_TEXT,
+            reply_text=self._decorate_closed_store_text(NAME_PROMPT_TEXT, availability),
             next_step=AssistantNextStep.ASK_NAME,
             handoff=False,
         )
@@ -467,3 +492,25 @@ class OrderingAssistantService:
         if any(term in lowered for term in blocked_terms):
             return None
         return cleaned.title()
+
+    def _decorate_reply_with_store_availability(
+        self,
+        reply: AssistantReply,
+        availability: StoreAvailabilitySnapshot,
+    ) -> AssistantReply:
+        """Prefix replies when the store is currently closed."""
+        if availability.is_open:
+            return reply
+        return reply.model_copy(
+            update={
+                "reply_text": self._decorate_closed_store_text(reply.reply_text, availability),
+            }
+        )
+
+    def _decorate_closed_store_text(self, reply_text: str, availability: StoreAvailabilitySnapshot) -> str:
+        """Prefix a reply with the store-closed notice when needed."""
+        if availability.is_open:
+            return reply_text
+        if reply_text.startswith(availability.message_text):
+            return reply_text
+        return CLOSED_STORE_PREFIX.format(message_text=availability.message_text) + reply_text

@@ -22,6 +22,8 @@ from ruperto.schemas import (
     MenuItemSnapshot,
     OrderSnapshot,
     OrderStatusUpdateRequest,
+    StoreBusinessHoursSnapshot,
+    StoreBusinessHoursUpdateRequest,
     StoreProfileSnapshot,
 )
 
@@ -58,7 +60,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await database.engine.dispose()
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901
     """Build the FastAPI application with a fully configured lifespan."""
     app = FastAPI(
         title="Ruperto API",
@@ -102,6 +104,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async with runtime.database.session_factory() as session:
             repository = BusinessRepository(session)
             return await repository.list_menu_items(only_available=only_available)
+
+    @app.get("/api/store-hours", response_model=list[StoreBusinessHoursSnapshot])
+    async def read_store_hours(request: Request) -> list[StoreBusinessHoursSnapshot]:
+        runtime = get_runtime(request)
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            return await repository.list_store_business_hours()
+
+    @app.put("/api/store-hours", response_model=list[StoreBusinessHoursSnapshot])
+    async def put_store_hours(
+        request: Request,
+        payload: StoreBusinessHoursUpdateRequest,
+    ) -> list[StoreBusinessHoursSnapshot]:
+        runtime = get_runtime(request)
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            updated_hours = await repository.replace_store_business_hours(
+                hours=[
+                    StoreBusinessHoursSnapshot(
+                        id=0,
+                        store_id=1,
+                        weekday=row.weekday,
+                        opens_at=row.opens_at,
+                        closes_at=row.closes_at,
+                        closed=row.closed,
+                    )
+                    for row in payload.hours
+                ]
+            )
+            await session.commit()
+            return updated_hours
 
     @app.get("/api/customers", response_model=list[CustomerSnapshot])
     async def read_customers(

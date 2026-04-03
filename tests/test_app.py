@@ -18,6 +18,8 @@ from ruperto.models import OrderStatus
 HTTP_OK = 200
 HTTP_NOT_FOUND = 404
 MIN_MENU_ITEMS = 5
+DEFAULT_WEEKLY_HOURS = 7
+UPDATED_WEEKLY_HOURS = 2
 
 
 def build_settings(tmp_path: Path, *, auto_init_db: bool = True) -> Settings:
@@ -126,6 +128,7 @@ def test_mvp_api_surface_exposes_dev_chat_and_read_models(tmp_path: Path, monkey
 
     with TestClient(app) as client:
         store_response = client.get("/api/store-profile")
+        store_hours_response = client.get("/api/store-hours")
         menu_response = client.get("/api/menu-items", params={"only_available": "false"})
         first_chat_response = client.post(
             "/api/dev/messages",
@@ -145,6 +148,8 @@ def test_mvp_api_surface_exposes_dev_chat_and_read_models(tmp_path: Path, monkey
 
     assert store_response.status_code == HTTP_OK
     assert store_response.json()["locale"] == "es-AR"
+    assert store_hours_response.status_code == HTTP_OK
+    assert len(store_hours_response.json()) == DEFAULT_WEEKLY_HOURS
 
     assert menu_response.status_code == HTTP_OK
     assert len(menu_response.json()) >= MIN_MENU_ITEMS
@@ -202,3 +207,24 @@ def test_staff_update_order_status_returns_not_found_for_unknown_order(tmp_path:
 
     assert response.status_code == HTTP_NOT_FOUND
     assert response.json()["detail"] == "Order not found."
+
+
+def test_staff_can_replace_store_hours(tmp_path: Path):
+    """The staff API can replace the weekly opening-hours schedule."""
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/api/store-hours",
+            json={
+                "hours": [
+                    {"weekday": 0, "opens_at": None, "closes_at": None, "closed": True},
+                    {"weekday": 1, "opens_at": "18:00", "closes_at": "23:30", "closed": False},
+                ]
+            },
+        )
+
+    assert response.status_code == HTTP_OK
+    assert len(response.json()) == UPDATED_WEEKLY_HOURS
+    assert response.json()[0]["closed"] is True
+    assert response.json()[1]["opens_at"] == "18:00"

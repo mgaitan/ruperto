@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     store_description: str = "Rotisería de barrio con pedidos asistidos por chat."
     assistant_personality: str = "Amable, ágil y confiable."
     store_locale: str = "es-AR"
+    store_timezone: str = "America/Argentina/Cordoba"
 
     gemini_model: str = "gemini-2.5-flash"
     gemini_api_key: SecretStr | None = None
@@ -51,6 +52,7 @@ class Settings(BaseSettings):
             "store_description": self.store_description,
             "assistant_personality": self.assistant_personality,
             "store_locale": self.store_locale,
+            "store_timezone": self.store_timezone,
             "gemini_model": self.gemini_model,
             "gemini_api_key_configured": self.gemini_api_key is not None,
             "kapso_api_key_configured": self.kapso_api_key is not None,

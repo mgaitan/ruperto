@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
+from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 from pydantic_ai import ModelMessage
 from pydantic_ai.messages import ModelMessagesTypeAdapter
@@ -23,6 +25,7 @@ from ruperto.models import (
     OrderItem,
     OrderStatus,
     PaymentMethod,
+    StoreBusinessHours,
     StoreProfile,
     utc_now,
 )
@@ -33,6 +36,8 @@ from ruperto.schemas import (
     MenuItemSnapshot,
     OrderItemSnapshot,
     OrderSnapshot,
+    StoreAvailabilitySnapshot,
+    StoreBusinessHoursSnapshot,
     StoreProfileSnapshot,
     format_price_ars,
 )
@@ -55,6 +60,24 @@ ACTIVE_ORDER_STATUSES = {
     OrderStatus.ALMOST_READY,
     OrderStatus.READY_FOR_PICKUP,
     OrderStatus.OUT_FOR_DELIVERY,
+}
+WEEKDAY_LABELS_ES = {
+    0: "lunes",
+    1: "martes",
+    2: "miércoles",
+    3: "jueves",
+    4: "viernes",
+    5: "sábado",
+    6: "domingo",
+}
+WEEKDAY_LABELS_ES = {
+    0: "lunes",
+    1: "martes",
+    2: "miércoles",
+    3: "jueves",
+    4: "viernes",
+    5: "sábado",
+    6: "domingo",
 }
 
 
@@ -111,6 +134,75 @@ class BusinessRepository:
         row = await self.session.scalar(select(StoreProfile).where(StoreProfile.id == 1))
         assert row is not None
         return StoreProfileSnapshot.model_validate(row)
+
+    async def list_store_business_hours(self, *, store_id: int = 1) -> list[StoreBusinessHoursSnapshot]:
+        """Return the weekly opening-hours schedule for the store."""
+        rows = (
+            await self.session.scalars(
+                select(StoreBusinessHours)
+                .where(StoreBusinessHours.store_id == store_id)
+                .order_by(StoreBusinessHours.weekday.asc())
+            )
+        ).all()
+        return [self._store_business_hours_snapshot(row) for row in rows]
+
+    async def replace_store_business_hours(
+        self,
+        *,
+        hours: list[StoreBusinessHoursSnapshot],
+        store_id: int = 1,
+    ) -> list[StoreBusinessHoursSnapshot]:
+        """Replace the weekly opening-hours schedule for the store."""
+        existing_rows = (
+            await self.session.scalars(select(StoreBusinessHours).where(StoreBusinessHours.store_id == store_id))
+        ).all()
+        for row in existing_rows:
+            await self.session.delete(row)
+        await self.session.flush()
+
+        self.session.add_all(
+            [
+                StoreBusinessHours(
+                    store_id=store_id,
+                    weekday=row.weekday,
+                    opens_at=self._parse_hour_text(row.opens_at),
+                    closes_at=self._parse_hour_text(row.closes_at),
+                    closed=row.closed,
+                )
+                for row in hours
+            ]
+        )
+        await self.session.flush()
+        return await self.list_store_business_hours(store_id=store_id)
+
+    async def get_store_availability(
+        self,
+        *,
+        timezone_name: str,
+        now: datetime | None = None,
+        store_id: int = 1,
+    ) -> StoreAvailabilitySnapshot:
+        """Return whether the store is currently open and when it opens next."""
+        zone = ZoneInfo(timezone_name)
+        local_now = now.astimezone(zone) if now is not None else datetime.now(zone)
+        schedule = await self.list_store_business_hours(store_id=store_id)
+        today = next((row for row in schedule if row.weekday == local_now.weekday()), None)
+        current_time = local_now.time().replace(second=0, microsecond=0)
+
+        if self._is_open_at(today, current_time):
+            close_text = f" hasta las {today.closes_at}" if today is not None and today.closes_at is not None else ""
+            return StoreAvailabilitySnapshot(
+                is_open=True,
+                message_text=f"Estamos abiertos ahora 🍽️{close_text}.",
+                next_open_text=None,
+            )
+
+        next_open_text = self._find_next_opening_text(schedule, local_now)
+        return StoreAvailabilitySnapshot(
+            is_open=False,
+            message_text=f"Ahora estamos cerrados 😴 Abrimos {next_open_text}.",
+            next_open_text=next_open_text,
+        )
 
     async def list_menu_items(self, *, only_available: bool = True) -> list[MenuItemSnapshot]:
         """List menu items visible to customers."""
@@ -497,6 +589,17 @@ class BusinessRepository:
             price_display=format_price_ars(item.price_cents),
         )
 
+    def _store_business_hours_snapshot(self, row: StoreBusinessHours) -> StoreBusinessHoursSnapshot:
+        """Build a serializable business-hours row."""
+        return StoreBusinessHoursSnapshot(
+            id=row.id,
+            store_id=row.store_id,
+            weekday=row.weekday,
+            opens_at=row.opens_at.strftime("%H:%M") if row.opens_at is not None else None,
+            closes_at=row.closes_at.strftime("%H:%M") if row.closes_at is not None else None,
+            closed=row.closed,
+        )
+
     async def _get_draft_order(self, customer_id: int, conversation_id: int) -> Order | None:
         """Load the active draft order for the customer."""
         return await self.session.scalar(
@@ -595,3 +698,41 @@ class BusinessRepository:
         if order.total_amount_cents >= LARGE_ORDER_THRESHOLD_CENTS:
             base_minutes += 4
         return base_minutes
+
+    def _is_open_at(self, row: StoreBusinessHoursSnapshot | None, current_time: time) -> bool:
+        """Return whether one schedule row covers the current time."""
+        if row is None or row.closed or row.opens_at is None or row.closes_at is None:
+            return False
+        opens_at = self._parse_hour_text(row.opens_at)
+        closes_at = self._parse_hour_text(row.closes_at)
+        assert opens_at is not None
+        assert closes_at is not None
+        return opens_at <= current_time < closes_at
+
+    def _find_next_opening_text(self, schedule: list[StoreBusinessHoursSnapshot], local_now: datetime) -> str:
+        """Find the next opening slot as a short Spanish phrase."""
+        for offset in range(8):
+            candidate_day = local_now + timedelta(days=offset)
+            row = next((item for item in schedule if item.weekday == candidate_day.weekday()), None)
+            if row is None or row.closed or row.opens_at is None:
+                continue
+
+            if offset == 0:
+                opens_at = self._parse_hour_text(row.opens_at)
+                assert opens_at is not None
+                if opens_at <= local_now.time():
+                    continue
+                return f"hoy a las {row.opens_at}"
+            if offset == 1:
+                return f"mañana a las {row.opens_at}"
+            weekday_name = WEEKDAY_LABELS_ES[candidate_day.weekday()]
+            return f"el {weekday_name} a las {row.opens_at}"
+
+        return "pronto"
+
+    def _parse_hour_text(self, value: str | None) -> time | None:
+        """Parse a `HH:MM` string into a time object."""
+        if value is None:
+            return None
+        hour_text, minute_text = value.split(":")
+        return time(hour=int(hour_text), minute=int(minute_text))
