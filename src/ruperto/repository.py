@@ -153,6 +153,15 @@ class BusinessRepository:
         assert customer is not None
         return CustomerSnapshot.model_validate(customer)
 
+    async def list_customers(self, *, limit: int = 50) -> list[CustomerSnapshot]:
+        """List customers ordered by recent activity."""
+        rows = (
+            await self.session.scalars(
+                select(Customer).order_by(Customer.updated_at.desc(), Customer.id.desc()).limit(limit)
+            )
+        ).all()
+        return [CustomerSnapshot.model_validate(row) for row in rows]
+
     async def update_customer_name(self, customer_id: int, name: str) -> CustomerSnapshot:
         """Persist the customer name."""
         customer = await self.session.get(Customer, customer_id)
@@ -268,6 +277,19 @@ class BusinessRepository:
         if order is None:
             return None
         return await self._build_order_snapshot(order)
+
+    async def list_orders(
+        self,
+        *,
+        limit: int = 50,
+        status: OrderStatus | None = None,
+    ) -> list[OrderSnapshot]:
+        """List orders ordered by recent activity."""
+        statement = select(Order).order_by(Order.updated_at.desc(), Order.id.desc()).limit(limit)
+        if status is not None:
+            statement = statement.where(Order.status == status)
+        orders = (await self.session.scalars(statement)).all()
+        return [await self._build_order_snapshot(order) for order in orders]
 
     async def add_item_to_current_order(
         self,

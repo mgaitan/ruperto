@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from ruperto.app import create_app
 from ruperto.config import Settings
 
 HTTP_OK = 200
+MIN_MENU_ITEMS = 5
 
 
 def build_settings(tmp_path: Path, *, auto_init_db: bool = True) -> Settings:
@@ -68,3 +73,83 @@ def test_public_settings_marks_secret_configuration():
 
     assert public["gemini_api_key_configured"] is True
     assert public["kapso_api_key_configured"] is True
+
+
+def collect_tool_returns(messages: list[ModelMessage]) -> dict[str, Any]:
+    """Collect the latest tool returns emitted during a deterministic model run."""
+    tool_returns: dict[str, Any] = {}
+    for message in messages:
+        if not isinstance(message, ModelRequest):
+            continue
+        for part in message.parts:
+            if isinstance(part, ToolReturnPart):
+                tool_returns[part.tool_name] = part.content
+    return tool_returns
+
+
+def dev_message_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Deterministic model used to exercise the development chat endpoint."""
+    tool_returns = collect_tool_returns(messages)
+    sequence: list[tuple[str, dict[str, Any]]] = [
+        ("update_customer_name", {"name": "Martina"}),
+        ("add_item_to_current_order", {"sku": "hamburguesa-completa", "quantity": 1}),
+        ("confirm_current_order", {}),
+    ]
+    for tool_name, arguments in sequence:
+        if tool_name not in tool_returns:
+            return ModelResponse(
+                parts=[ToolCallPart(tool_name, arguments)],
+                model_name="function:test-api-dev-message",
+            )
+
+    return ModelResponse(
+        parts=[
+            ToolCallPart(
+                info.output_tools[0].name,
+                {
+                    "reply_text": "Hola Martina, tu pedido quedó confirmado.",
+                    "next_step": "complete",
+                    "handoff": False,
+                },
+            )
+        ],
+        model_name="function:test-api-dev-message",
+    )
+
+
+def test_mvp_api_surface_exposes_dev_chat_and_read_models(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The API exposes basic store, catalog, customer, and order surfaces."""
+    monkeypatch.setattr("ruperto.assistant.build_google_model", lambda settings: FunctionModel(dev_message_model))
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        store_response = client.get("/api/store-profile")
+        menu_response = client.get("/api/menu-items", params={"only_available": "false"})
+        chat_response = client.post(
+            "/api/dev/messages",
+            json={"external_user_id": "cli-user", "message_text": "Hola, quiero pedir"},
+        )
+        customers_response = client.get("/api/customers", params={"limit": 1})
+        orders_response = client.get("/api/orders", params={"limit": 10})
+        confirmed_orders_response = client.get("/api/orders", params={"status": "confirmed", "limit": 10})
+
+    assert store_response.status_code == HTTP_OK
+    assert store_response.json()["locale"] == "es-AR"
+
+    assert menu_response.status_code == HTTP_OK
+    assert len(menu_response.json()) >= MIN_MENU_ITEMS
+
+    assert chat_response.status_code == HTTP_OK
+    chat_payload = chat_response.json()
+    assert chat_payload["customer"]["name"] == "Martina"
+    assert chat_payload["reply"]["next_step"] == "complete"
+    assert chat_payload["current_order"]["status"] == "confirmed"
+
+    assert customers_response.status_code == HTTP_OK
+    assert customers_response.json()[0]["name"] == "Martina"
+
+    assert orders_response.status_code == HTTP_OK
+    assert len(orders_response.json()) == 1
+
+    assert confirmed_orders_response.status_code == HTTP_OK
+    assert confirmed_orders_response.json()[0]["status"] == "confirmed"

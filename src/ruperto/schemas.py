@@ -119,3 +119,10 @@ class AssistantTurnResult(BaseModel):
     customer: CustomerSnapshot
     reply: AssistantReply
     current_order: OrderSnapshot | None = None
+
+
+class DevMessageRequest(BaseModel):
+    """Payload accepted by the development chat endpoint."""
+
+    external_user_id: str = Field(min_length=1)
+    message_text: str = Field(min_length=1)
