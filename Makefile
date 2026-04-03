@@ -9,7 +9,7 @@ install: ## Install the virtual environment and install the pre-commit hooks
 		echo "ℹ️  prek is not installed. Install it with: uv tool install prek"; \
 	fi
 
-.PHONY: test qa
+.PHONY: test qa serve init-db
 test: ## Run tests with coverage
 	@echo "🧪 Running tests with coverage"
 	@uv run pytest
@@ -21,6 +21,12 @@ qa: ## Run local QA checks via prek
 	else \
 		echo "ℹ️  prek is not installed. Install it with: uv tool install prek"; \
 	fi
+
+serve: ## Run the API locally with FastAPI CLI
+	@uv run fastapi dev src/ruperto/app.py
+
+init-db: ## Initialize the local database
+	@uv run ruperto init-db
 
 .PHONY: bump
 bump:

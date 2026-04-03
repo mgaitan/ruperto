@@ -8,25 +8,40 @@
 [![ty](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ty/main/assets/badge/v0.json)](https://github.com/astral-sh/ty)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/mgaitan/ruperto/blob/main/LICENSE)
 
-A minimalist configurable agent
+Conversational ordering backend for food businesses.
+
+The current MVP direction is a transactional assistant focused on:
+
+- customer identification by channel identity, starting with phone number,
+- menu and order guidance,
+- future-ready channel adapters, beginning with WhatsApp via Kapso,
+- a small admin surface for active orders, customers, menu, and store settings.
 
 ## Quick Start
 
-Run directly without installing via `uvx`:
+Install dependencies and initialize the local database:
 
 ```bash
-uvx ruperto
+uv sync
+uv run ruperto init-db
 ```
 
-To install the tool permanently:
+Run the API locally:
 
 ```bash
-uv tool install ruperto
+uv run fastapi dev src/ruperto/app.py
 ```
+
+You should then have:
+
+- API root at `http://127.0.0.1:8000/`
+- health check at `http://127.0.0.1:8000/healthz`
 
 ## Development
 
 - Install dependencies with `uv sync`.
+- Initialize the local database with `uv run ruperto init-db`.
+- Run the API locally with `make serve` or `uv run fastapi dev src/ruperto/app.py`.
 - New dependency releases are delayed by one week via `uv` cooldown (`[tool.uv].exclude-newer = "1 week"`), with per-package overrides when required (for example, `ty`).
 - Install [`prek`](https://github.com/j178/prek) as an external tool:
 
