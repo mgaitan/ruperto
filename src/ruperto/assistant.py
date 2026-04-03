@@ -20,6 +20,7 @@ from ruperto.schemas import (
     AssistantTurnResult,
     CustomerMemorySnapshot,
     CustomerSnapshot,
+    DelayEstimateSnapshot,
     MenuItemSnapshot,
     OrderSnapshot,
 )
@@ -34,6 +35,7 @@ Reglas operativas:
 - Hace una sola pregunta por vez cuando falten datos.
 - Prioriza cerrar el pedido con la menor fricción posible.
 - Si el cliente ya es conocido y hay una memoria útil, podés mencionarla con naturalidad.
+- Si preguntan por demora o tiempo estimado, usá la herramienta de demora disponible.
 - Si el cliente pide algo fuera del alcance del bot, deriva a una persona.
 """.strip()
 
@@ -122,6 +124,18 @@ async def search_menu(ctx: RunContext[AssistantDeps], query: str) -> list[MenuIt
 async def get_customer_memory(ctx: RunContext[AssistantDeps]) -> CustomerMemorySnapshot:
     """Return lightweight memory derived from previous confirmed orders."""
     return await with_repository(ctx, lambda repository: repository.get_customer_memory(ctx.deps.customer_id))
+
+
+@ordering_agent.tool
+async def get_estimated_delay(ctx: RunContext[AssistantDeps]) -> DelayEstimateSnapshot:
+    """Return a deterministic operational delay estimate for the current conversation."""
+    return await with_repository(
+        ctx,
+        lambda repository: repository.get_estimated_delay(
+            ctx.deps.customer_id,
+            ctx.deps.conversation_id,
+        ),
+    )
 
 
 @ordering_agent.tool

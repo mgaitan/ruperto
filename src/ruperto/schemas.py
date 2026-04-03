@@ -91,6 +91,13 @@ class CustomerMemorySnapshot(BaseModel):
     recent_items: list[str] = Field(default_factory=list)
 
 
+class DelayEstimateSnapshot(BaseModel):
+    """Operational delay estimate exposed to the assistant."""
+
+    estimated_minutes: int
+    display_text: str
+
+
 class AssistantNextStep(StrEnum):
     """High-level next steps for the ordering conversation."""
 

@@ -134,6 +134,31 @@ def memory_model_factory(message_lengths: list[int]):
     return model
 
 
+def delay_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Drive a turn that asks specifically for the current delay estimate."""
+    tool_returns = collect_tool_returns(messages)
+    if "get_estimated_delay" not in tool_returns:
+        return ModelResponse(
+            parts=[ToolCallPart("get_estimated_delay", {})],
+            model_name="function:test-delay",
+        )
+
+    delay = tool_returns["get_estimated_delay"]
+    return ModelResponse(
+        parts=[
+            ToolCallPart(
+                info.output_tools[0].name,
+                {
+                    "reply_text": f"La demora estimada es de {delay.display_text}.",
+                    "next_step": "complete",
+                    "handoff": False,
+                },
+            )
+        ],
+        model_name="function:test-delay",
+    )
+
+
 async def test_build_google_model(tmp_path: Path):
     """The production Gemini model can be constructed from settings."""
     model = build_google_model(build_settings(tmp_path))
@@ -203,5 +228,32 @@ async def test_assistant_reuses_history_and_customer_memory(tmp_path: Path):
     assert "Hamburguesa completa" in follow_up.reply.reply_text
     assert follow_up.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
     assert len(history) >= MIN_HISTORY_MESSAGES
+
+    await runtime.engine.dispose()
+
+
+async def test_assistant_can_answer_delay_after_confirming_an_order(tmp_path: Path):
+    """A follow-up question can reuse the latest order to answer the estimated delay."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+
+    await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-demora",
+        message_text="Hola, quiero una hamburguesa",
+        model=FunctionModel(transactional_model),
+    )
+
+    follow_up = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-demora",
+        message_text="¿Qué demora tiene?",
+        model=FunctionModel(delay_model),
+    )
+
+    assert follow_up.reply.reply_text == "La demora estimada es de 30 minutos aproximadamente."
+    assert follow_up.reply.next_step == AssistantNextStep.COMPLETE
 
     await runtime.engine.dispose()

@@ -29,12 +29,16 @@ from ruperto.models import (
 from ruperto.schemas import (
     CustomerMemorySnapshot,
     CustomerSnapshot,
+    DelayEstimateSnapshot,
     MenuItemSnapshot,
     OrderItemSnapshot,
     OrderSnapshot,
     StoreProfileSnapshot,
     format_price_ars,
 )
+
+LARGE_ORDER_THRESHOLD_CENTS = 3000000
+DEFAULT_DELAY_MINUTES = 25
 
 
 def normalize_phone_number(value: str | None) -> str | None:
@@ -406,6 +410,22 @@ class BusinessRepository:
             recent_items=recent_items,
         )
 
+    async def get_estimated_delay(self, customer_id: int, conversation_id: int) -> DelayEstimateSnapshot:
+        """Estimate the current preparation delay for the active or latest order."""
+        order = await self._get_draft_order(customer_id, conversation_id)
+        if order is None:
+            latest_order = await self.get_latest_order(customer_id, conversation_id)
+            if latest_order is None:
+                estimated_minutes = DEFAULT_DELAY_MINUTES
+                return DelayEstimateSnapshot(
+                    estimated_minutes=estimated_minutes,
+                    display_text=f"{estimated_minutes} minutos aproximadamente",
+                )
+            return self._estimate_delay_from_snapshot(latest_order)
+
+        snapshot = await self._build_order_snapshot(order)
+        return self._estimate_delay_from_snapshot(snapshot)
+
     def _menu_item_snapshot(self, item: MenuItem) -> MenuItemSnapshot:
         """Build a public menu snapshot."""
         return MenuItemSnapshot(
@@ -479,4 +499,27 @@ class BusinessRepository:
                 )
                 for item in items
             ],
+        )
+
+    def _estimate_delay_from_snapshot(self, order: OrderSnapshot) -> DelayEstimateSnapshot:
+        """Compute a simple deterministic delay estimate for the MVP."""
+        total_quantity = sum(item.quantity for item in order.items)
+        distinct_items = len(order.items)
+
+        estimated_minutes = 18
+        if order.delivery_type == DeliveryType.DELIVERY:
+            estimated_minutes += 12
+        elif order.delivery_type == DeliveryType.PICKUP:
+            estimated_minutes += 4
+        else:
+            estimated_minutes += 8
+
+        estimated_minutes += max(total_quantity - 1, 0) * 3
+        estimated_minutes += max(distinct_items - 1, 0) * 2
+        if order.total_amount_cents >= LARGE_ORDER_THRESHOLD_CENTS:
+            estimated_minutes += 4
+
+        return DelayEstimateSnapshot(
+            estimated_minutes=estimated_minutes,
+            display_text=f"{estimated_minutes} minutos aproximadamente",
         )
