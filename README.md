@@ -49,10 +49,12 @@ You should then have:
 - development web chat at `http://127.0.0.1:7932/`
 
 The current development flow asks for the customer's name before the first
-order unless the customer already introduced themself in the opening message,
-estimates kitchen delay from preparation time plus active workload, and lets
-staff move orders through operational statuses with
-`PATCH /api/orders/{order_id}/status`.
+order unless the customer already introduced themself in the opening message.
+If the first customer message already contains an order or menu question, that
+intent is now remembered and resumed as soon as the customer shares their
+name, instead of resetting the conversation. The assistant also estimates
+kitchen delay from preparation time plus active workload and lets staff move
+orders through operational statuses with `PATCH /api/orders/{order_id}/status`.
 Store opening hours are now configurable through `GET/PUT /api/store-hours`,
 and customer replies mention the next opening time whenever the store is closed.
 The demo catalog now includes a broader synthetic menu with pizzas,
@@ -62,6 +64,9 @@ simple add-on suggestions.
 Compact customer messages are also handled more naturally now, so the assistant
 can reuse cues such as a self-introduction, a payment hint like `te pago acá`,
 and a same-turn price question without asking for the same detail twice.
+The service also starts carrying an explicit `default_store_id` setting as the
+first groundwork toward a logical multi-tenant deployment, while still running
+today as one configurable store by default.
 
 ## Development
 

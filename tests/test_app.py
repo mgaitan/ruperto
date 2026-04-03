@@ -20,6 +20,7 @@ HTTP_NOT_FOUND = 404
 MIN_MENU_ITEMS = 35
 DEFAULT_WEEKLY_HOURS = 7
 UPDATED_WEEKLY_HOURS = 2
+TENANT_STORE_ID = 7
 
 
 def build_settings(tmp_path: Path, *, auto_init_db: bool = True) -> Settings:
@@ -72,11 +73,13 @@ def test_public_settings_marks_secret_configuration():
     settings = Settings(
         gemini_api_key=SecretStr("gemini-key"),
         kapso_api_key=SecretStr("kapso-key"),
+        default_store_id=TENANT_STORE_ID,
     )
     public = settings.public_settings()
 
     assert public["gemini_api_key_configured"] is True
     assert public["kapso_api_key_configured"] is True
+    assert public["default_store_id"] == TENANT_STORE_ID
 
 
 def collect_tool_returns(messages: list[ModelMessage]) -> dict[str, Any]:
@@ -160,7 +163,8 @@ def test_mvp_api_surface_exposes_dev_chat_and_read_models(tmp_path: Path, monkey
     assert first_chat_response.json()["reply"]["next_step"] == "ask_name"
     assert second_chat_response.status_code == HTTP_OK
     assert second_chat_response.json()["customer"]["name"] == "Martina"
-    assert second_chat_response.json()["reply"]["next_step"] == "choose_items"
+    assert second_chat_response.json()["reply"]["next_step"] == "complete"
+    assert second_chat_response.json()["current_order"]["status"] == "confirmed"
 
     assert chat_response.status_code == HTTP_OK
     chat_payload = chat_response.json()

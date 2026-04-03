@@ -17,6 +17,7 @@ from ruperto.models import (
     Channel,
     Conversation,
     ConversationMessage,
+    ConversationState,
     Customer,
     CustomerIdentity,
     DeliveryType,
@@ -162,9 +163,9 @@ class BusinessRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
-    async def get_store_profile(self) -> StoreProfileSnapshot:
+    async def get_store_profile(self, *, store_id: int = 1) -> StoreProfileSnapshot:
         """Return the single store profile used by the MVP."""
-        row = await self.session.scalar(select(StoreProfile).where(StoreProfile.id == 1))
+        row = await self.session.scalar(select(StoreProfile).where(StoreProfile.id == store_id))
         assert row is not None
         return StoreProfileSnapshot.model_validate(row)
 
@@ -378,6 +379,19 @@ class BusinessRepository:
             restored = ModelMessagesTypeAdapter.validate_python([payload])
             messages.extend(restored)
         return messages
+
+    async def get_pending_customer_message(self, conversation_id: int) -> str | None:
+        """Return the deferred customer message captured before onboarding completed."""
+        state = await self._get_or_create_conversation_state(conversation_id)
+        return state.pending_customer_message
+
+    async def set_pending_customer_message(self, conversation_id: int, message_text: str | None) -> str | None:
+        """Persist or clear the deferred customer message for one conversation."""
+        state = await self._get_or_create_conversation_state(conversation_id)
+        state.pending_customer_message = message_text.strip() if message_text else None
+        state.updated_at = utc_now()
+        await self.session.flush()
+        return state.pending_customer_message
 
     async def append_conversation_messages(self, conversation_id: int, messages: list[ModelMessage]) -> None:
         """Persist the newly generated PydanticAI messages for a conversation."""
@@ -650,6 +664,17 @@ class BusinessRepository:
             )
             .order_by(Order.updated_at.desc())
         )
+
+    async def _get_or_create_conversation_state(self, conversation_id: int) -> ConversationState:
+        """Return mutable conversation state, creating it on first use."""
+        state = await self.session.scalar(
+            select(ConversationState).where(ConversationState.conversation_id == conversation_id)
+        )
+        if state is None:
+            state = ConversationState(conversation_id=conversation_id)
+            self.session.add(state)
+            await self.session.flush()
+        return state
 
     async def _require_current_order(self, customer_id: int, conversation_id: int) -> Order:
         """Return the draft order, creating one only if it already exists."""

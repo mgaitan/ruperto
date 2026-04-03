@@ -156,6 +156,19 @@ class ConversationMessage(Base):
     created_at: Mapped[datetime] = mapped_column(default=utc_now)
 
 
+class ConversationState(Base):
+    """Mutable per-conversation state that does not belong in the message log."""
+
+    __tablename__ = "conversation_state"
+    __table_args__ = (UniqueConstraint("conversation_id", name="uq_conversation_state_conversation"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    conversation_id: Mapped[int] = mapped_column(ForeignKey("conversation.id", ondelete="CASCADE"))
+    pending_customer_message: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(default=utc_now, onupdate=utc_now)
+
+
 class Order(Base):
     """A customer order, typically starting as a draft."""
 

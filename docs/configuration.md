@@ -37,6 +37,12 @@ RUPERTO_STORE_LOCALE
   The current default is `es-AR`, which is the main language for customer and
   staff interactions in the MVP.
 
+RUPERTO_DEFAULT_STORE_ID
+  Store identifier resolved by default when the service boots without an
+  explicit tenant resolution step.
+  This keeps today's single-store MVP configurable while preparing for future
+  logical multi-tenancy.
+
 RUPERTO_GEMINI_MODEL
   Google Gemini model name used by the PydanticAI ordering assistant.
   The initial value is `gemini-2.5-flash`.
@@ -44,6 +50,10 @@ RUPERTO_GEMINI_MODEL
 RUPERTO_GEMINI_API_KEY
   API key for the Google Gemini provider.
   This is intentionally not echoed back by CLI diagnostics.
+
+RUPERTO_ASSISTANT_MODEL_TIMEOUT_SECONDS
+  Maximum number of seconds the backend waits for the configured model before
+  degrading the turn into a friendly handoff response.
 
 RUPERTO_KAPSO_API_KEY
   API key for Kapso WhatsApp operations.

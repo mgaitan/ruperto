@@ -39,12 +39,12 @@ async def init_database(*, settings: Settings, runtime: DatabaseRuntime | None =
         await connection.run_sync(Base.metadata.create_all)
 
     async with active_runtime.session_factory() as session:
-        result = await session.execute(select(StoreProfile).where(StoreProfile.id == 1))
+        result = await session.execute(select(StoreProfile).where(StoreProfile.id == settings.default_store_id))
         profile = result.scalar_one_or_none()
         if profile is None:
             session.add(
                 StoreProfile(
-                    id=1,
+                    id=settings.default_store_id,
                     store_name=settings.store_name,
                     bot_name=settings.bot_name,
                     store_location=settings.store_location,
@@ -74,7 +74,7 @@ async def init_database(*, settings: Settings, runtime: DatabaseRuntime | None =
             session.add_all(
                 [
                     StoreBusinessHours(
-                        store_id=1,
+                        store_id=settings.default_store_id,
                         weekday=row.weekday,
                         opens_at=row.opens_at,
                         closes_at=row.closes_at,

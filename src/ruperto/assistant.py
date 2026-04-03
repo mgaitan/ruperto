@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -53,6 +54,9 @@ Reglas operativas:
 """.strip()
 
 NAME_CONFIRMATION_TEMPLATE = "¡Gracias, {name}! 😄 ¿Qué querés pedir hoy?"
+MODEL_UNAVAILABLE_REPLY = (
+    "Se me complicó responder justo ahora 😓 Si querés, probá de nuevo en unos segundos o te derivo con una persona."
+)
 MAX_NAME_WORDS = 3
 CLOSED_STORE_PREFIX = "{message_text} "
 NAME_TOKEN_PATTERN = re.compile(r"^[A-Za-zÁÉÍÓÚÜÑáéíóúüñ'-]+$")
@@ -144,6 +148,7 @@ class AssistantDeps:
 
     settings: Settings
     session_factory: async_sessionmaker[AsyncSession]
+    store_id: int
     customer_id: int
     conversation_id: int
     turn_context_hint: str | None = None
@@ -157,6 +162,15 @@ class TurnPolicy:
 
     allow_order_mutations: bool
     allow_order_confirmation: bool
+
+
+@dataclass(slots=True)
+class NameHandlingResult:
+    """Outcome of the deterministic onboarding guardrails for one turn."""
+
+    customer: CustomerSnapshot
+    direct_reply: AssistantTurnResult | None = None
+    resumed_pending_message: str | None = None
 
 
 class InformationalTurnMutationError(ValueError):
@@ -204,7 +218,7 @@ ordering_agent = cast(
 @ordering_agent.instructions
 async def business_context(ctx: RunContext[AssistantDeps]) -> str:
     """Provide dynamic business context to the model."""
-    store = await with_repository(ctx, lambda repository: repository.get_store_profile())
+    store = await with_repository(ctx, lambda repository: repository.get_store_profile(store_id=ctx.deps.store_id))
     context = (
         f"Atendes {store.store_name}. "
         f"Bot: {store.bot_name}. "
@@ -271,6 +285,7 @@ async def get_store_availability(ctx: RunContext[AssistantDeps]) -> StoreAvailab
         ctx,
         lambda repository: repository.get_store_availability(
             timezone_name=ctx.deps.settings.store_timezone,
+            store_id=ctx.deps.store_id,
         ),
     )
 
@@ -407,6 +422,35 @@ class OrderingAssistantService:
         self.settings = settings
         self.agent = agent
 
+    async def _build_model_unavailable_result(
+        self,
+        *,
+        conversation_id: int,
+        customer: CustomerSnapshot,
+        user_text: str,
+    ) -> AssistantTurnResult:
+        """Persist and return a friendly fallback when the model is unavailable."""
+        fallback_reply = AssistantReply(
+            reply_text=MODEL_UNAVAILABLE_REPLY,
+            next_step=AssistantNextStep.HANDOFF,
+            handoff=True,
+        )
+        async with self.session_factory() as session:
+            repository = BusinessRepository(session)
+            await self._persist_direct_reply(
+                repository=repository,
+                conversation_id=conversation_id,
+                user_text=user_text,
+                reply_text=fallback_reply.reply_text,
+            )
+            await session.commit()
+        return AssistantTurnResult(
+            conversation_id=conversation_id,
+            customer=customer,
+            reply=fallback_reply,
+            current_order=None,
+        )
+
     async def handle_customer_message(
         self,
         *,
@@ -414,8 +458,10 @@ class OrderingAssistantService:
         external_user_id: str,
         message_text: str,
         model: Model | str | None = None,
+        store_id: int | None = None,
     ) -> AssistantTurnResult:
         """Process one customer message and persist the resulting turn."""
+        resolved_store_id = store_id if store_id is not None else self.settings.default_store_id
         async with self.session_factory() as session:
             repository = BusinessRepository(session)
             customer = await repository.get_or_create_customer(
@@ -429,6 +475,7 @@ class OrderingAssistantService:
                 customer_id=customer.id,
             )
             history = await repository.load_conversation_messages(conversation.id)
+            pending_customer_message = await repository.get_pending_customer_message(conversation.id)
             current_order_before_run = await repository.get_current_order(
                 customer.id,
                 conversation.id,
@@ -440,45 +487,72 @@ class OrderingAssistantService:
                 history=history,
                 message_text=message_text,
             )
-            availability = await repository.get_store_availability(timezone_name=self.settings.store_timezone)
-            turn_policy = self._analyze_turn_policy(message_text, current_order=current_order_before_run)
-            deps = AssistantDeps(
-                settings=self.settings,
-                session_factory=self.session_factory,
-                customer_id=customer.id,
-                conversation_id=conversation.id,
-                turn_context_hint=self._build_turn_context_hint(
-                    customer=customer,
-                    message_text=message_text,
-                    current_order=current_order_before_run,
-                ),
-                allow_order_mutations=turn_policy.allow_order_mutations,
-                allow_order_confirmation=turn_policy.allow_order_confirmation,
+            availability = await repository.get_store_availability(
+                timezone_name=self.settings.store_timezone,
+                store_id=resolved_store_id,
             )
-
-            direct_reply = await self._maybe_handle_missing_customer_name(
+            name_handling = await self._maybe_handle_missing_customer_name(
                 repository=repository,
                 customer=customer,
                 conversation_id=conversation.id,
                 history=history,
                 message_text=message_text,
                 availability=availability,
+                pending_customer_message=pending_customer_message,
             )
-            if direct_reply is not None:
+            if name_handling.direct_reply is not None:
                 await session.commit()
-                return direct_reply
+                return name_handling.direct_reply
+
+            customer = name_handling.customer
+            resumed_pending_message = name_handling.resumed_pending_message
+            turn_policy = self._analyze_turn_policy(
+                resumed_pending_message or message_text,
+                current_order=current_order_before_run,
+            )
+            deps = AssistantDeps(
+                settings=self.settings,
+                session_factory=self.session_factory,
+                store_id=resolved_store_id,
+                customer_id=customer.id,
+                conversation_id=conversation.id,
+                turn_context_hint=self._build_turn_context_hint(
+                    customer=customer,
+                    message_text=message_text,
+                    current_order=current_order_before_run,
+                    pending_customer_message=resumed_pending_message,
+                ),
+                allow_order_mutations=turn_policy.allow_order_mutations,
+                allow_order_confirmation=turn_policy.allow_order_confirmation,
+            )
 
             await session.commit()
             customer_id = customer.id
             conversation_id = conversation.id
 
         active_model = model if model is not None else build_google_model(self.settings)
-        result = await self.agent.run(
-            message_text,
-            deps=deps,
-            message_history=history,
-            model=active_model,
-        )
+        try:
+            async with asyncio.timeout(self.settings.assistant_model_timeout_seconds):
+                result = await self.agent.run(
+                    message_text,
+                    deps=deps,
+                    message_history=history,
+                    model=active_model,
+                )
+        except TimeoutError:
+            return await self._build_model_unavailable_result(
+                conversation_id=conversation_id,
+                customer=customer,
+                user_text=message_text,
+            )
+        except Exception as error:
+            if isinstance(error, (InformationalTurnMutationError, MissingConfirmationSignalError)):
+                raise
+            return await self._build_model_unavailable_result(
+                conversation_id=conversation_id,
+                customer=customer,
+                user_text=message_text,
+            )
 
         async with self.session_factory() as session:
             repository = BusinessRepository(session)
@@ -520,14 +594,22 @@ class OrderingAssistantService:
         history: list[ModelMessage],
         message_text: str,
         availability: StoreAvailabilitySnapshot,
-    ) -> AssistantTurnResult | None:
+        pending_customer_message: str | None,
+    ) -> NameHandlingResult:
         """Handle the initial name-capture flow deterministically before invoking the model."""
         if customer.name is not None:
-            return None
+            return NameHandlingResult(customer=customer)
 
         if self._is_waiting_for_name(history):
             if name := self._extract_customer_name(message_text):
                 updated_customer = await repository.update_customer_name(customer.id, name)
+                if pending_customer_message is not None:
+                    await repository.set_pending_customer_message(conversation_id, None)
+                    return NameHandlingResult(
+                        customer=updated_customer,
+                        resumed_pending_message=pending_customer_message,
+                    )
+
                 reply = AssistantReply(
                     reply_text=self._decorate_closed_store_text(
                         NAME_CONFIRMATION_TEMPLATE.format(name=updated_customer.name),
@@ -542,16 +624,19 @@ class OrderingAssistantService:
                     user_text=message_text,
                     reply_text=reply.reply_text,
                 )
-                return AssistantTurnResult(
-                    conversation_id=conversation_id,
+                return NameHandlingResult(
                     customer=updated_customer,
-                    reply=reply,
-                    current_order=None,
+                    direct_reply=AssistantTurnResult(
+                        conversation_id=conversation_id,
+                        customer=updated_customer,
+                        reply=reply,
+                        current_order=None,
+                    ),
                 )
 
             reply = AssistantReply(
                 reply_text=self._decorate_closed_store_text(
-                    "🙂 Necesito tu nombre para seguir con el pedido. ¿Cómo te llamás?",
+                    "🙂 Necesito tu nombre para seguir con lo que me pediste. ¿Cómo te llamás?",
                     availability,
                 ),
                 next_step=AssistantNextStep.ASK_NAME,
@@ -563,16 +648,24 @@ class OrderingAssistantService:
                 user_text=message_text,
                 reply_text=reply.reply_text,
             )
-            return AssistantTurnResult(
-                conversation_id=conversation_id,
+            return NameHandlingResult(
                 customer=customer,
-                reply=reply,
-                current_order=None,
+                direct_reply=AssistantTurnResult(
+                    conversation_id=conversation_id,
+                    customer=customer,
+                    reply=reply,
+                    current_order=None,
+                ),
             )
 
+        if self._should_store_pending_message_before_name(message_text):
+            await repository.set_pending_customer_message(conversation_id, message_text)
         reply = AssistantReply(
             reply_text=self._decorate_closed_store_text(
-                self._build_name_prompt(conversation_id=conversation_id),
+                self._build_name_prompt(
+                    conversation_id=conversation_id,
+                    remembers_pending_message=self._should_store_pending_message_before_name(message_text),
+                ),
                 availability,
             ),
             next_step=AssistantNextStep.ASK_NAME,
@@ -584,11 +677,14 @@ class OrderingAssistantService:
             user_text=message_text,
             reply_text=reply.reply_text,
         )
-        return AssistantTurnResult(
-            conversation_id=conversation_id,
+        return NameHandlingResult(
             customer=customer,
-            reply=reply,
-            current_order=None,
+            direct_reply=AssistantTurnResult(
+                conversation_id=conversation_id,
+                customer=customer,
+                reply=reply,
+                current_order=None,
+            ),
         )
 
     async def _capture_customer_name_from_message(
@@ -675,6 +771,19 @@ class OrderingAssistantService:
         """Extract a customer name from either a short reply or a longer introduction."""
         return self._extract_name_from_introduction(message_text) or self._extract_name_candidate(message_text)
 
+    def _should_store_pending_message_before_name(self, message_text: str) -> bool:
+        """Return whether an unnamed first turn already contains useful order intent to resume later."""
+        lowered = message_text.casefold()
+        if not lowered.strip():
+            return False
+        if any(hint in lowered for hint in ORDER_INTENT_HINTS):
+            return True
+        if any(hint in lowered for hint in INFORMATIONAL_MENU_HINTS):
+            return True
+        if self._message_requests_total(message_text):
+            return True
+        return any(keyword in lowered for keyword in ("bebida", "postre", "combo", "hamburguesa", "pizza", "empanada"))
+
     def _extract_name_from_introduction(self, message_text: str) -> str | None:
         """Extract a first name from a longer self-introduction message."""
         cleaned = " ".join(message_text.split())
@@ -735,6 +844,7 @@ class OrderingAssistantService:
         customer: CustomerSnapshot,
         message_text: str,
         current_order: OrderSnapshot | None,
+        pending_customer_message: str | None = None,
     ) -> str | None:
         """Build safe guidance for dense first-turn customer messages."""
         hints: list[str] = []
@@ -765,6 +875,12 @@ class OrderingAssistantService:
             hints.append(
                 "El cliente quiere saber cuánto sale en este mismo turno. "
                 "Si ya podés calcularlo con herramientas, informá el total o subtotal actual."
+            )
+        if pending_customer_message is not None:
+            hints.append(
+                "Antes de identificarse, el cliente dejó una consulta pendiente: "
+                f"'{pending_customer_message}'. "
+                "Retomá eso ahora sin volver a preguntarle qué quiere."
             )
         hints.extend(self._build_current_order_context_hints(customer=customer, current_order=current_order))
 
@@ -943,13 +1059,16 @@ class OrderingAssistantService:
             )
         )
 
-    def _build_name_prompt(self, *, conversation_id: int) -> str:
+    def _build_name_prompt(self, *, conversation_id: int, remembers_pending_message: bool = False) -> str:
         """Build the first-contact greeting asking for the customer's name."""
         template = NAME_PROMPT_VARIANTS[conversation_id % len(NAME_PROMPT_VARIANTS)]
-        return template.format(
+        prompt = template.format(
             bot_name=self.settings.bot_name,
             store_name=self.settings.store_name,
         )
+        if not remembers_pending_message:
+            return prompt
+        return f"{prompt} Así sigo con lo que me pediste recién."
 
     def _decorate_reply_with_store_availability(
         self,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock
@@ -12,6 +13,8 @@ from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, Text
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from ruperto.assistant import (
+    MODEL_UNAVAILABLE_REPLY,
+    MissingConfirmationSignalError,
     OrderingAssistantService,
     add_item_to_current_order,
     build_google_model,
@@ -204,6 +207,125 @@ async def test_build_google_model(tmp_path: Path):
     assert model.model_name == "gemini-2.5-flash-lite"
 
 
+async def test_assistant_returns_handoff_when_model_times_out(tmp_path: Path):
+    """Timeouts from the model should degrade into a deterministic handoff reply."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    baseline_service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        baseline_service,
+        channel=Channel.DEV,
+        external_user_id="timeout-user",
+        name="Martina",
+    )
+
+    class SlowAgent:
+        async def run(self, *args: Any, **kwargs: Any):
+            await asyncio.sleep(0.05)
+            raise AssertionError
+
+    service = OrderingAssistantService(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        agent=cast(Any, SlowAgent()),
+    )
+    service.settings.assistant_model_timeout_seconds = 0.001
+
+    result = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="timeout-user",
+        message_text="decime qué tenés",
+    )
+
+    assert result.reply.reply_text == MODEL_UNAVAILABLE_REPLY
+    assert result.reply.next_step == AssistantNextStep.HANDOFF
+    assert result.reply.handoff is True
+    assert result.current_order is None
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.DEV,
+            external_id="timeout-user",
+            customer_id=result.customer.id,
+        )
+        history = await repository.load_conversation_messages(conversation.id)
+        assert service._extract_latest_assistant_text(history) == MODEL_UNAVAILABLE_REPLY
+
+    await runtime.engine.dispose()
+
+
+async def test_assistant_returns_handoff_when_model_errors(tmp_path: Path):
+    """Provider failures should degrade into a deterministic handoff reply."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    baseline_service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        baseline_service,
+        channel=Channel.DEV,
+        external_user_id="error-user",
+        name="Martina",
+    )
+
+    class FailingAgent:
+        async def run(self, *args: Any, **kwargs: Any):
+            raise RuntimeError
+
+    service = OrderingAssistantService(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        agent=cast(Any, FailingAgent()),
+    )
+
+    result = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="error-user",
+        message_text="decime qué tenés",
+    )
+
+    assert result.reply.reply_text == MODEL_UNAVAILABLE_REPLY
+    assert result.reply.next_step == AssistantNextStep.HANDOFF
+    assert result.reply.handoff is True
+    assert result.current_order is None
+
+    await runtime.engine.dispose()
+
+
+async def test_assistant_does_not_swallow_guardrail_errors(tmp_path: Path):
+    """Guardrail exceptions should still propagate instead of degrading to handoff."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    baseline_service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        baseline_service,
+        channel=Channel.DEV,
+        external_user_id="guardrail-user",
+        name="Martina",
+    )
+
+    class GuardrailAgent:
+        async def run(self, *args: Any, **kwargs: Any):
+            raise MissingConfirmationSignalError
+
+    service = OrderingAssistantService(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        agent=cast(Any, GuardrailAgent()),
+    )
+
+    with pytest.raises(MissingConfirmationSignalError):
+        await service.handle_customer_message(
+            channel=Channel.DEV,
+            external_user_id="guardrail-user",
+            message_text="confirmalo",
+        )
+
+    await runtime.engine.dispose()
+
+
 async def test_assistant_handles_order_flow_in_spanish(tmp_path: Path):
     """The service can orchestrate a transactional order and persist the result."""
     settings = build_settings(tmp_path)
@@ -333,7 +455,7 @@ async def test_assistant_asks_for_name_before_taking_the_first_order(tmp_path: P
         channel=Channel.DEV,
         external_user_id="cliente-sin-nombre",
         message_text="Martina",
-        model=FunctionModel(transactional_model),
+        model=FunctionModel(resumed_order_model),
     )
 
     assert first_reply.reply.next_step == AssistantNextStep.ASK_NAME
@@ -343,8 +465,10 @@ async def test_assistant_asks_for_name_before_taking_the_first_order(tmp_path: P
         "tu nombre" in first_reply.reply.reply_text.lower() or "cómo te llamás" in first_reply.reply.reply_text.lower()
     )
     assert second_reply.customer.name == "Martina"
-    assert second_reply.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
-    assert "¿Qué querés pedir hoy?" in second_reply.reply.reply_text
+    assert second_reply.reply.next_step == AssistantNextStep.CHOOSE_DELIVERY
+    assert "hamburguesa completa" in second_reply.reply.reply_text.lower()
+    assert "envío o retirás" in second_reply.reply.reply_text.lower()
+    assert second_reply.current_order is not None
 
     await runtime.engine.dispose()
 
@@ -371,6 +495,40 @@ def onboarding_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResp
             )
         ],
         model_name="function:test-onboarding",
+    )
+
+
+def resumed_order_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Drive the second turn after onboarding resumes a previously pending request."""
+    tool_returns = collect_tool_returns(messages)
+    expected_sequence: list[tuple[str, dict[str, Any]]] = [
+        ("lookup_customer", {}),
+        ("search_menu", {"query": "hamburguesa"}),
+        ("get_current_order", {}),
+        ("add_item_to_current_order", {"sku": "hamburguesa-completa", "quantity": 1}),
+    ]
+    for tool_name, arguments in expected_sequence:
+        if tool_name not in tool_returns:
+            return ModelResponse(
+                parts=[ToolCallPart(tool_name, arguments)],
+                model_name="function:test-resumed-order",
+            )
+
+    customer = tool_returns["lookup_customer"]
+    return ModelResponse(
+        parts=[
+            ToolCallPart(
+                info.output_tools[0].name,
+                {
+                    "reply_text": (
+                        f"Perfecto, {customer.name}: te sumé una hamburguesa completa. ¿Querés algo para tomar?"
+                    ),
+                    "next_step": "choose_delivery",
+                    "handoff": False,
+                },
+            )
+        ],
+        model_name="function:test-resumed-order",
     )
 
 
@@ -417,14 +575,45 @@ async def test_assistant_accepts_a_natural_introduction_while_waiting_for_name(t
         channel=Channel.DEV,
         external_user_id="cliente-presentacion-natural",
         message_text="Qué tal, me llamo Pedro Guti y tengo hambre",
-        model=FunctionModel(transactional_model),
+        model=FunctionModel(onboarding_model),
     )
 
     assert reply.customer.name == "Pedro"
     assert reply.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
-    assert "¿Qué querés pedir hoy?" in reply.reply.reply_text
+    assert "Hola Pedro" in reply.reply.reply_text
 
     await runtime.engine.dispose()
+
+
+async def test_assistant_resumes_pending_request_after_collecting_name(tmp_path: Path):
+    """The assistant should remember the first request while asking for the customer's name."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+
+    first_reply = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-pendiente",
+        message_text="quiero una hamburguesa. ¿tenés bebida?",
+        model=FunctionModel(transactional_model),
+    )
+    resumed_reply = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-pendiente",
+        message_text="Martín",
+        model=FunctionModel(resumed_order_model),
+    )
+
+    assert first_reply.reply.next_step == AssistantNextStep.ASK_NAME
+    assert "así sigo con lo que me pediste" in first_reply.reply.reply_text.lower()
+    assert resumed_reply.customer.name == "Martín"
+    assert resumed_reply.reply.next_step == AssistantNextStep.CHOOSE_DELIVERY
+    assert "hamburguesa completa" in resumed_reply.reply.reply_text.lower()
+    assert "envío o retirás" in resumed_reply.reply.reply_text.lower()
+    assert resumed_reply.current_order is not None
+    assert resumed_reply.current_order.items[0].name == "Hamburguesa completa"
+    assert resumed_reply.current_order.delivery_type is None
 
 
 async def test_name_candidate_heuristics_cover_edge_cases(tmp_path: Path):
@@ -470,6 +659,17 @@ async def test_name_candidate_heuristics_cover_edge_cases(tmp_path: Path):
     assert service._message_requests_total("dame una pizza") is False
     assert "Ruperto Test" in service._build_name_prompt(conversation_id=1)
     assert "Rotisería Test" in service._build_name_prompt(conversation_id=1)
+    assert service._should_store_pending_message_before_name("quiero una hamburguesa y bebida") is True
+    assert service._should_store_pending_message_before_name("tenés postre?") is True
+    assert service._should_store_pending_message_before_name("cuánto es?") is True
+    assert service._should_store_pending_message_before_name("   ") is False
+    assert (
+        "así sigo con lo que me pediste"
+        in service._build_name_prompt(
+            conversation_id=1,
+            remembers_pending_message=True,
+        ).lower()
+    )
 
     await runtime.engine.dispose()
 

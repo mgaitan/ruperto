@@ -30,6 +30,7 @@ EMPTY_DRAFT_DELAY_MINUTES = 15
 DEFAULT_WEEKLY_HOURS = 7
 UPDATED_WEEKLY_HOURS = 2
 MIN_MENU_ITEMS = 35
+TENANT_STORE_ID = 7
 
 
 async def build_repository(tmp_path: Path) -> tuple[BusinessRepository, DatabaseRuntime]:
@@ -146,6 +147,28 @@ async def test_customer_identity_and_message_history_are_persisted(tmp_path: Pat
     await close_repository(repository, runtime)
 
 
+async def test_conversation_state_can_remember_a_pending_customer_message(tmp_path: Path):
+    """Conversation state stores deferred intent while onboarding is incomplete."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="cliente-pendiente")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="cliente-pendiente",
+        customer_id=customer.id,
+    )
+
+    assert await repository.get_pending_customer_message(conversation.id) is None
+    assert (
+        await repository.set_pending_customer_message(conversation.id, "quiero una hamburguesa y una coca")
+        == "quiero una hamburguesa y una coca"
+    )
+    assert await repository.get_pending_customer_message(conversation.id) == "quiero una hamburguesa y una coca"
+    assert await repository.set_pending_customer_message(conversation.id, None) is None
+    assert await repository.get_pending_customer_message(conversation.id) is None
+
+    await close_repository(repository, runtime)
+
+
 async def test_customer_phone_and_conversation_can_be_completed_later(tmp_path: Path):
     """Existing identities can gain a phone number and conversations can be re-linked."""
     repository, runtime = await build_repository(tmp_path)
@@ -175,6 +198,31 @@ async def test_customer_phone_and_conversation_can_be_completed_later(tmp_path: 
     assert updated_customer.phone_number == "+543514443322"
     assert reassigned.id == conversation.id
     assert reassigned.customer_id == another_customer.id
+
+    await close_repository(repository, runtime)
+
+
+async def test_init_database_respects_the_configured_default_store_id(tmp_path: Path):
+    """Bootstrap should create the default store profile and schedule with the configured store id."""
+    settings = Settings(
+        environment="test",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'repo-store.db'}",
+        store_name="Rotisería Tenant",
+        bot_name="Ruperto Tenant",
+        default_store_id=TENANT_STORE_ID,
+    )
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    session = runtime.session_factory()
+    repository = BusinessRepository(session)
+
+    store = await repository.get_store_profile(store_id=TENANT_STORE_ID)
+    hours = await repository.list_store_business_hours(store_id=TENANT_STORE_ID)
+
+    assert store.id == TENANT_STORE_ID
+    assert store.store_name == "Rotisería Tenant"
+    assert len(hours) == DEFAULT_WEEKLY_HOURS
+    assert all(row.store_id == TENANT_STORE_ID for row in hours)
 
     await close_repository(repository, runtime)
 

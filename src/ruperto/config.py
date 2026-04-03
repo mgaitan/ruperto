@@ -34,13 +34,15 @@ class Settings(BaseSettings):
     assistant_personality: str = "Amable, ágil y confiable."
     store_locale: str = "es-AR"
     store_timezone: str = "America/Argentina/Cordoba"
+    default_store_id: int = 1
 
     gemini_model: str = "gemini-2.5-flash"
     gemini_api_key: SecretStr | None = None
+    assistant_model_timeout_seconds: float = 25.0
     kapso_api_key: SecretStr | None = None
     kapso_phone_number_id: str | None = None
 
-    def public_settings(self) -> dict[str, str | bool | None]:
+    def public_settings(self) -> dict[str, str | bool | float | None]:
         """Return a safe snapshot suitable for logs, docs, and diagnostics."""
         return {
             "environment": self.environment,
@@ -53,8 +55,10 @@ class Settings(BaseSettings):
             "assistant_personality": self.assistant_personality,
             "store_locale": self.store_locale,
             "store_timezone": self.store_timezone,
+            "default_store_id": self.default_store_id,
             "gemini_model": self.gemini_model,
             "gemini_api_key_configured": self.gemini_api_key is not None,
+            "assistant_model_timeout_seconds": self.assistant_model_timeout_seconds,
             "kapso_api_key_configured": self.kapso_api_key is not None,
             "kapso_phone_number_id": self.kapso_phone_number_id,
         }

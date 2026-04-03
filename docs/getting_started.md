@@ -29,6 +29,9 @@ uv run ruperto show-settings
 
 The bootstrap profile defaults to an `es-AR` locale so the MVP can keep
 customer and staff-facing interactions in Spanish (Argentina) from the start.
+It also respects {term}`RUPERTO_DEFAULT_STORE_ID`, which is the first step
+toward a future logical multi-tenant deployment while keeping a single store
+active by default today.
 
 ## 3. Run the API locally
 
@@ -65,6 +68,9 @@ For a brand-new customer, the assistant first asks for the person's name before
 continuing with the order flow, unless the opening message already contains a
 self-introduction such as `Hola, soy Martín`. That name is then reused across
 later messages for the same development identity.
+If the first message already contained an order or menu question, that pending
+intent is remembered while the assistant asks for the name and then resumed as
+soon as the customer identifies themself.
 The same applies to denser opening messages like `Hola, soy Martín, mandame 2
 pizzas muzza, ¿cuánto es? te pago acá`: the backend now passes safe turn hints
 so the assistant can avoid re-asking the name and can reuse explicit payment or
