@@ -8,10 +8,11 @@ from pathlib import Path
 
 import pytest
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+from sqlalchemy import select
 
 from ruperto.config import Settings
 from ruperto.db import DatabaseRuntime, create_database_runtime, init_database
-from ruperto.models import Channel, DeliveryType, OrderStatus, PaymentMethod
+from ruperto.models import Channel, DeliveryType, MenuItem, OrderStatus, PaymentMethod
 from ruperto.repository import BusinessRepository, normalize_phone_number
 from ruperto.schemas import StoreBusinessHoursSnapshot
 
@@ -28,6 +29,7 @@ KITCHEN_LOAD_DELAY_MINUTES = 18
 EMPTY_DRAFT_DELAY_MINUTES = 15
 DEFAULT_WEEKLY_HOURS = 7
 UPDATED_WEEKLY_HOURS = 2
+MIN_MENU_ITEMS = 14
 
 
 async def build_repository(tmp_path: Path) -> tuple[BusinessRepository, DatabaseRuntime]:
@@ -67,14 +69,42 @@ async def test_bootstrap_seeds_store_menu_and_empty_memory(tmp_path: Path):
 
     assert store.locale == "es-AR"
     assert len(await repository.list_store_business_hours()) == DEFAULT_WEEKLY_HOURS
-    assert menu
-    assert search[0].sku == "hamburguesa-completa"
+    assert len(menu) >= MIN_MENU_ITEMS
+    assert {item.sku for item in search} >= {"hamburguesa-completa", "hamburguesa-doble", "hamburguesa-bbq"}
+    assert any(item.category == "Bebidas" for item in menu)
+    assert any(item.category == "Postres" for item in menu)
     assert memory.favorite_item_name is None
     assert normalize_phone_number("+54 351-555-7788") == "+543515557788"
     assert normalize_phone_number("351 555 7788") == "3515557788"
     assert normalize_phone_number("   ") is None
 
     await close_repository(repository, runtime)
+
+
+async def test_init_database_backfills_missing_demo_menu_items(tmp_path: Path):
+    """Bootstrap adds missing demo items even when the menu already has rows."""
+    settings = Settings(
+        environment="test",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'repo-backfill.db'}",
+        store_name="Rotisería Test",
+        bot_name="Ruperto Test",
+    )
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+
+    async with runtime.session_factory() as session:
+        pizza = await session.scalar(select(MenuItem).where(MenuItem.sku == "pizza-especial"))
+        assert pizza is not None
+        await session.delete(pizza)
+        await session.commit()
+
+    await init_database(settings=settings, runtime=runtime)
+
+    async with runtime.session_factory() as session:
+        restored_pizza = await session.scalar(select(MenuItem).where(MenuItem.sku == "pizza-especial"))
+        assert restored_pizza is not None
+
+    await runtime.engine.dispose()
 
 
 async def test_customer_identity_and_message_history_are_persisted(tmp_path: Path):

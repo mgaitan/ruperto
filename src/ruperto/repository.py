@@ -50,9 +50,20 @@ DELIVERY_EXTRA_MINUTES = 5
 ITEM_PREPARATION_MINUTES_BY_SKU = {
     "empanadas de carne": 12,
     "hamburguesa completa": 15,
+    "hamburguesa doble cheddar": 17,
+    "hamburguesa bbq": 16,
     "milanesa napolitana": 18,
     "pizza muzzarella": 20,
+    "pizza napolitana": 20,
+    "pizza fugazzeta": 21,
+    "pizza especial": 22,
     "sanguche de milanesa": 14,
+    "gaseosa cola 1.5l": 2,
+    "agua sin gas 500ml": 1,
+    "cerveza rubia lata": 2,
+    "flan casero": 4,
+    "helado 1/4 kg": 3,
+    "brownie con nuez": 4,
 }
 ACTIVE_ORDER_STATUSES = {
     OrderStatus.CONFIRMED,

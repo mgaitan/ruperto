@@ -54,6 +54,8 @@ lets staff move orders through operational statuses with
 `PATCH /api/orders/{order_id}/status`.
 Store opening hours are now configurable through `GET/PUT /api/store-hours`,
 and customer replies mention the next opening time whenever the store is closed.
+The demo catalog now includes multiple food options plus drinks and desserts so
+local development can exercise simple add-on suggestions.
 
 ## Development
 

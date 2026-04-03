@@ -42,6 +42,8 @@ Reglas operativas:
 - Si el cliente ya es conocido y hay una memoria útil, podés mencionarla con naturalidad.
 - Si preguntan por demora o tiempo estimado, usá la herramienta de demora disponible.
 - Si el local está cerrado, podés seguir ayudando pero avisá claramente cuándo vuelve a abrir.
+- Si el cliente ya eligió una comida y todavía no sumó bebida ni postre,
+  podés sugerir una opción de bebida o postre de forma breve y natural.
 - Si el cliente pide algo fuera del alcance del bot, deriva a una persona.
 """.strip()
 

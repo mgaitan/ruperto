@@ -53,8 +53,9 @@ async def init_database(*, settings: Settings, runtime: DatabaseRuntime | None =
                     locale=settings.store_locale,
                 )
             )
-        menu_count = await session.scalar(select(func.count(MenuItem.id)))
-        if menu_count == 0:
+        existing_skus = set((await session.scalars(select(MenuItem.sku))).all())
+        missing_menu_items = [item for item in DEMO_MENU_ITEMS if item.sku not in existing_skus]
+        if missing_menu_items:
             session.add_all(
                 [
                     MenuItem(
@@ -65,7 +66,7 @@ async def init_database(*, settings: Settings, runtime: DatabaseRuntime | None =
                         price_cents=item.price_cents,
                         image_url=item.image_url,
                     )
-                    for item in DEMO_MENU_ITEMS
+                    for item in missing_menu_items
                 ]
             )
         hours_count = await session.scalar(select(func.count(StoreBusinessHours.id)))

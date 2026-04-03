@@ -65,6 +65,10 @@ For a brand-new customer, the assistant first asks for the person's name before
 continuing with the order flow. That name is then reused across later messages
 for the same development identity.
 
+The seeded demo menu now includes several food options, drinks, and desserts,
+which makes it easier to test suggestions such as offering a beverage or a
+dessert after the customer chooses a main dish.
+
 Or launch the built-in PydanticAI web client for development:
 
 ```bash
