@@ -1,4 +1,6 @@
-"""Entry-point module, in case you use `python -m pp3`."""
+"""Run the Ruperto CLI with `python -m ruperto`."""
+
+from __future__ import annotations
 
 import sys
 

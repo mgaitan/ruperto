@@ -4,6 +4,54 @@ This chapter is a lookup reference for environment variables used by commands,
 documentation examples, and CI workflows.
 
 ```{glossary}
+RUPERTO_ENVIRONMENT
+  Runtime environment name for the service.
+  Use values such as `development`, `test`, or `production`.
+
+RUPERTO_DATABASE_URL
+  SQLAlchemy connection string used by the backend.
+  The current prototype defaults to SQLite via `aiosqlite`.
+
+RUPERTO_AUTO_INIT_DB
+  When enabled, the FastAPI lifespan creates the schema and bootstraps the
+  initial store profile on startup.
+
+RUPERTO_STORE_NAME
+  Public name of the food business served by the assistant.
+
+RUPERTO_BOT_NAME
+  Display name used by the assistant persona.
+
+RUPERTO_STORE_LOCATION
+  Optional location or area served by the business.
+
+RUPERTO_STORE_DESCRIPTION
+  Short store description that can be reused in the assistant instructions and
+  future admin screens.
+
+RUPERTO_ASSISTANT_PERSONALITY
+  Short description of the assistant tone and behavior.
+
+RUPERTO_STORE_LOCALE
+  Primary locale used by the business-facing configuration and the assistant.
+  The current default is `es-AR`, which is the main language for customer and
+  staff interactions in the MVP.
+
+RUPERTO_GEMINI_MODEL
+  Google Gemini model name used by the PydanticAI ordering assistant.
+  The initial value is `gemini-2.5-flash`.
+
+RUPERTO_GEMINI_API_KEY
+  API key for the Google Gemini provider.
+  This is intentionally not echoed back by CLI diagnostics.
+
+RUPERTO_KAPSO_API_KEY
+  API key for Kapso WhatsApp operations.
+  This is reserved for the future channel adapter work.
+
+RUPERTO_KAPSO_PHONE_NUMBER_ID
+  Kapso or WhatsApp phone number identifier used by outbound messaging.
+
 PYTHONPATH
   Python import search path.
   In this project docs, it is used for module execution from source (for example `PYTHONPATH=src uv run -m ...`).

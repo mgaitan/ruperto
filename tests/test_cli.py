@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import runpy
+import sqlite3
 import sys
 from importlib import metadata
+from pathlib import Path
 
 import pytest
 
@@ -58,3 +61,26 @@ def test_get_version_package_not_found(mocker):
         side_effect=metadata.PackageNotFoundError("not found"),
     )
     assert get_version() == "unknown"
+
+
+def test_show_settings(monkeypatch, capsys: pytest.CaptureFixture):
+    """The public settings snapshot is printed as JSON."""
+    monkeypatch.setenv("RUPERTO_STORE_NAME", "Pizza Planet")
+    assert main(["show-settings"]) == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["store_name"] == "Pizza Planet"
+
+
+def test_init_db(monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture):
+    """The database bootstrap command creates the first table."""
+    database_path = tmp_path / "ruperto.db"
+    monkeypatch.setenv("RUPERTO_DATABASE_URL", f"sqlite+aiosqlite:///{database_path}")
+    assert main(["init-db"]) == 0
+    captured = capsys.readouterr()
+    assert str(database_path) in captured.out
+
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+    tables = {row[0] for row in rows}
+    assert "store_profile" in tables

@@ -22,7 +22,15 @@ classifiers = [
     "Topic :: Utilities",
     "Typing :: Typed",
 ]
-dependencies = ["rich"]
+dependencies = [
+    "aiosqlite>=0.22.1",
+    "fastapi[standard]>=0.135.2",
+    "httpx>=0.28.1",
+    "pydantic-ai-slim[google]>=1.73.0",
+    "pydantic-settings>=2.13.1",
+    "rich",
+    "sqlalchemy>=2.0.48",
+]
 
 [build-system]
 requires = ["uv_build>=0.8.9,<0.9.0"]
@@ -30,6 +38,9 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 module-name = "ruperto"
+
+[tool.fastapi]
+entrypoint = "ruperto.app:app"
 
 [tool.uv]
 exclude-newer = "1 week"
