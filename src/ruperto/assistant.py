@@ -673,7 +673,7 @@ class OrderingAssistantService:
 
     def _extract_customer_name(self, message_text: str) -> str | None:
         """Extract a customer name from either a short reply or a longer introduction."""
-        return self._extract_name_candidate(message_text) or self._extract_name_from_introduction(message_text)
+        return self._extract_name_from_introduction(message_text) or self._extract_name_candidate(message_text)
 
     def _extract_name_from_introduction(self, message_text: str) -> str | None:
         """Extract a first name from a longer self-introduction message."""

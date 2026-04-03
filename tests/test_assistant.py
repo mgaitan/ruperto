@@ -447,6 +447,8 @@ async def test_name_candidate_heuristics_cover_edge_cases(tmp_path: Path):
     assert service._extract_name_candidate("Juan Carlos Perez Gomez") is None
     assert service._extract_name_candidate("Ana María López") == "Ana María López"
     assert service._extract_customer_name("Qué tal, me llamo Pedro Guti y tengo hambre") == "Pedro"
+    assert service._extract_customer_name("sí, soy martín") == "Martín"
+    assert service._extract_customer_name("si, soy martin") == "Martin"
     assert (
         service._extract_latest_assistant_text(
             [
