@@ -331,6 +331,31 @@ async def test_assistant_asks_for_name_before_taking_the_first_order(tmp_path: P
     await runtime.engine.dispose()
 
 
+def onboarding_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Reply with the customer name so onboarding capture can be asserted."""
+    tool_returns = collect_tool_returns(messages)
+    if "lookup_customer" not in tool_returns:
+        return ModelResponse(
+            parts=[ToolCallPart("lookup_customer", {})],
+            model_name="function:test-onboarding",
+        )
+
+    customer = tool_returns["lookup_customer"]
+    return ModelResponse(
+        parts=[
+            ToolCallPart(
+                info.output_tools[0].name,
+                {
+                    "reply_text": f"Hola {customer.name}, te tomo ese pedido 🍕",
+                    "next_step": "choose_items",
+                    "handoff": False,
+                },
+            )
+        ],
+        model_name="function:test-onboarding",
+    )
+
+
 async def test_assistant_reasks_for_name_when_the_reply_is_not_a_name(tmp_path: Path):
     """The deterministic onboarding keeps asking for the name until it gets a plausible answer."""
     settings = build_settings(tmp_path)
@@ -363,10 +388,19 @@ async def test_name_candidate_heuristics_cover_edge_cases(tmp_path: Path):
     service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
 
     assert service._extract_name_candidate("martina") == "Martina"
+    assert service._extract_name_from_introduction("Hola, soy martín gaitán y quiero una pizza") == "Martín"
+    assert service._extract_name_from_introduction("Buenas, me llamo ana y quiero pagar acá") == "Ana"
+    assert service._extract_name_from_introduction("Mi nombre es Juan Cruz") == "Juan"
+    assert service._extract_name_from_introduction("Hola, quiero pizza") is None
+    assert service._extract_name_from_introduction("   ") is None
+    assert service._extract_name_from_introduction("Soy !!!") is None
+    assert service._extract_name_from_introduction("Hola, soy martín 123") == "Martín"
+    assert service._extract_name_from_introduction("Hola, soy juan carlos perez y quiero pedir") == "Juan"
     assert service._extract_name_candidate("   ") is None
     assert service._extract_name_candidate("Juan 123") is None
     assert service._extract_name_candidate("hola quiero pizza") is None
     assert service._extract_name_candidate("Juan Carlos Perez Gomez") is None
+    assert service._extract_name_candidate("Ana María López") == "Ana María López"
     assert (
         service._extract_latest_assistant_text(
             [
@@ -382,6 +416,28 @@ async def test_name_candidate_heuristics_cover_edge_cases(tmp_path: Path):
     )
     assert "Ruperto Test" in service._build_name_prompt(conversation_id=1)
     assert "Rotisería Test" in service._build_name_prompt(conversation_id=1)
+
+    await runtime.engine.dispose()
+
+
+async def test_assistant_uses_name_introduced_in_the_first_message(tmp_path: Path):
+    """A first-turn self-introduction should be persisted and reused immediately."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+
+    reply = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-presentado",
+        message_text="Hola, soy martín gaitán, mandame 2 pizzas muzza y te pago acá.",
+        model=FunctionModel(onboarding_model),
+    )
+
+    assert reply.customer.name == "Martín"
+    assert reply.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
+    assert "Hola Martín" in reply.reply.reply_text
+    assert "¿me decís tu nombre?" not in reply.reply.reply_text
 
     await runtime.engine.dispose()
 

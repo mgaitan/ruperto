@@ -49,8 +49,9 @@ You should then have:
 - development web chat at `http://127.0.0.1:7932/`
 
 The current development flow asks for the customer's name before the first
-order, estimates kitchen delay from preparation time plus active workload, and
-lets staff move orders through operational statuses with
+order unless the customer already introduced themself in the opening message,
+estimates kitchen delay from preparation time plus active workload, and lets
+staff move orders through operational statuses with
 `PATCH /api/orders/{order_id}/status`.
 Store opening hours are now configurable through `GET/PUT /api/store-hours`,
 and customer replies mention the next opening time whenever the store is closed.

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
@@ -38,7 +37,6 @@ from ruperto.models import Channel
 WEB_MODEL_ID = "ruperto-dev-web"
 WEB_TOOL_NAME = "submit_customer_message"
 REQUEST_DATA_ADAPTER = TypeAdapter(RequestData)
-WEB_CHAT_LOG_PATH = Path(".ruperto-web-chat.log")
 
 
 class MissingWebChatUserMessageError(ValueError):
@@ -224,17 +222,11 @@ def create_web_chat_app(
 def run_web_chat(*, settings: Settings, session_factory: async_sessionmaker[AsyncSession], host: str, port: int) -> int:
     """Run the development web chat server."""
     app = create_web_chat_app(settings=settings, session_factory=session_factory)
-    print(f"Development web chat available at http://{host}:{port} (logs: {WEB_CHAT_LOG_PATH})")
-    with (
-        WEB_CHAT_LOG_PATH.open("a", encoding="utf-8") as log_file,
-        contextlib.redirect_stdout(log_file),
-        contextlib.redirect_stderr(log_file),
-    ):
-        uvicorn.run(
-            app,
-            host=host,
-            port=port,
-            access_log=False,
-            use_colors=False,
-        )
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        access_log=False,
+        use_colors=False,
+    )
     return 0
