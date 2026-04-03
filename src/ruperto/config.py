@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.5-flash"
     gemini_api_key: SecretStr | None = None
     assistant_model_timeout_seconds: float = 25.0
+    assistant_model_retry_attempts: int = 1
     kapso_api_key: SecretStr | None = None
     kapso_phone_number_id: str | None = None
 
@@ -59,6 +60,7 @@ class Settings(BaseSettings):
             "gemini_model": self.gemini_model,
             "gemini_api_key_configured": self.gemini_api_key is not None,
             "assistant_model_timeout_seconds": self.assistant_model_timeout_seconds,
+            "assistant_model_retry_attempts": self.assistant_model_retry_attempts,
             "kapso_api_key_configured": self.kapso_api_key is not None,
             "kapso_phone_number_id": self.kapso_phone_number_id,
         }

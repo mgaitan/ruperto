@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import cast
+from typing import Protocol, cast
 
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, UserPromptPart
@@ -29,6 +30,8 @@ from ruperto.schemas import (
     OrderSnapshot,
     StoreAvailabilitySnapshot,
 )
+
+logger = logging.getLogger(__name__)
 
 BASE_INSTRUCTIONS = """
 Sos el asistente virtual de un local de comida en Argentina.
@@ -171,6 +174,27 @@ class NameHandlingResult:
     customer: CustomerSnapshot
     direct_reply: AssistantTurnResult | None = None
     resumed_pending_message: str | None = None
+
+
+@dataclass(slots=True)
+class ModelRunContext:
+    """Inputs required to execute one agent run with retries."""
+
+    message_text: str
+    deps: AssistantDeps
+    history: list[ModelMessage]
+    model: Model | str
+    external_user_id: str
+    conversation_id: int
+
+
+class AgentRunResult(Protocol):
+    """Minimal protocol required from one completed agent run."""
+
+    output: AssistantReply
+
+    def new_messages(self) -> list[ModelMessage]:
+        """Return the messages produced during the run."""
 
 
 class InformationalTurnMutationError(ValueError):
@@ -451,6 +475,56 @@ class OrderingAssistantService:
             current_order=None,
         )
 
+    async def _run_agent_with_retries(
+        self,
+        *,
+        run_context: ModelRunContext,
+    ) -> AgentRunResult:
+        """Run the agent with timeout logging and one or more retry attempts."""
+        attempts = self.settings.assistant_model_retry_attempts + 1
+        last_error: Exception | None = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                async with asyncio.timeout(self.settings.assistant_model_timeout_seconds):
+                    return await self.agent.run(
+                        run_context.message_text,
+                        deps=run_context.deps,
+                        message_history=run_context.history,
+                        model=run_context.model,
+                    )
+            except TimeoutError as error:
+                logger.warning(
+                    "Assistant model timed out",
+                    extra={
+                        "external_user_id": run_context.external_user_id,
+                        "conversation_id": run_context.conversation_id,
+                        "attempt": attempt,
+                        "max_attempts": attempts,
+                    },
+                )
+                last_error = error
+            except Exception as error:
+                if isinstance(error, (InformationalTurnMutationError, MissingConfirmationSignalError)):
+                    raise
+                logger.warning(
+                    "Assistant model failed",
+                    exc_info=error,
+                    extra={
+                        "external_user_id": run_context.external_user_id,
+                        "conversation_id": run_context.conversation_id,
+                        "attempt": attempt,
+                        "max_attempts": attempts,
+                    },
+                )
+                last_error = error
+
+            if attempt < attempts:
+                await asyncio.sleep(min(0.25 * attempt, 1.0))
+
+        assert last_error is not None
+        raise last_error
+
     async def handle_customer_message(
         self,
         *,
@@ -532,13 +606,16 @@ class OrderingAssistantService:
 
         active_model = model if model is not None else build_google_model(self.settings)
         try:
-            async with asyncio.timeout(self.settings.assistant_model_timeout_seconds):
-                result = await self.agent.run(
-                    message_text,
+            result = await self._run_agent_with_retries(
+                run_context=ModelRunContext(
+                    message_text=message_text,
                     deps=deps,
-                    message_history=history,
+                    history=history,
                     model=active_model,
-                )
+                    external_user_id=external_user_id,
+                    conversation_id=conversation_id,
+                ),
+            )
         except TimeoutError:
             return await self._build_model_unavailable_result(
                 conversation_id=conversation_id,

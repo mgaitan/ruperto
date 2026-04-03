@@ -41,6 +41,7 @@ from ruperto.schemas import (
 
 pytestmark = pytest.mark.anyio
 MIN_HISTORY_MESSAGES = 10
+RETRY_SUCCESS_CALLS = 2
 
 
 def build_settings(tmp_path: Path) -> Settings:
@@ -231,6 +232,7 @@ async def test_assistant_returns_handoff_when_model_times_out(tmp_path: Path):
         agent=cast(Any, SlowAgent()),
     )
     service.settings.assistant_model_timeout_seconds = 0.001
+    service.settings.assistant_model_retry_attempts = 1
 
     result = await service.handle_customer_message(
         channel=Channel.DEV,
@@ -278,6 +280,7 @@ async def test_assistant_returns_handoff_when_model_errors(tmp_path: Path):
         settings=settings,
         agent=cast(Any, FailingAgent()),
     )
+    service.settings.assistant_model_retry_attempts = 1
 
     result = await service.handle_customer_message(
         channel=Channel.DEV,
@@ -289,6 +292,61 @@ async def test_assistant_returns_handoff_when_model_errors(tmp_path: Path):
     assert result.reply.next_step == AssistantNextStep.HANDOFF
     assert result.reply.handoff is True
     assert result.current_order is None
+
+    await runtime.engine.dispose()
+
+
+async def test_assistant_retries_once_before_fallback(tmp_path: Path):
+    """Transient provider failures should be retried before degrading the turn."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    baseline_service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        baseline_service,
+        channel=Channel.DEV,
+        external_user_id="retry-user",
+        name="Martina",
+    )
+
+    class FlakyAgent:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def run(self, *args: Any, **kwargs: Any):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError
+            return type(
+                "RunResult",
+                (),
+                {
+                    "output": AssistantReply(
+                        reply_text="Hola Martina, te tomo ese pedido 🍕",
+                        next_step=AssistantNextStep.CHOOSE_ITEMS,
+                        handoff=False,
+                    ),
+                    "new_messages": staticmethod(list),
+                },
+            )()
+
+    flaky_agent = FlakyAgent()
+    service = OrderingAssistantService(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        agent=cast(Any, flaky_agent),
+    )
+    service.settings.assistant_model_retry_attempts = 1
+
+    result = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="retry-user",
+        message_text="quiero una hamburguesa",
+    )
+
+    assert flaky_agent.calls == RETRY_SUCCESS_CALLS
+    assert result.reply.reply_text == "Hola Martina, te tomo ese pedido 🍕"
+    assert result.reply.handoff is False
 
     await runtime.engine.dispose()
 

@@ -55,6 +55,10 @@ RUPERTO_ASSISTANT_MODEL_TIMEOUT_SECONDS
   Maximum number of seconds the backend waits for the configured model before
   degrading the turn into a friendly handoff response.
 
+RUPERTO_ASSISTANT_MODEL_RETRY_ATTEMPTS
+  Number of extra attempts the backend performs after a timeout or provider
+  failure before returning the fallback handoff reply.
+
 RUPERTO_KAPSO_API_KEY
   API key for Kapso WhatsApp operations.
   This is reserved for the future channel adapter work.
