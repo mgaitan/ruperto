@@ -245,3 +245,5 @@ def test_run_web_chat_starts_uvicorn(mocker, tmp_path: Path):
         == 0
     )
     uvicorn_run.assert_called_once()
+    assert uvicorn_run.call_args.kwargs["access_log"] is False
+    assert uvicorn_run.call_args.kwargs["use_colors"] is False

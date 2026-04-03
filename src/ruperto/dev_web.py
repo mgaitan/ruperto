@@ -222,5 +222,11 @@ def create_web_chat_app(
 def run_web_chat(*, settings: Settings, session_factory: async_sessionmaker[AsyncSession], host: str, port: int) -> int:
     """Run the development web chat server."""
     app = create_web_chat_app(settings=settings, session_factory=session_factory)
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        access_log=False,
+        use_colors=False,
+    )
     return 0
