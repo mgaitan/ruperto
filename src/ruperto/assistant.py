@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import cast
@@ -50,6 +51,34 @@ Reglas operativas:
 NAME_CONFIRMATION_TEMPLATE = "¡Gracias, {name}! 😄 ¿Qué querés pedir hoy?"
 MAX_NAME_WORDS = 3
 CLOSED_STORE_PREFIX = "{message_text} "
+NAME_TOKEN_PATTERN = re.compile(r"^[A-Za-zÁÉÍÓÚÜÑáéíóúüñ'-]+$")
+INTRO_NAME_PATTERNS = (
+    re.compile(r"\bsoy\s+(?P<tail>.+)", re.IGNORECASE),
+    re.compile(r"\bme\s+llamo\s+(?P<tail>.+)", re.IGNORECASE),
+    re.compile(r"\bmi\s+nombre\s+es\s+(?P<tail>.+)", re.IGNORECASE),
+)
+INTRO_NAME_STOP_WORDS = {
+    "y",
+    "me",
+    "mandás",
+    "mandame",
+    "mandáme",
+    "quiero",
+    "quisiera",
+    "te",
+    "pido",
+    "pedir",
+    "para",
+    "con",
+    "sin",
+    "cuánto",
+    "cuanto",
+    "sale",
+    "es",
+    "acá",
+    "aca",
+    "pago",
+}
 NAME_PROMPT_VARIANTS = (
     "👋 Hola, soy {bot_name}, el asistente de pedidos de {store_name}. Antes de seguir, ¿me decís tu nombre?",
     "🍽️ Hola, te habla {bot_name}, el asistente de pedidos de {store_name}. Para arrancar, ¿cómo te llamás?",
@@ -308,8 +337,14 @@ class OrderingAssistantService:
                 external_id=external_user_id,
                 customer_id=customer.id,
             )
-            availability = await repository.get_store_availability(timezone_name=self.settings.store_timezone)
             history = await repository.load_conversation_messages(conversation.id)
+            customer = await self._capture_customer_name_from_message(
+                repository=repository,
+                customer=customer,
+                history=history,
+                message_text=message_text,
+            )
+            availability = await repository.get_store_availability(timezone_name=self.settings.store_timezone)
             deps = AssistantDeps(
                 settings=self.settings,
                 session_factory=self.session_factory,
@@ -438,6 +473,23 @@ class OrderingAssistantService:
             current_order=None,
         )
 
+    async def _capture_customer_name_from_message(
+        self,
+        *,
+        repository: BusinessRepository,
+        customer: CustomerSnapshot,
+        history: list[ModelMessage],
+        message_text: str,
+    ) -> CustomerSnapshot:
+        """Persist a detected customer name before the rest of the turn continues."""
+        if customer.name is not None:
+            return customer
+        if self._is_waiting_for_name(history):
+            return customer
+        if name := self._extract_name_from_introduction(message_text):
+            return await repository.update_customer_name(customer.id, name)
+        return customer
+
     async def _persist_direct_reply(
         self,
         *,
@@ -500,6 +552,41 @@ class OrderingAssistantService:
         if any(term in lowered for term in blocked_terms):
             return None
         return cleaned.title()
+
+    def _extract_name_from_introduction(self, message_text: str) -> str | None:
+        """Extract a first name from a longer self-introduction message."""
+        cleaned = " ".join(message_text.split())
+        if not cleaned:
+            return None
+
+        for pattern in INTRO_NAME_PATTERNS:
+            match = pattern.search(cleaned)
+            if match is None:
+                continue
+            if name := self._extract_first_name_from_intro_tail(match.group("tail")):
+                return name
+        return None
+
+    def _extract_first_name_from_intro_tail(self, tail: str) -> str | None:
+        """Return the first valid name token found after an introduction phrase."""
+        candidate_tokens: list[str] = []
+        normalized_tail = tail.replace(",", " ").replace(".", " ").replace(";", " ").replace(":", " ")
+        for raw_token in normalized_tail.split():
+            token = raw_token.strip("¡!¿?()[]{}\"'")
+            if not token:
+                continue
+            lowered = token.casefold()
+            if candidate_tokens and lowered in INTRO_NAME_STOP_WORDS:
+                break
+            if not NAME_TOKEN_PATTERN.fullmatch(token):
+                break
+            candidate_tokens.append(token)
+            if len(candidate_tokens) >= MAX_NAME_WORDS:
+                break
+
+        if not candidate_tokens:
+            return None
+        return candidate_tokens[0].title()
 
     def _build_name_prompt(self, *, conversation_id: int) -> str:
         """Build the first-contact greeting asking for the customer's name."""

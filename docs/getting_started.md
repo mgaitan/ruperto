@@ -62,8 +62,9 @@ curl -X POST http://127.0.0.1:8000/api/dev/messages \
 ```
 
 For a brand-new customer, the assistant first asks for the person's name before
-continuing with the order flow. That name is then reused across later messages
-for the same development identity.
+continuing with the order flow, unless the opening message already contains a
+self-introduction such as `Hola, soy Martín`. That name is then reused across
+later messages for the same development identity.
 
 The seeded demo menu now includes several food options, drinks, and desserts,
 which makes it easier to test suggestions such as offering a beverage or a

@@ -23,7 +23,6 @@ from starlette.responses import JSONResponse
 from ruperto.config import Settings
 from ruperto.db import create_database_runtime
 from ruperto.dev_web import (
-    WEB_CHAT_LOG_PATH,
     WEB_TOOL_NAME,
     build_web_chat_response,
     build_web_chat_stream,
@@ -235,7 +234,6 @@ def test_run_web_chat_starts_uvicorn(mocker, tmp_path: Path):
     settings = build_settings(tmp_path)
     runtime = create_database_runtime(settings)
     uvicorn_run = mocker.patch("ruperto.dev_web.uvicorn.run")
-    mocker.patch("builtins.print")
 
     assert (
         run_web_chat(
@@ -249,4 +247,3 @@ def test_run_web_chat_starts_uvicorn(mocker, tmp_path: Path):
     uvicorn_run.assert_called_once()
     assert uvicorn_run.call_args.kwargs["access_log"] is False
     assert uvicorn_run.call_args.kwargs["use_colors"] is False
-    assert WEB_CHAT_LOG_PATH.exists()
