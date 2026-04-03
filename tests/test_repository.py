@@ -10,18 +10,20 @@ from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserProm
 
 from ruperto.config import Settings
 from ruperto.db import DatabaseRuntime, create_database_runtime, init_database
-from ruperto.models import Channel, DeliveryType, PaymentMethod
+from ruperto.models import Channel, DeliveryType, OrderStatus, PaymentMethod
 from ruperto.repository import BusinessRepository, normalize_phone_number
 
 pytestmark = pytest.mark.anyio
 EXPECTED_HISTORY_MESSAGES = 2
 EXPECTED_ORDER_TOTAL = 1900000
 EXPECTED_SINGLE_BURGER_TOTAL = 950000
-EXPECTED_DELAY_MINUTES = 33
+EXPECTED_DELAY_MINUTES = 22
 DEFAULT_DELAY_MINUTES = 25
-DRAFT_DELAY_MINUTES = 26
-PICKUP_DELAY_MINUTES = 22
-LARGE_ORDER_DELAY_MINUTES = 40
+DRAFT_DELAY_MINUTES = 15
+PICKUP_DELAY_MINUTES = 15
+LARGE_ORDER_DELAY_MINUTES = 31
+KITCHEN_LOAD_DELAY_MINUTES = 18
+EMPTY_DRAFT_DELAY_MINUTES = 15
 
 
 async def build_repository(tmp_path: Path) -> tuple[BusinessRepository, DatabaseRuntime]:
@@ -190,8 +192,10 @@ async def test_order_lifecycle_and_customer_memory(tmp_path: Path):
     assert latest.status.value == "confirmed"
     assert confirmed.total_amount_cents == EXPECTED_ORDER_TOTAL
     assert confirmed.items[0].notes == "sin cebolla"
+    assert delay.base_minutes == EXPECTED_DELAY_MINUTES
+    assert delay.active_orders_ahead == 0
     assert delay.estimated_minutes == EXPECTED_DELAY_MINUTES
-    assert delay.display_text == "33 minutos aproximadamente"
+    assert delay.display_text == "22 minutos aproximadamente"
     assert memory.favorite_item_name == "Hamburguesa completa"
     assert memory.recent_items == ["Hamburguesa completa"]
 
@@ -255,8 +259,30 @@ async def test_delay_estimate_without_order_returns_store_default(tmp_path: Path
 
     delay = await repository.get_estimated_delay(customer.id, conversation.id)
 
+    assert delay.base_minutes == DEFAULT_DELAY_MINUTES
+    assert delay.active_orders_ahead == 0
     assert delay.estimated_minutes == DEFAULT_DELAY_MINUTES
     assert delay.display_text == "25 minutos aproximadamente"
+
+    await close_repository(repository, runtime)
+
+
+async def test_delay_estimate_with_empty_draft_uses_base_preparation(tmp_path: Path):
+    """An empty draft still returns the default preparation base."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="delay-empty")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="delay-empty",
+        customer_id=customer.id,
+    )
+
+    await repository.get_current_order(customer.id, conversation.id)
+    delay = await repository.get_estimated_delay(customer.id, conversation.id)
+
+    assert delay.base_minutes == EMPTY_DRAFT_DELAY_MINUTES
+    assert delay.active_orders_ahead == 0
+    assert delay.estimated_minutes == EMPTY_DRAFT_DELAY_MINUTES
 
     await close_repository(repository, runtime)
 
@@ -281,10 +307,12 @@ async def test_delay_estimate_uses_draft_order_rules(tmp_path: Path):
     await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.PICKUP)
     pickup_delay = await repository.get_estimated_delay(customer.id, conversation.id)
 
+    assert draft_delay.base_minutes == DRAFT_DELAY_MINUTES
     assert draft_delay.estimated_minutes == DRAFT_DELAY_MINUTES
-    assert draft_delay.display_text == "26 minutos aproximadamente"
+    assert draft_delay.display_text == "15 minutos aproximadamente"
+    assert pickup_delay.base_minutes == PICKUP_DELAY_MINUTES
     assert pickup_delay.estimated_minutes == PICKUP_DELAY_MINUTES
-    assert pickup_delay.display_text == "22 minutos aproximadamente"
+    assert pickup_delay.display_text == "15 minutos aproximadamente"
 
     await close_repository(repository, runtime)
 
@@ -309,7 +337,59 @@ async def test_delay_estimate_adds_extra_time_for_large_orders(tmp_path: Path):
     await repository.confirm_current_order(customer.id, conversation.id)
     delay = await repository.get_estimated_delay(customer.id, conversation.id)
 
+    assert delay.base_minutes == LARGE_ORDER_DELAY_MINUTES
     assert delay.estimated_minutes == LARGE_ORDER_DELAY_MINUTES
-    assert delay.display_text == "40 minutos aproximadamente"
+    assert delay.display_text == "31 minutos aproximadamente"
+
+    await close_repository(repository, runtime)
+
+
+async def test_delay_estimate_reflects_kitchen_load_from_previous_active_orders(tmp_path: Path):
+    """Earlier active orders increase the delay estimate for later orders."""
+    repository, runtime = await build_repository(tmp_path)
+
+    first_customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="load-1")
+    first_conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="load-1",
+        customer_id=first_customer.id,
+    )
+    await repository.add_item_to_current_order(
+        first_customer.id,
+        first_conversation.id,
+        sku="pizza-muzzarella",
+        quantity=1,
+    )
+    first_order = await repository.confirm_current_order(first_customer.id, first_conversation.id)
+    assert first_order.status == OrderStatus.CONFIRMED
+
+    second_customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="load-2")
+    second_conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="load-2",
+        customer_id=second_customer.id,
+    )
+    await repository.add_item_to_current_order(
+        second_customer.id,
+        second_conversation.id,
+        sku="hamburguesa-completa",
+        quantity=1,
+    )
+    delay = await repository.get_estimated_delay(second_customer.id, second_conversation.id)
+
+    assert delay.base_minutes == DRAFT_DELAY_MINUTES
+    assert delay.active_orders_ahead == 1
+    assert delay.estimated_minutes == KITCHEN_LOAD_DELAY_MINUTES
+    assert delay.display_text == "18 minutos aproximadamente"
+
+    await close_repository(repository, runtime)
+
+
+async def test_update_order_status_requires_an_existing_order(tmp_path: Path):
+    """Staff operations fail clearly when the order id does not exist."""
+    repository, runtime = await build_repository(tmp_path)
+
+    with pytest.raises(ValueError, match=re.escape("No se encontró el pedido solicitado.")):
+        await repository.update_order_status(999, OrderStatus.ALMOST_READY)
 
     await close_repository(repository, runtime)

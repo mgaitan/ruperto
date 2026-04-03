@@ -94,6 +94,8 @@ class CustomerMemorySnapshot(BaseModel):
 class DelayEstimateSnapshot(BaseModel):
     """Operational delay estimate exposed to the assistant."""
 
+    active_orders_ahead: int
+    base_minutes: int
     estimated_minutes: int
     display_text: str
 
@@ -133,3 +135,9 @@ class DevMessageRequest(BaseModel):
 
     external_user_id: str = Field(min_length=1)
     message_text: str = Field(min_length=1)
+
+
+class OrderStatusUpdateRequest(BaseModel):
+    """Payload accepted by staff endpoints to update one order status."""
+
+    status: OrderStatus

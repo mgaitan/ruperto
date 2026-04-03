@@ -13,8 +13,10 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from ruperto.app import create_app
 from ruperto.config import Settings
+from ruperto.models import OrderStatus
 
 HTTP_OK = 200
+HTTP_NOT_FOUND = 404
 MIN_MENU_ITEMS = 5
 
 
@@ -125,9 +127,17 @@ def test_mvp_api_surface_exposes_dev_chat_and_read_models(tmp_path: Path, monkey
     with TestClient(app) as client:
         store_response = client.get("/api/store-profile")
         menu_response = client.get("/api/menu-items", params={"only_available": "false"})
-        chat_response = client.post(
+        first_chat_response = client.post(
             "/api/dev/messages",
             json={"external_user_id": "cli-user", "message_text": "Hola, quiero pedir"},
+        )
+        second_chat_response = client.post(
+            "/api/dev/messages",
+            json={"external_user_id": "cli-user", "message_text": "Martina"},
+        )
+        chat_response = client.post(
+            "/api/dev/messages",
+            json={"external_user_id": "cli-user", "message_text": "Quiero una hamburguesa"},
         )
         customers_response = client.get("/api/customers", params={"limit": 1})
         orders_response = client.get("/api/orders", params={"limit": 10})
@@ -138,6 +148,12 @@ def test_mvp_api_surface_exposes_dev_chat_and_read_models(tmp_path: Path, monkey
 
     assert menu_response.status_code == HTTP_OK
     assert len(menu_response.json()) >= MIN_MENU_ITEMS
+
+    assert first_chat_response.status_code == HTTP_OK
+    assert first_chat_response.json()["reply"]["next_step"] == "ask_name"
+    assert second_chat_response.status_code == HTTP_OK
+    assert second_chat_response.json()["customer"]["name"] == "Martina"
+    assert second_chat_response.json()["reply"]["next_step"] == "choose_items"
 
     assert chat_response.status_code == HTTP_OK
     chat_payload = chat_response.json()
@@ -153,3 +169,36 @@ def test_mvp_api_surface_exposes_dev_chat_and_read_models(tmp_path: Path, monkey
 
     assert confirmed_orders_response.status_code == HTTP_OK
     assert confirmed_orders_response.json()[0]["status"] == "confirmed"
+
+
+def test_staff_can_update_order_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Staff endpoints can move an order through the operational workflow."""
+    monkeypatch.setattr("ruperto.assistant.build_google_model", lambda settings: FunctionModel(dev_message_model))
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Hola"})
+        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Martina"})
+        order_response = client.post(
+            "/api/dev/messages",
+            json={"external_user_id": "cli-user", "message_text": "Quiero una hamburguesa"},
+        )
+        order_id = order_response.json()["current_order"]["id"]
+        status_response = client.patch(
+            f"/api/orders/{order_id}/status",
+            json={"status": OrderStatus.ALMOST_READY.value},
+        )
+
+    assert status_response.status_code == HTTP_OK
+    assert status_response.json()["status"] == OrderStatus.ALMOST_READY.value
+
+
+def test_staff_update_order_status_returns_not_found_for_unknown_order(tmp_path: Path):
+    """The staff status endpoint returns 404 when the order is missing."""
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.patch("/api/orders/999/status", json={"status": OrderStatus.ALMOST_READY.value})
+
+    assert response.status_code == HTTP_NOT_FOUND
+    assert response.json()["detail"] == "Order not found."

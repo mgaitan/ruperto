@@ -39,6 +39,23 @@ from ruperto.schemas import (
 
 LARGE_ORDER_THRESHOLD_CENTS = 3000000
 DEFAULT_DELAY_MINUTES = 25
+KITCHEN_LOAD_COEFFICIENT_MINUTES = 3
+DEFAULT_PREPARATION_MINUTES = 15
+DELIVERY_EXTRA_MINUTES = 5
+ITEM_PREPARATION_MINUTES_BY_SKU = {
+    "empanadas de carne": 12,
+    "hamburguesa completa": 15,
+    "milanesa napolitana": 18,
+    "pizza muzzarella": 20,
+    "sanguche de milanesa": 14,
+}
+ACTIVE_ORDER_STATUSES = {
+    OrderStatus.CONFIRMED,
+    OrderStatus.IN_PREPARATION,
+    OrderStatus.ALMOST_READY,
+    OrderStatus.READY_FOR_PICKUP,
+    OrderStatus.OUT_FOR_DELIVERY,
+}
 
 
 def normalize_phone_number(value: str | None) -> str | None:
@@ -74,6 +91,13 @@ class EmptyOrderError(ValueError):
 
     def __init__(self) -> None:
         super().__init__("No se puede confirmar un pedido vacío.")
+
+
+class OrderNotFoundError(ValueError):
+    """Raised when the requested order does not exist."""
+
+    def __init__(self) -> None:
+        super().__init__("No se encontró el pedido solicitado.")
 
 
 class BusinessRepository:
@@ -295,6 +319,16 @@ class BusinessRepository:
         orders = (await self.session.scalars(statement)).all()
         return [await self._build_order_snapshot(order) for order in orders]
 
+    async def update_order_status(self, order_id: int, status: OrderStatus) -> OrderSnapshot:
+        """Update the operational status for one order."""
+        order = await self.session.get(Order, order_id)
+        if order is None:
+            raise OrderNotFoundError
+        order.status = status
+        order.updated_at = utc_now()
+        await self.session.flush()
+        return await self._build_order_snapshot(order)
+
     async def add_item_to_current_order(
         self,
         customer_id: int,
@@ -416,15 +450,38 @@ class BusinessRepository:
         if order is None:
             latest_order = await self.get_latest_order(customer_id, conversation_id)
             if latest_order is None:
-                estimated_minutes = DEFAULT_DELAY_MINUTES
+                active_orders_ahead = await self.count_active_orders()
+                estimated_minutes = DEFAULT_DELAY_MINUTES + (active_orders_ahead * KITCHEN_LOAD_COEFFICIENT_MINUTES)
                 return DelayEstimateSnapshot(
+                    active_orders_ahead=active_orders_ahead,
+                    base_minutes=DEFAULT_DELAY_MINUTES,
                     estimated_minutes=estimated_minutes,
                     display_text=f"{estimated_minutes} minutos aproximadamente",
                 )
-            return self._estimate_delay_from_snapshot(latest_order)
+            active_orders_ahead = await self.count_active_orders_ahead_by_order_id(latest_order.id)
+            return self._estimate_delay_from_snapshot(latest_order, active_orders_ahead=active_orders_ahead)
 
         snapshot = await self._build_order_snapshot(order)
-        return self._estimate_delay_from_snapshot(snapshot)
+        active_orders_ahead = await self.count_active_orders_ahead_by_order_id(order.id)
+        return self._estimate_delay_from_snapshot(snapshot, active_orders_ahead=active_orders_ahead)
+
+    async def count_active_orders(self) -> int:
+        """Count currently active non-draft orders in the kitchen pipeline."""
+        result = await self.session.scalar(select(func.count(Order.id)).where(Order.status.in_(ACTIVE_ORDER_STATUSES)))
+        return int(result or 0)
+
+    async def count_active_orders_ahead_by_order_id(self, order_id: int) -> int:
+        """Count active orders created before the given order."""
+        current_order = await self.session.get(Order, order_id)
+        assert current_order is not None
+        result = await self.session.scalar(
+            select(func.count(Order.id)).where(
+                Order.id != current_order.id,
+                Order.status.in_(ACTIVE_ORDER_STATUSES),
+                Order.created_at <= current_order.created_at,
+            )
+        )
+        return int(result or 0)
 
     def _menu_item_snapshot(self, item: MenuItem) -> MenuItemSnapshot:
         """Build a public menu snapshot."""
@@ -501,25 +558,40 @@ class BusinessRepository:
             ],
         )
 
-    def _estimate_delay_from_snapshot(self, order: OrderSnapshot) -> DelayEstimateSnapshot:
-        """Compute a simple deterministic delay estimate for the MVP."""
-        total_quantity = sum(item.quantity for item in order.items)
-        distinct_items = len(order.items)
-
-        estimated_minutes = 18
-        if order.delivery_type == DeliveryType.DELIVERY:
-            estimated_minutes += 12
-        elif order.delivery_type == DeliveryType.PICKUP:
-            estimated_minutes += 4
-        else:
-            estimated_minutes += 8
-
-        estimated_minutes += max(total_quantity - 1, 0) * 3
-        estimated_minutes += max(distinct_items - 1, 0) * 2
-        if order.total_amount_cents >= LARGE_ORDER_THRESHOLD_CENTS:
-            estimated_minutes += 4
+    def _estimate_delay_from_snapshot(
+        self,
+        order: OrderSnapshot,
+        *,
+        active_orders_ahead: int,
+    ) -> DelayEstimateSnapshot:
+        """Compute an MVP delay estimate based on preparation time and kitchen load."""
+        base_minutes = self._estimate_preparation_minutes(order)
+        estimated_minutes = base_minutes + (active_orders_ahead * KITCHEN_LOAD_COEFFICIENT_MINUTES)
 
         return DelayEstimateSnapshot(
+            active_orders_ahead=active_orders_ahead,
+            base_minutes=base_minutes,
             estimated_minutes=estimated_minutes,
             display_text=f"{estimated_minutes} minutos aproximadamente",
         )
+
+    def _estimate_preparation_minutes(self, order: OrderSnapshot) -> int:
+        """Estimate one order's base preparation time without kitchen load."""
+        if not order.items:
+            return DEFAULT_PREPARATION_MINUTES
+
+        line_minutes = [
+            ITEM_PREPARATION_MINUTES_BY_SKU.get(item.name.strip().lower(), DEFAULT_PREPARATION_MINUTES)
+            for item in order.items
+        ]
+        base_minutes = max(line_minutes)
+        total_quantity = sum(item.quantity for item in order.items)
+        distinct_items = len(order.items)
+
+        base_minutes += max(total_quantity - 1, 0) * 2
+        base_minutes += max(distinct_items - 1, 0) * 2
+        if order.delivery_type == DeliveryType.DELIVERY:
+            base_minutes += DELIVERY_EXTRA_MINUTES
+        if order.total_amount_cents >= LARGE_ORDER_THRESHOLD_CENTS:
+            base_minutes += 4
+        return base_minutes

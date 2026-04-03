@@ -60,6 +60,10 @@ curl -X POST http://127.0.0.1:8000/api/dev/messages \
   -d '{"external_user_id":"cliente-demo","message_text":"Hola, quiero pedir"}'
 ```
 
+For a brand-new customer, the assistant first asks for the person's name before
+continuing with the order flow. That name is then reused across later messages
+for the same development identity.
+
 Or launch the built-in PydanticAI web client for development:
 
 ```bash
@@ -72,6 +76,15 @@ In this mode there is no WhatsApp phone number, so Ruperto identifies the user
 with a stable development identity derived from the web chat id:
 `web:<chat-id>`. If you continue in the same web chat, the stored customer,
 order, and conversation history are reused automatically.
+
+Staff can also move an order through operational statuses from the API, for
+example to mark a pickup order as almost ready:
+
+```bash
+curl -X PATCH http://127.0.0.1:8000/api/orders/1/status \
+  -H 'content-type: application/json' \
+  -d '{"status":"almost_ready"}'
+```
 
 ## 4. Run quality checks
 

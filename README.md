@@ -48,6 +48,11 @@ You should then have:
 - development chat endpoint at `http://127.0.0.1:8000/api/dev/messages`
 - development web chat at `http://127.0.0.1:7932/`
 
+The current development flow asks for the customer's name before the first
+order, estimates kitchen delay from preparation time plus active workload, and
+lets staff move orders through operational statuses with
+`PATCH /api/orders/{order_id}/status`.
+
 ## Development
 
 - Install dependencies with `uv sync`.

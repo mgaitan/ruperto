@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import cast
 
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, UserPromptPart
 from pydantic_ai.models import Model
 from pydantic_ai.models.google import GoogleModel
 from pydantic_ai.providers.google import GoogleProvider
@@ -16,6 +17,7 @@ from ruperto.config import Settings
 from ruperto.models import Channel, DeliveryType, PaymentMethod
 from ruperto.repository import BusinessRepository
 from ruperto.schemas import (
+    AssistantNextStep,
     AssistantReply,
     AssistantTurnResult,
     CustomerMemorySnapshot,
@@ -33,11 +35,16 @@ Reglas operativas:
 - No inventes productos, precios, stock, direcciones, tiempos ni pagos.
 - Para cualquier dato del negocio tenés que usar herramientas.
 - Hace una sola pregunta por vez cuando falten datos.
+- Si no conocés el nombre del cliente, pedilo al comienzo antes de avanzar con el pedido.
 - Prioriza cerrar el pedido con la menor fricción posible.
 - Si el cliente ya es conocido y hay una memoria útil, podés mencionarla con naturalidad.
 - Si preguntan por demora o tiempo estimado, usá la herramienta de demora disponible.
 - Si el cliente pide algo fuera del alcance del bot, deriva a una persona.
 """.strip()
+
+NAME_PROMPT_TEXT = "Antes de seguir con el pedido, ¿me decís tu nombre?"
+NAME_CONFIRMATION_TEMPLATE = "Gracias, {name}. ¿Qué querés pedir hoy?"
+MAX_NAME_WORDS = 3
 
 
 @dataclass(slots=True)
@@ -288,6 +295,18 @@ class OrderingAssistantService:
                 customer_id=customer.id,
                 conversation_id=conversation.id,
             )
+
+            direct_reply = await self._maybe_handle_missing_customer_name(
+                repository=repository,
+                customer=customer,
+                conversation_id=conversation.id,
+                history=history,
+                message_text=message_text,
+            )
+            if direct_reply is not None:
+                await session.commit()
+                return direct_reply
+
             await session.commit()
             customer_id = customer.id
             conversation_id = conversation.id
@@ -315,3 +334,136 @@ class OrderingAssistantService:
                 reply=result.output,
                 current_order=current_order,
             )
+
+    async def _maybe_handle_missing_customer_name(
+        self,
+        *,
+        repository: BusinessRepository,
+        customer: CustomerSnapshot,
+        conversation_id: int,
+        history: list[ModelMessage],
+        message_text: str,
+    ) -> AssistantTurnResult | None:
+        """Handle the initial name-capture flow deterministically before invoking the model."""
+        if customer.name is not None:
+            return None
+
+        if self._is_waiting_for_name(history):
+            if name := self._extract_name_candidate(message_text):
+                updated_customer = await repository.update_customer_name(customer.id, name)
+                reply = AssistantReply(
+                    reply_text=NAME_CONFIRMATION_TEMPLATE.format(name=updated_customer.name),
+                    next_step=AssistantNextStep.CHOOSE_ITEMS,
+                    handoff=False,
+                )
+                await self._persist_direct_reply(
+                    repository=repository,
+                    conversation_id=conversation_id,
+                    user_text=message_text,
+                    reply_text=reply.reply_text,
+                )
+                return AssistantTurnResult(
+                    conversation_id=conversation_id,
+                    customer=updated_customer,
+                    reply=reply,
+                    current_order=None,
+                )
+
+            reply = AssistantReply(
+                reply_text="Necesito tu nombre para seguir con el pedido. ¿Cómo te llamás?",
+                next_step=AssistantNextStep.ASK_NAME,
+                handoff=False,
+            )
+            await self._persist_direct_reply(
+                repository=repository,
+                conversation_id=conversation_id,
+                user_text=message_text,
+                reply_text=reply.reply_text,
+            )
+            return AssistantTurnResult(
+                conversation_id=conversation_id,
+                customer=customer,
+                reply=reply,
+                current_order=None,
+            )
+
+        reply = AssistantReply(
+            reply_text=NAME_PROMPT_TEXT,
+            next_step=AssistantNextStep.ASK_NAME,
+            handoff=False,
+        )
+        await self._persist_direct_reply(
+            repository=repository,
+            conversation_id=conversation_id,
+            user_text=message_text,
+            reply_text=reply.reply_text,
+        )
+        return AssistantTurnResult(
+            conversation_id=conversation_id,
+            customer=customer,
+            reply=reply,
+            current_order=None,
+        )
+
+    async def _persist_direct_reply(
+        self,
+        *,
+        repository: BusinessRepository,
+        conversation_id: int,
+        user_text: str,
+        reply_text: str,
+    ) -> None:
+        """Persist a deterministic user/assistant exchange outside the model loop."""
+        await repository.append_conversation_messages(
+            conversation_id,
+            [
+                ModelRequest(parts=[UserPromptPart(content=user_text)]),
+                ModelResponse(parts=[TextPart(content=reply_text)], model_name="ruperto:system"),
+            ],
+        )
+
+    def _is_waiting_for_name(self, history: list[ModelMessage]) -> bool:
+        """Return whether the latest assistant reply explicitly requested the customer's name."""
+        latest_assistant_text = self._extract_latest_assistant_text(history)
+        if latest_assistant_text is None:
+            return False
+        lowered = latest_assistant_text.lower()
+        return "tu nombre" in lowered or "cómo te llamás" in lowered or "como te llamas" in lowered
+
+    def _extract_latest_assistant_text(self, history: list[ModelMessage]) -> str | None:
+        """Extract the latest text response persisted in the conversation history."""
+        for message in reversed(history):
+            if not isinstance(message, ModelResponse):
+                continue
+            for part in reversed(message.parts):
+                if isinstance(part, TextPart):
+                    return part.content
+        return None
+
+    def _extract_name_candidate(self, message_text: str) -> str | None:
+        """Infer a plausible first-name style answer from a short user message."""
+        cleaned = " ".join(message_text.split()).strip(" .,!?:;")
+        if not cleaned:
+            return None
+        words = cleaned.split()
+        if len(words) > MAX_NAME_WORDS:
+            return None
+        if any(char.isdigit() for char in cleaned):
+            return None
+        lowered = cleaned.lower()
+        blocked_terms = {
+            "hola",
+            "quiero",
+            "pedido",
+            "pizza",
+            "hamburguesa",
+            "empanadas",
+            "milanesa",
+            "retiro",
+            "delivery",
+            "transferencia",
+            "efectivo",
+        }
+        if any(term in lowered for term in blocked_terms):
+            return None
+        return cleaned.title()

@@ -31,6 +31,11 @@ class OrderStatus(StrEnum):
 
     DRAFT = "draft"
     CONFIRMED = "confirmed"
+    IN_PREPARATION = "in_preparation"
+    ALMOST_READY = "almost_ready"
+    READY_FOR_PICKUP = "ready_for_pickup"
+    OUT_FOR_DELIVERY = "out_for_delivery"
+    DELIVERED = "delivered"
     CANCELLED = "cancelled"
 
 

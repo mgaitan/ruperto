@@ -7,20 +7,21 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Annotated, Any
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 
 from ruperto import get_version
 from ruperto.assistant import OrderingAssistantService
 from ruperto.config import Settings
 from ruperto.db import DatabaseRuntime, create_database_runtime, init_database, ping_database
 from ruperto.models import Channel, OrderStatus
-from ruperto.repository import BusinessRepository
+from ruperto.repository import BusinessRepository, OrderNotFoundError
 from ruperto.schemas import (
     AssistantTurnResult,
     CustomerSnapshot,
     DevMessageRequest,
     MenuItemSnapshot,
     OrderSnapshot,
+    OrderStatusUpdateRequest,
     StoreProfileSnapshot,
 )
 
@@ -122,6 +123,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async with runtime.database.session_factory() as session:
             repository = BusinessRepository(session)
             return await repository.list_orders(limit=limit, status=status)
+
+    @app.patch("/api/orders/{order_id}/status", response_model=OrderSnapshot)
+    async def patch_order_status(
+        request: Request,
+        order_id: int,
+        payload: OrderStatusUpdateRequest,
+    ) -> OrderSnapshot:
+        runtime = get_runtime(request)
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            try:
+                updated_order = await repository.update_order_status(order_id, payload.status)
+            except OrderNotFoundError as error:
+                raise HTTPException(status_code=404, detail="Order not found.") from error
+            await session.commit()
+            return updated_order
 
     @app.post("/api/dev/messages", response_model=AssistantTurnResult)
     async def post_dev_message(request: Request, payload: DevMessageRequest) -> AssistantTurnResult:

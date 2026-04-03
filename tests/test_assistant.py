@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 from pydantic import SecretStr
-from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from ruperto.assistant import OrderingAssistantService, build_google_model
@@ -36,6 +36,26 @@ def extract_tool_returns(messages: list[ModelMessage]) -> dict[str, Any]:
     """Collect tool-return payloads from the latest model request."""
     latest_request = next(message for message in reversed(messages) if isinstance(message, ModelRequest))
     return {part.tool_name: part.content for part in latest_request.parts if isinstance(part, ToolReturnPart)}
+
+
+async def seed_named_customer(
+    service: OrderingAssistantService,
+    *,
+    channel: Channel,
+    external_user_id: str,
+    name: str,
+):
+    """Create a known customer so tests can focus on later ordering behavior."""
+    async with service.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(channel=channel, external_id=external_user_id)
+        await repository.update_customer_name(customer.id, name)
+        await repository.get_or_create_conversation(
+            channel=channel,
+            external_id=external_user_id,
+            customer_id=customer.id,
+        )
+        await session.commit()
 
 
 def collect_tool_returns(messages: list[ModelMessage]) -> dict[str, Any]:
@@ -171,6 +191,12 @@ async def test_assistant_handles_order_flow_in_spanish(tmp_path: Path):
     runtime = create_database_runtime(settings)
     await init_database(settings=settings, runtime=runtime)
     service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        service,
+        channel=Channel.WHATSAPP,
+        external_user_id="+54 351 555 7788",
+        name="Martina",
+    )
 
     result = await service.handle_customer_message(
         channel=Channel.WHATSAPP,
@@ -199,6 +225,12 @@ async def test_assistant_reuses_history_and_customer_memory(tmp_path: Path):
     runtime = create_database_runtime(settings)
     await init_database(settings=settings, runtime=runtime)
     service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        service,
+        channel=Channel.DEV,
+        external_user_id="cliente-dev",
+        name="Martina",
+    )
 
     await service.handle_customer_message(
         channel=Channel.DEV,
@@ -238,6 +270,12 @@ async def test_assistant_can_answer_delay_after_confirming_an_order(tmp_path: Pa
     runtime = create_database_runtime(settings)
     await init_database(settings=settings, runtime=runtime)
     service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        service,
+        channel=Channel.DEV,
+        external_user_id="cliente-demora",
+        name="Martina",
+    )
 
     await service.handle_customer_message(
         channel=Channel.DEV,
@@ -253,7 +291,89 @@ async def test_assistant_can_answer_delay_after_confirming_an_order(tmp_path: Pa
         model=FunctionModel(delay_model),
     )
 
-    assert follow_up.reply.reply_text == "La demora estimada es de 30 minutos aproximadamente."
+    assert follow_up.reply.reply_text == "La demora estimada es de 20 minutos aproximadamente."
     assert follow_up.reply.next_step == AssistantNextStep.COMPLETE
+
+    await runtime.engine.dispose()
+
+
+async def test_assistant_asks_for_name_before_taking_the_first_order(tmp_path: Path):
+    """Unknown customers are asked for their name before the ordering flow continues."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+
+    first_reply = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-sin-nombre",
+        message_text="Hola, quiero una pizza",
+        model=FunctionModel(transactional_model),
+    )
+    second_reply = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-sin-nombre",
+        message_text="Martina",
+        model=FunctionModel(transactional_model),
+    )
+
+    assert first_reply.reply.next_step == AssistantNextStep.ASK_NAME
+    assert "tu nombre" in first_reply.reply.reply_text.lower()
+    assert second_reply.customer.name == "Martina"
+    assert second_reply.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
+    assert "¿Qué querés pedir hoy?" in second_reply.reply.reply_text
+
+    await runtime.engine.dispose()
+
+
+async def test_assistant_reasks_for_name_when_the_reply_is_not_a_name(tmp_path: Path):
+    """The deterministic onboarding keeps asking for the name until it gets a plausible answer."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+
+    await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-repregunta",
+        message_text="Hola",
+        model=FunctionModel(transactional_model),
+    )
+    second_reply = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-repregunta",
+        message_text="quiero una pizza",
+        model=FunctionModel(transactional_model),
+    )
+
+    assert second_reply.reply.next_step == AssistantNextStep.ASK_NAME
+    assert "cómo te llamás" in second_reply.reply.reply_text.lower()
+
+    await runtime.engine.dispose()
+
+
+async def test_name_candidate_heuristics_cover_edge_cases(tmp_path: Path):
+    """Name extraction accepts short names and rejects noisy ordering content."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+
+    assert service._extract_name_candidate("martina") == "Martina"
+    assert service._extract_name_candidate("   ") is None
+    assert service._extract_name_candidate("Juan 123") is None
+    assert service._extract_name_candidate("hola quiero pizza") is None
+    assert service._extract_name_candidate("Juan Carlos Perez Gomez") is None
+    assert (
+        service._extract_latest_assistant_text(
+            [
+                ModelRequest(parts=[ToolReturnPart(tool_name="x", content={})]),
+                ModelResponse(parts=[TextPart(content="Último texto")], model_name="test"),
+            ]
+        )
+        == "Último texto"
+    )
+    assert (
+        service._extract_latest_assistant_text([ModelRequest(parts=[ToolReturnPart(tool_name="x", content={})])])
+        is None
+    )
 
     await runtime.engine.dispose()
