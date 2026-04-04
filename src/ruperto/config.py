@@ -36,6 +36,14 @@ class Settings(BaseSettings):
     store_timezone: str = "America/Argentina/Cordoba"
     store_transfer_alias: str | None = "demo.rotiseria"
     default_store_id: int = 1
+    dashboard_session_secret: str = "change-me-in-production"
+    dashboard_admin_email: str | None = None
+    dashboard_admin_password: SecretStr | None = None
+    dashboard_admin_name: str = "Store Admin"
+    smtp_server: str | None = None
+    smtp_port: int | None = None
+    smtp_user: str | None = None
+    smtp_password: SecretStr | None = None
 
     gemini_model: str = "gemini-2.5-flash-lite"
     gemini_api_key: SecretStr | None = None
@@ -59,6 +67,22 @@ class Settings(BaseSettings):
             "store_timezone": self.store_timezone,
             "store_transfer_alias": self.store_transfer_alias,
             "default_store_id": self.default_store_id,
+            "dashboard_session_secret_configured": self.dashboard_session_secret != "change-me-in-production",
+            "dashboard_admin_email": self.dashboard_admin_email,
+            "dashboard_admin_password_configured": self.dashboard_admin_password is not None,
+            "dashboard_admin_name": self.dashboard_admin_name,
+            "smtp_server": self.smtp_server,
+            "smtp_port": self.smtp_port,
+            "smtp_user": self.smtp_user,
+            "smtp_password_configured": self.smtp_password is not None,
+            "smtp_configured": all(
+                (
+                    self.smtp_server is not None,
+                    self.smtp_port is not None,
+                    self.smtp_user is not None,
+                    self.smtp_password is not None,
+                )
+            ),
             "gemini_model": self.gemini_model,
             "gemini_api_key_configured": self.gemini_api_key is not None,
             "assistant_model_timeout_seconds": self.assistant_model_timeout_seconds,

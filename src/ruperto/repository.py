@@ -14,6 +14,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
+from ruperto.auth import hash_password, normalize_email, verify_password
 from ruperto.models import (
     Channel,
     Conversation,
@@ -27,7 +28,10 @@ from ruperto.models import (
     OrderItem,
     OrderStatus,
     PaymentMethod,
+    StaffRole,
+    StaffUser,
     StoreBusinessHours,
+    StoreMembership,
     StoreProfile,
     utc_now,
 )
@@ -38,10 +42,13 @@ from ruperto.schemas import (
     MenuItemSnapshot,
     OrderItemSnapshot,
     OrderSnapshot,
+    StaffUserSnapshot,
     StoreAvailabilitySnapshot,
     StoreBusinessHoursSnapshot,
+    StoreMembershipSnapshot,
     StoreProfileSnapshot,
     StoreProfileUpdateRequest,
+    StoreStaffMembershipSnapshot,
     format_price_ars,
 )
 
@@ -75,6 +82,10 @@ ACTIVE_ORDER_STATUSES = {
     OrderStatus.READY_FOR_PICKUP,
     OrderStatus.OUT_FOR_DELIVERY,
 }
+STORE_MEMBERSHIP_NOT_FOUND_MESSAGE = "Store membership not found."
+STORE_HOURS_SLOT_REQUIRES_BOTH_TIMES_MESSAGE = "Each business-hours slot requires both open and close times."
+STORE_HOURS_SLOT_ORDER_MESSAGE = "Business-hours slots must close after they open."
+STORE_HOURS_SLOT_OVERLAP_MESSAGE = "Business-hours slots cannot overlap on the same day."
 WEEKDAY_LABELS_ES = {
     0: "lunes",
     1: "martes",
@@ -189,6 +200,31 @@ class BusinessRepository:
         assert row is not None
         return StoreProfileSnapshot.model_validate(row)
 
+    async def create_store_profile(  # noqa: PLR0913
+        self,
+        *,
+        store_name: str,
+        bot_name: str,
+        store_description: str,
+        assistant_personality: str,
+        store_location: str | None = None,
+        locale: str = "es-AR",
+        transfer_alias: str | None = None,
+    ) -> StoreProfileSnapshot:
+        """Create a new store profile for staff membership tests and future tenancy."""
+        row = StoreProfile(
+            store_name=store_name.strip(),
+            bot_name=bot_name.strip(),
+            store_location=self._normalize_optional_text(store_location),
+            store_description=store_description.strip(),
+            assistant_personality=assistant_personality.strip(),
+            locale=locale,
+            transfer_alias=self._normalize_optional_text(transfer_alias),
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return StoreProfileSnapshot.model_validate(row)
+
     async def update_store_profile(
         self,
         payload: StoreProfileUpdateRequest,
@@ -208,13 +244,149 @@ class BusinessRepository:
         await self.session.flush()
         return StoreProfileSnapshot.model_validate(row)
 
+    async def get_staff_user_by_id(self, staff_user_id: int) -> StaffUserSnapshot | None:
+        """Return one dashboard user by primary key."""
+        row = await self.session.get(StaffUser, staff_user_id)
+        if row is None:
+            return None
+        return StaffUserSnapshot.model_validate(row)
+
+    async def get_staff_user_by_email(self, email: str) -> StaffUserSnapshot | None:
+        """Return one dashboard user by normalized email."""
+        row = await self.session.scalar(select(StaffUser).where(StaffUser.email == normalize_email(email)))
+        if row is None:
+            return None
+        return StaffUserSnapshot.model_validate(row)
+
+    async def ensure_staff_user(
+        self,
+        *,
+        email: str,
+        full_name: str,
+        password: str,
+        store_id: int,
+        role: StaffRole = StaffRole.OWNER,
+    ) -> StaffUserSnapshot:
+        """Create or refresh one dashboard user and membership."""
+        normalized_email = normalize_email(email)
+        row = await self.session.scalar(select(StaffUser).where(StaffUser.email == normalized_email))
+        if row is None:
+            row = StaffUser(
+                email=normalized_email,
+                full_name=full_name.strip(),
+                password_hash=hash_password(password),
+                is_active=True,
+            )
+            self.session.add(row)
+            await self.session.flush()
+        else:
+            row.full_name = full_name.strip()
+            row.password_hash = hash_password(password)
+            row.is_active = True
+            row.updated_at = utc_now()
+            await self.session.flush()
+
+        membership = await self.session.scalar(
+            select(StoreMembership).where(
+                StoreMembership.staff_user_id == row.id,
+                StoreMembership.store_id == store_id,
+            )
+        )
+        if membership is None:
+            self.session.add(StoreMembership(staff_user_id=row.id, store_id=store_id, role=role))
+        else:
+            membership.role = role
+        await self.session.flush()
+        return StaffUserSnapshot.model_validate(row)
+
+    async def authenticate_staff_user(self, *, email: str, password: str) -> StaffUserSnapshot | None:
+        """Return the dashboard user when the credentials are valid."""
+        row = await self.session.scalar(select(StaffUser).where(StaffUser.email == normalize_email(email)))
+        if row is None or not row.is_active:
+            return None
+        if not verify_password(password, row.password_hash):
+            return None
+        return StaffUserSnapshot.model_validate(row)
+
+    async def list_store_memberships_for_staff_user(self, staff_user_id: int) -> list[StoreMembershipSnapshot]:
+        """List the stores one dashboard user can operate."""
+        rows = (
+            await self.session.execute(
+                select(StoreMembership, StoreProfile.store_name)
+                .join(StoreProfile, StoreProfile.id == StoreMembership.store_id)
+                .where(StoreMembership.staff_user_id == staff_user_id)
+                .order_by(StoreProfile.id.asc())
+            )
+        ).all()
+        return [
+            StoreMembershipSnapshot(
+                store_id=membership.store_id,
+                store_name=store_name,
+                role=membership.role,
+            )
+            for membership, store_name in rows
+        ]
+
+    async def user_can_access_store(self, *, staff_user_id: int, store_id: int) -> bool:
+        """Return whether the given dashboard user has membership in the store."""
+        membership = await self.session.scalar(
+            select(StoreMembership).where(
+                StoreMembership.staff_user_id == staff_user_id,
+                StoreMembership.store_id == store_id,
+            )
+        )
+        return membership is not None
+
+    async def list_staff_memberships_for_store(self, *, store_id: int) -> list[StoreStaffMembershipSnapshot]:
+        """List staff memberships operating the given store."""
+        rows = (
+            await self.session.execute(
+                select(StoreMembership, StaffUser, StoreProfile.store_name)
+                .join(StaffUser, StaffUser.id == StoreMembership.staff_user_id)
+                .join(StoreProfile, StoreProfile.id == StoreMembership.store_id)
+                .where(StoreMembership.store_id == store_id)
+                .order_by(StaffUser.full_name.asc(), StaffUser.email.asc())
+            )
+        ).all()
+        return [
+            StoreStaffMembershipSnapshot(
+                membership_id=membership.id,
+                staff_user_id=membership.staff_user_id,
+                store_id=membership.store_id,
+                store_name=store_name,
+                role=membership.role,
+                email=staff_user.email,
+                full_name=staff_user.full_name,
+                is_active=staff_user.is_active,
+            )
+            for membership, staff_user, store_name in rows
+        ]
+
+    async def update_store_membership_role(
+        self,
+        *,
+        membership_id: int,
+        store_id: int,
+        role: StaffRole,
+    ) -> StoreStaffMembershipSnapshot:
+        """Update one membership role inside the given store."""
+        row = await self.session.scalar(
+            select(StoreMembership).where(StoreMembership.id == membership_id, StoreMembership.store_id == store_id)
+        )
+        if row is None:
+            raise ValueError(STORE_MEMBERSHIP_NOT_FOUND_MESSAGE)
+        row.role = role
+        await self.session.flush()
+        memberships = await self.list_staff_memberships_for_store(store_id=store_id)
+        return next(membership for membership in memberships if membership.membership_id == membership_id)
+
     async def list_store_business_hours(self, *, store_id: int = 1) -> list[StoreBusinessHoursSnapshot]:
         """Return the weekly opening-hours schedule for the store."""
         rows = (
             await self.session.scalars(
                 select(StoreBusinessHours)
                 .where(StoreBusinessHours.store_id == store_id)
-                .order_by(StoreBusinessHours.weekday.asc())
+                .order_by(StoreBusinessHours.weekday.asc(), StoreBusinessHours.slot_index.asc())
             )
         ).all()
         return [self._store_business_hours_snapshot(row) for row in rows]
@@ -226,6 +398,7 @@ class BusinessRepository:
         store_id: int = 1,
     ) -> list[StoreBusinessHoursSnapshot]:
         """Replace the weekly opening-hours schedule for the store."""
+        normalized_hours = self._normalize_store_business_hours(hours, store_id=store_id)
         existing_rows = (
             await self.session.scalars(select(StoreBusinessHours).where(StoreBusinessHours.store_id == store_id))
         ).all()
@@ -238,11 +411,12 @@ class BusinessRepository:
                 StoreBusinessHours(
                     store_id=store_id,
                     weekday=row.weekday,
+                    slot_index=row.slot_index,
                     opens_at=self._parse_hour_text(row.opens_at),
                     closes_at=self._parse_hour_text(row.closes_at),
                     closed=row.closed,
                 )
-                for row in hours
+                for row in normalized_hours
             ]
         )
         await self.session.flush()
@@ -259,11 +433,15 @@ class BusinessRepository:
         zone = ZoneInfo(timezone_name)
         local_now = now.astimezone(zone) if now is not None else datetime.now(zone)
         schedule = await self.list_store_business_hours(store_id=store_id)
-        today = next((row for row in schedule if row.weekday == local_now.weekday()), None)
         current_time = local_now.time().replace(second=0, microsecond=0)
+        current_slot = self._find_matching_schedule_row(schedule, local_now)
 
-        if self._is_open_at(today, current_time):
-            close_text = f" hasta las {today.closes_at}" if today is not None and today.closes_at is not None else ""
+        if self._is_open_at(current_slot, current_time):
+            close_text = (
+                f" hasta las {current_slot.closes_at}"
+                if current_slot is not None and current_slot.closes_at is not None
+                else ""
+            )
             return StoreAvailabilitySnapshot(
                 is_open=True,
                 message_text=f"Estamos abiertos ahora 🍽️{close_text}.",
@@ -748,6 +926,7 @@ class BusinessRepository:
             id=row.id,
             store_id=row.store_id,
             weekday=row.weekday,
+            slot_index=row.slot_index,
             opens_at=row.opens_at.strftime("%H:%M") if row.opens_at is not None else None,
             closes_at=row.closes_at.strftime("%H:%M") if row.closes_at is not None else None,
             closed=row.closed,
@@ -852,10 +1031,8 @@ class BusinessRepository:
             raise RequestedReadyTimeError.past_time()
 
         schedule = await self.list_store_business_hours(store_id=store_id)
-        schedule_row = self._schedule_row_for_datetime(schedule, local_ready)
-        if schedule_row is None or not self._is_open_at(
-            schedule_row, local_ready.time().replace(second=0, microsecond=0)
-        ):
+        schedule_row = self._find_matching_schedule_row(schedule, local_ready)
+        if schedule_row is None:
             next_open_text = self._find_next_opening_text(schedule, local_now)
             raise RequestedReadyTimeError.outside_business_hours(next_open_text)
 
@@ -955,13 +1132,33 @@ class BusinessRepository:
         assert closes_at is not None
         return opens_at <= current_time < closes_at
 
-    def _schedule_row_for_datetime(
+    def _schedule_rows_for_weekday(
+        self,
+        schedule: list[StoreBusinessHoursSnapshot],
+        weekday: int,
+    ) -> list[StoreBusinessHoursSnapshot]:
+        """Return the schedule rows configured for one weekday."""
+        return [
+            row
+            for row in schedule
+            if row.weekday == weekday and not row.closed and row.opens_at is not None and row.closes_at is not None
+        ]
+
+    def _find_matching_schedule_row(
         self,
         schedule: list[StoreBusinessHoursSnapshot],
         local_dt: datetime,
     ) -> StoreBusinessHoursSnapshot | None:
-        """Return the weekly row that applies to a given local datetime."""
-        return next((row for row in schedule if row.weekday == local_dt.weekday()), None)
+        """Return the schedule row that covers the given local datetime."""
+        current_time = local_dt.time().replace(second=0, microsecond=0)
+        return next(
+            (
+                row
+                for row in self._schedule_rows_for_weekday(schedule, local_dt.weekday())
+                if self._is_open_at(row, current_time)
+            ),
+            None,
+        )
 
     def _opening_datetime_for_row(self, row: StoreBusinessHoursSnapshot, local_dt: datetime) -> datetime:
         """Return the opening datetime for the schedule row on the given local date."""
@@ -983,22 +1180,101 @@ class BusinessRepository:
         """Find the next opening slot as a short Spanish phrase."""
         for offset in range(8):
             candidate_day = local_now + timedelta(days=offset)
-            row = next((item for item in schedule if item.weekday == candidate_day.weekday()), None)
-            if row is None or row.closed or row.opens_at is None:
-                continue
-
-            if offset == 0:
-                opens_at = self._parse_hour_text(row.opens_at)
-                assert opens_at is not None
-                if opens_at <= local_now.time():
-                    continue
-                return f"hoy a las {row.opens_at}"
-            if offset == 1:
-                return f"mañana a las {row.opens_at}"
-            weekday_name = WEEKDAY_LABELS_ES[candidate_day.weekday()]
-            return f"el {weekday_name} a las {row.opens_at}"
+            day_rows = self._schedule_rows_for_weekday(schedule, candidate_day.weekday())
+            for row in day_rows:
+                if offset == 0:
+                    opens_at = self._parse_hour_text(row.opens_at)
+                    assert opens_at is not None
+                    if opens_at <= local_now.time():
+                        continue
+                    return f"hoy a las {row.opens_at}"
+                if offset == 1:
+                    return f"mañana a las {row.opens_at}"
+                weekday_name = WEEKDAY_LABELS_ES[candidate_day.weekday()]
+                return f"el {weekday_name} a las {row.opens_at}"
 
         return "pronto"
+
+    def _normalize_store_business_hours(
+        self,
+        hours: list[StoreBusinessHoursSnapshot],
+        *,
+        store_id: int,
+    ) -> list[StoreBusinessHoursSnapshot]:
+        """Normalize and validate staff-defined business hours before persisting them."""
+        rows_by_day: dict[int, list[StoreBusinessHoursSnapshot]] = {weekday: [] for weekday in range(7)}
+        for row in sorted(hours, key=lambda item: (item.weekday, item.slot_index)):
+            if row.closed:
+                continue
+            if row.opens_at is None and row.closes_at is None:
+                continue
+            if row.opens_at is None or row.closes_at is None:
+                raise ValueError(STORE_HOURS_SLOT_REQUIRES_BOTH_TIMES_MESSAGE)
+
+            opens_at = self._parse_hour_text(row.opens_at)
+            closes_at = self._parse_hour_text(row.closes_at)
+            assert opens_at is not None
+            assert closes_at is not None
+            if opens_at >= closes_at:
+                raise ValueError(STORE_HOURS_SLOT_ORDER_MESSAGE)
+
+            rows_by_day[row.weekday].append(
+                StoreBusinessHoursSnapshot(
+                    id=0,
+                    store_id=store_id,
+                    weekday=row.weekday,
+                    slot_index=row.slot_index,
+                    opens_at=row.opens_at,
+                    closes_at=row.closes_at,
+                    closed=False,
+                )
+            )
+
+        normalized_hours: list[StoreBusinessHoursSnapshot] = []
+        for weekday in range(7):
+            day_rows = sorted(
+                rows_by_day[weekday],
+                key=lambda item: (
+                    self._parse_hour_text(item.opens_at) or time.min,
+                    self._parse_hour_text(item.closes_at) or time.min,
+                ),
+            )
+            if not day_rows:
+                normalized_hours.append(
+                    StoreBusinessHoursSnapshot(
+                        id=0,
+                        store_id=store_id,
+                        weekday=weekday,
+                        slot_index=0,
+                        opens_at=None,
+                        closes_at=None,
+                        closed=True,
+                    )
+                )
+                continue
+
+            previous_close: time | None = None
+            for slot_index, row in enumerate(day_rows):
+                opens_at = self._parse_hour_text(row.opens_at)
+                closes_at = self._parse_hour_text(row.closes_at)
+                assert opens_at is not None
+                assert closes_at is not None
+                if previous_close is not None and opens_at < previous_close:
+                    raise ValueError(STORE_HOURS_SLOT_OVERLAP_MESSAGE)
+                previous_close = closes_at
+                normalized_hours.append(
+                    StoreBusinessHoursSnapshot(
+                        id=0,
+                        store_id=store_id,
+                        weekday=weekday,
+                        slot_index=slot_index,
+                        opens_at=row.opens_at,
+                        closes_at=row.closes_at,
+                        closed=False,
+                    )
+                )
+
+        return normalized_hours
 
     def _parse_hour_text(self, value: str | None) -> time | None:
         """Parse a `HH:MM` string into a time object."""

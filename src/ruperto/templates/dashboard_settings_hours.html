@@ -1,0 +1,178 @@
+{% extends "dashboard_base.html" %} {% block content %}
+<section
+    class="rounded-[2rem] border border-white/70 bg-white/85 p-6 shadow-card backdrop-blur"
+>
+    <div
+        class="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900"
+    >
+        Cada día puede tener cero, una o varias franjas. Si no dejás ninguna
+        franja, el local figura como cerrado ese día.
+    </div>
+    <form
+        action="/dashboard/settings/hours"
+        method="post"
+        class="mt-6 space-y-4"
+        data-hours-form
+    >
+        {% for day in hours %}
+        <article
+            class="rounded-3xl border border-slate-200 bg-white p-4"
+            data-weekday="{{ day.weekday }}"
+        >
+            <div
+                class="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between"
+            >
+                <div>
+                    <h3 class="text-lg font-semibold">{{ day.label }}</h3>
+                    <p class="mt-1 text-sm text-slate-500">
+                        {% if day.closed %} Sin franjas configuradas. {% else %}
+                        {{ day.slots|length }} franja{% if day.slots|length != 1
+                        %}s{% endif %} configurada{% if day.slots|length != 1
+                        %}s{% endif %}. {% endif %}
+                    </p>
+                </div>
+                <button
+                    class="rounded-full bg-oat px-4 py-2 text-sm font-semibold text-slate-700 transition hover:bg-orange-100"
+                    type="button"
+                    data-add-slot
+                >
+                    Agregar franja
+                </button>
+            </div>
+
+            <div class="mt-4 space-y-3" data-slots>
+                {% for slot in day.slots %}
+                <div
+                    class="grid gap-3 rounded-2xl border border-slate-200 bg-slate-50 p-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
+                    data-slot-index="{{ slot.slot_index }}"
+                >
+                    <label class="space-y-2 text-sm font-medium text-slate-700">
+                        <span>Abre a las</span>
+                        <input
+                            class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                            type="time"
+                            name="opens_at_{{ day.weekday }}_{{ slot.slot_index }}"
+                            value="{{ slot.opens_at }}"
+                        />
+                    </label>
+                    <label class="space-y-2 text-sm font-medium text-slate-700">
+                        <span>Cierra a las</span>
+                        <input
+                            class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                            type="time"
+                            name="closes_at_{{ day.weekday }}_{{ slot.slot_index }}"
+                            value="{{ slot.closes_at }}"
+                        />
+                    </label>
+                    <div class="flex items-end">
+                        <button
+                            class="rounded-full bg-white px-4 py-3 text-sm font-semibold text-rose-700 transition hover:bg-rose-50"
+                            type="button"
+                            data-remove-slot
+                        >
+                            Quitar
+                        </button>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+        </article>
+        {% endfor %}
+        <div class="flex justify-end">
+            <button
+                class="rounded-full bg-ink px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-800"
+                type="submit"
+            >
+                Guardar agenda semanal
+            </button>
+        </div>
+    </form>
+</section>
+
+<template id="hours-slot-template">
+    <div
+        class="grid gap-3 rounded-2xl border border-slate-200 bg-slate-50 p-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
+        data-slot-index=""
+    >
+        <label class="space-y-2 text-sm font-medium text-slate-700">
+            <span>Abre a las</span>
+            <input
+                class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                type="time"
+                data-field="opens"
+            />
+        </label>
+        <label class="space-y-2 text-sm font-medium text-slate-700">
+            <span>Cierra a las</span>
+            <input
+                class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                type="time"
+                data-field="closes"
+            />
+        </label>
+        <div class="flex items-end">
+            <button
+                class="rounded-full bg-white px-4 py-3 text-sm font-semibold text-rose-700 transition hover:bg-rose-50"
+                type="button"
+                data-remove-slot
+            >
+                Quitar
+            </button>
+        </div>
+    </div>
+</template>
+
+<script>
+    (() => {
+        const form = document.querySelector("[data-hours-form]");
+        const template = document.querySelector("#hours-slot-template");
+        if (!form || !template) return;
+
+        const buildNames = (weekday, slotIndex, container) => {
+            container.setAttribute("data-slot-index", slotIndex);
+            container.querySelector('[data-field="opens"]').name =
+                `opens_at_${weekday}_${slotIndex}`;
+            container.querySelector('[data-field="closes"]').name =
+                `closes_at_${weekday}_${slotIndex}`;
+        };
+
+        const attachRemoveHandler = (button) => {
+            button.addEventListener("click", () => {
+                button.closest("div.rounded-2xl")?.remove();
+            });
+        };
+
+        form.querySelectorAll("[data-remove-slot]").forEach((button) =>
+            attachRemoveHandler(button),
+        );
+
+        form.querySelectorAll("[data-add-slot]").forEach((button) => {
+            button.addEventListener("click", () => {
+                const article = button.closest("[data-weekday]");
+                if (!article) return;
+                const weekday = article.getAttribute("data-weekday");
+                const slotsContainer = article.querySelector("[data-slots]");
+                if (!weekday || !slotsContainer) return;
+
+                const slotIndex =
+                    Math.max(
+                        -1,
+                        ...Array.from(slotsContainer.children).map((element) =>
+                            Number(
+                                element.getAttribute("data-slot-index") || "-1",
+                            ),
+                        ),
+                    ) + 1;
+                const fragment = template.content.cloneNode(true);
+                const container = fragment.firstElementChild;
+                if (!container) return;
+                buildNames(weekday, slotIndex, container);
+                attachRemoveHandler(
+                    container.querySelector("[data-remove-slot]"),
+                );
+                slotsContainer.appendChild(container);
+            });
+        });
+    })();
+</script>
+{% endblock %}

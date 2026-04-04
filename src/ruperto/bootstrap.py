@@ -25,6 +25,7 @@ class BusinessHoursSeed:
     weekday: int
     opens_at: time | None
     closes_at: time | None
+    slot_index: int = 0
     closed: bool = False
 
 

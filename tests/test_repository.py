@@ -9,13 +9,19 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
+from pydantic import SecretStr
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 from sqlalchemy import create_engine, select, text
 
 from ruperto.config import Settings
-from ruperto.db import DatabaseRuntime, create_database_runtime, init_database
-from ruperto.models import Channel, DeliveryType, MenuItem, OrderStatus, PaymentMethod
-from ruperto.repository import BusinessRepository, normalize_phone_number
+from ruperto.db import DatabaseRuntime, _ensure_schema_columns, create_database_runtime, init_database
+from ruperto.models import Channel, DeliveryType, MenuItem, OrderStatus, PaymentMethod, StaffRole, StaffUser
+from ruperto.repository import (
+    STORE_HOURS_SLOT_ORDER_MESSAGE,
+    STORE_HOURS_SLOT_REQUIRES_BOTH_TIMES_MESSAGE,
+    BusinessRepository,
+    normalize_phone_number,
+)
 from ruperto.schemas import StoreBusinessHoursSnapshot, StoreProfileUpdateRequest
 
 pytestmark = pytest.mark.anyio
@@ -30,7 +36,6 @@ LARGE_ORDER_DELAY_MINUTES = 31
 KITCHEN_LOAD_DELAY_MINUTES = 18
 EMPTY_DRAFT_DELAY_MINUTES = 15
 DEFAULT_WEEKLY_HOURS = 7
-UPDATED_WEEKLY_HOURS = 2
 MIN_MENU_ITEMS = 35
 TENANT_STORE_ID = 7
 STORE_TIMEZONE = "America/Argentina/Cordoba"
@@ -103,6 +108,98 @@ async def test_store_profile_can_be_updated_with_empty_optional_fields(tmp_path:
     assert updated.store_name == "Panel Rotisería"
     assert updated.store_location is None
     assert updated.transfer_alias is None
+
+    await close_repository(repository, runtime)
+
+
+async def test_dashboard_admin_bootstrap_and_staff_authentication(tmp_path: Path):
+    """Database bootstrap can create the initial dashboard admin and memberships."""
+    settings = Settings(
+        environment="test",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'staff.db'}",
+        store_name="Rotisería Test",
+        bot_name="Ruperto Test",
+        dashboard_admin_email="owner@example.com",
+        dashboard_admin_password=SecretStr("super-secret"),
+        dashboard_admin_name="Owner User",
+    )
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        staff_user = await repository.get_staff_user_by_email("OWNER@example.com")
+        authenticated = await repository.authenticate_staff_user(email="owner@example.com", password="super-secret")
+        memberships = await repository.list_store_memberships_for_staff_user(authenticated.id if authenticated else 0)
+
+        assert staff_user is not None
+        assert authenticated is not None
+        assert memberships[0].store_id == 1
+        assert memberships[0].role == StaffRole.OWNER
+        assert await repository.user_can_access_store(staff_user_id=authenticated.id, store_id=1) is True
+        assert await repository.user_can_access_store(staff_user_id=authenticated.id, store_id=999) is False
+
+    await runtime.engine.dispose()
+
+
+async def test_staff_repository_helpers_handle_missing_and_inactive_users(tmp_path: Path):
+    """Staff lookups fail closed for missing records and inactive accounts."""
+    repository, runtime = await build_repository(tmp_path)
+    created = await repository.ensure_staff_user(
+        email="staff@example.com",
+        full_name="Staff User",
+        password="super-secret",
+        store_id=1,
+    )
+
+    assert await repository.get_staff_user_by_id(9999) is None
+    assert await repository.get_staff_user_by_email("missing@example.com") is None
+
+    staff_row = await repository.session.get(StaffUser, created.id)
+    assert staff_row is not None
+    staff_row.is_active = False
+    await repository.session.flush()
+
+    assert await repository.authenticate_staff_user(email="staff@example.com", password="super-secret") is None
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_staff_memberships_can_be_listed_and_reassigned(tmp_path: Path):
+    """Store membership helpers expose staff rows and allow role updates."""
+    repository, runtime = await build_repository(tmp_path)
+    await repository.ensure_staff_user(
+        email="team@example.com",
+        full_name="Equipo Local",
+        password="super-secret",
+        store_id=1,
+        role=StaffRole.STAFF,
+    )
+
+    memberships = await repository.list_staff_memberships_for_store(store_id=1)
+    team_membership = next(membership for membership in memberships if membership.email == "team@example.com")
+    updated_membership = await repository.update_store_membership_role(
+        membership_id=team_membership.membership_id,
+        store_id=1,
+        role=StaffRole.MANAGER,
+    )
+
+    assert team_membership.role == StaffRole.STAFF
+    assert updated_membership.role == StaffRole.MANAGER
+
+    await close_repository(repository, runtime)
+
+
+async def test_update_store_membership_role_raises_for_missing_membership(tmp_path: Path):
+    """Updating an unknown store membership fails with a clear error."""
+    repository, runtime = await build_repository(tmp_path)
+
+    with pytest.raises(ValueError, match=r"Store membership not found\."):
+        await repository.update_store_membership_role(
+            membership_id=999,
+            store_id=1,
+            role=StaffRole.MANAGER,
+        )
 
     await close_repository(repository, runtime)
 
@@ -511,6 +608,88 @@ async def test_init_database_backfills_schedule_and_transfer_columns_for_legacy_
     await runtime.engine.dispose()
 
 
+async def test_legacy_business_hours_table_gains_slot_index_column(tmp_path: Path):
+    """Legacy opening-hours rows are migrated to the multi-slot schema."""
+    database_path = tmp_path / "legacy-hours.db"
+    sync_engine = create_engine(f"sqlite:///{database_path}")
+    with sync_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE store_profile (
+                    id INTEGER PRIMARY KEY,
+                    store_name VARCHAR(120),
+                    bot_name VARCHAR(120),
+                    store_location VARCHAR(255),
+                    store_description VARCHAR(500),
+                    assistant_personality VARCHAR(255),
+                    locale VARCHAR(32),
+                    currency_code VARCHAR(8),
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE store_business_hours (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    store_id INTEGER NOT NULL,
+                    weekday INTEGER NOT NULL,
+                    opens_at TIME,
+                    closes_at TIME,
+                    closed BOOLEAN NOT NULL DEFAULT 0,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    FOREIGN KEY(store_id) REFERENCES store_profile (id) ON DELETE CASCADE,
+                    CONSTRAINT uq_store_business_hours UNIQUE (store_id, weekday)
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO store_business_hours (
+                    id,
+                    store_id,
+                    weekday,
+                    opens_at,
+                    closes_at,
+                    closed,
+                    created_at,
+                    updated_at
+                ) VALUES (
+                    1,
+                    1,
+                    1,
+                    '11:00',
+                    '15:00',
+                    0,
+                    CURRENT_TIMESTAMP,
+                    CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        _ensure_schema_columns(connection)
+    sync_engine.dispose()
+
+    with sqlite3.connect(database_path) as sqlite_connection:
+        columns = {row[1] for row in sqlite_connection.execute("PRAGMA table_info(store_business_hours)")}
+        migrated_row = sqlite_connection.execute(
+            """
+            SELECT weekday, slot_index, opens_at, closes_at, closed
+            FROM store_business_hours
+            """
+        ).fetchone()
+
+    assert "slot_index" in columns
+    assert migrated_row == (1, 0, "11:00", "15:00", 0)
+
+
 async def test_schedule_validation_helpers_cover_past_missing_prep_and_relative_day_text(tmp_path: Path):
     """Scheduling validation rejects past times and the local-text helper covers tomorrow and weekdays."""
     repository, runtime = await build_repository(tmp_path)
@@ -829,6 +1008,16 @@ async def test_store_business_hours_can_be_replaced(tmp_path: Path):
                 id=0,
                 store_id=1,
                 weekday=1,
+                slot_index=0,
+                opens_at="11:30",
+                closes_at="15:00",
+                closed=False,
+            ),
+            StoreBusinessHoursSnapshot(
+                id=0,
+                store_id=1,
+                weekday=1,
+                slot_index=1,
                 opens_at="18:00",
                 closes_at="23:30",
                 closed=False,
@@ -836,9 +1025,10 @@ async def test_store_business_hours_can_be_replaced(tmp_path: Path):
         ]
     )
 
-    assert len(updated) == UPDATED_WEEKLY_HOURS
+    assert len(updated) == DEFAULT_WEEKLY_HOURS + 1
     assert updated[0].closed is True
-    assert updated[1].opens_at == "18:00"
+    assert updated[1].opens_at == "11:30"
+    assert updated[2].opens_at == "18:00"
 
     await close_repository(repository, runtime)
 
@@ -893,5 +1083,147 @@ async def test_store_availability_skips_today_when_the_shift_already_closed(tmp_
     )
 
     assert availability.next_open_text == "mañana a las 18:00"
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_availability_handles_multiple_daily_slots(tmp_path: Path):
+    """Availability should respect later slots on the same day."""
+    repository, runtime = await build_repository(tmp_path)
+    await repository.replace_store_business_hours(
+        hours=[
+            StoreBusinessHoursSnapshot(
+                id=0,
+                store_id=1,
+                weekday=0,
+                slot_index=0,
+                opens_at="11:00",
+                closes_at="15:00",
+                closed=False,
+            ),
+            StoreBusinessHoursSnapshot(
+                id=0,
+                store_id=1,
+                weekday=0,
+                slot_index=1,
+                opens_at="19:00",
+                closes_at="23:00",
+                closed=False,
+            ),
+        ]
+    )
+
+    afternoon_closed = await repository.get_store_availability(
+        timezone_name="America/Argentina/Cordoba",
+        now=datetime(2026, 4, 6, 20, 0, tzinfo=UTC),
+    )
+    evening_open = await repository.get_store_availability(
+        timezone_name="America/Argentina/Cordoba",
+        now=datetime(2026, 4, 6, 23, 30, tzinfo=UTC),
+    )
+
+    assert afternoon_closed.next_open_text == "hoy a las 19:00"
+    assert evening_open.is_open is True
+    assert "hasta las 23:00" in evening_open.message_text
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_business_hours_reject_overlapping_slots(tmp_path: Path):
+    """Overlapping slots on the same day should fail fast."""
+    repository, runtime = await build_repository(tmp_path)
+
+    with pytest.raises(ValueError, match=r"Business-hours slots cannot overlap on the same day\."):
+        await repository.replace_store_business_hours(
+            hours=[
+                StoreBusinessHoursSnapshot(
+                    id=0,
+                    store_id=1,
+                    weekday=0,
+                    slot_index=0,
+                    opens_at="11:00",
+                    closes_at="15:00",
+                    closed=False,
+                ),
+                StoreBusinessHoursSnapshot(
+                    id=0,
+                    store_id=1,
+                    weekday=0,
+                    slot_index=1,
+                    opens_at="14:00",
+                    closes_at="18:00",
+                    closed=False,
+                ),
+            ]
+        )
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_business_hours_ignore_empty_open_rows_and_keep_day_closed(tmp_path: Path):
+    """Rows without any times are ignored when normalizing slots."""
+    repository, runtime = await build_repository(tmp_path)
+
+    updated = await repository.replace_store_business_hours(
+        hours=[
+            StoreBusinessHoursSnapshot(
+                id=0,
+                store_id=1,
+                weekday=0,
+                slot_index=0,
+                opens_at=None,
+                closes_at=None,
+                closed=False,
+            )
+        ]
+    )
+
+    monday_row = next(row for row in updated if row.weekday == 0)
+    assert monday_row.closed is True
+    assert monday_row.opens_at is None
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_business_hours_reject_partial_slots(tmp_path: Path):
+    """A slot must provide both opening and closing times."""
+    repository, runtime = await build_repository(tmp_path)
+
+    with pytest.raises(ValueError, match=re.escape(STORE_HOURS_SLOT_REQUIRES_BOTH_TIMES_MESSAGE)):
+        await repository.replace_store_business_hours(
+            hours=[
+                StoreBusinessHoursSnapshot(
+                    id=0,
+                    store_id=1,
+                    weekday=0,
+                    slot_index=0,
+                    opens_at="11:00",
+                    closes_at=None,
+                    closed=False,
+                )
+            ]
+        )
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_business_hours_reject_inverted_slots(tmp_path: Path):
+    """A slot cannot close before it opens."""
+    repository, runtime = await build_repository(tmp_path)
+
+    with pytest.raises(ValueError, match=re.escape(STORE_HOURS_SLOT_ORDER_MESSAGE)):
+        await repository.replace_store_business_hours(
+            hours=[
+                StoreBusinessHoursSnapshot(
+                    id=0,
+                    store_id=1,
+                    weekday=0,
+                    slot_index=0,
+                    opens_at="15:00",
+                    closes_at="11:00",
+                    closed=False,
+                )
+            ]
+        )
 
     await close_repository(repository, runtime)

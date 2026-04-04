@@ -7,7 +7,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ruperto.models import DeliveryType, OrderStatus, PaymentMethod
+from ruperto.models import DeliveryType, OrderStatus, PaymentMethod, StaffRole
 
 
 def format_price_ars(amount_cents: int) -> str:
@@ -43,6 +43,7 @@ class StoreBusinessHoursSnapshot(BaseSchema):
     id: int
     store_id: int
     weekday: int
+    slot_index: int = 0
     opens_at: str | None
     closes_at: str | None
     closed: bool
@@ -63,6 +64,36 @@ class CustomerSnapshot(BaseSchema):
     name: str | None
     phone_number: str | None
     default_address: str | None
+
+
+class StaffUserSnapshot(BaseSchema):
+    """Dashboard user information safe to expose to templates and handlers."""
+
+    id: int
+    email: str
+    full_name: str
+    is_active: bool
+
+
+class StoreMembershipSnapshot(BaseModel):
+    """One store the current dashboard user can operate."""
+
+    store_id: int
+    store_name: str
+    role: StaffRole
+
+
+class StoreStaffMembershipSnapshot(BaseModel):
+    """One staff membership row shown in the dashboard user management page."""
+
+    membership_id: int
+    staff_user_id: int
+    store_id: int
+    store_name: str
+    role: StaffRole
+    email: str
+    full_name: str
+    is_active: bool
 
 
 class MenuItemSnapshot(BaseSchema):
@@ -170,6 +201,7 @@ class StoreBusinessHoursUpdateEntry(BaseModel):
     """One staff-supplied business-hours row."""
 
     weekday: int = Field(ge=0, le=6)
+    slot_index: int = Field(default=0, ge=0, le=9)
     opens_at: str | None = None
     closes_at: str | None = None
     closed: bool = False

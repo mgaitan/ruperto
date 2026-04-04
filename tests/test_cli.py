@@ -88,6 +88,30 @@ def test_init_db(monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture):
     assert "store_profile" in tables
 
 
+def test_create_admin_interactively(monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture):
+    """The create-admin command can prompt for one owner user interactively."""
+    database_path = tmp_path / "admin.db"
+    monkeypatch.setenv("RUPERTO_DATABASE_URL", f"sqlite+aiosqlite:///{database_path}")
+    prompts = iter(["", "gaitan@gmail.com", ""])
+    passwords = iter(["clave-1", "clave-2", "", "secreta", "secreta"])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(prompts))
+    monkeypatch.setattr("ruperto.getpass.getpass", lambda _prompt="": next(passwords))
+
+    assert main(["create-admin"]) == 0
+    captured = capsys.readouterr()
+    assert "Admin user ready for gaitan@gmail.com" in captured.out
+    assert "This field is required." in captured.out
+    assert "Passwords do not match." in captured.out
+    assert "Password cannot be empty." in captured.out
+
+    with sqlite3.connect(database_path) as connection:
+        user_row = connection.execute("SELECT email, full_name FROM staff_user").fetchone()
+        membership_row = connection.execute("SELECT store_id, role FROM store_membership").fetchone()
+
+    assert user_row == ("gaitan@gmail.com", "Store Admin")
+    assert membership_row == (1, "OWNER")
+
+
 def test_web_chat_command_starts_dev_server(monkeypatch, mocker, tmp_path: Path):
     """The web-chat subcommand starts the development web UI."""
     database_path = tmp_path / "web-chat.db"

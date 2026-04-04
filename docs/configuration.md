@@ -47,6 +47,35 @@ RUPERTO_DEFAULT_STORE_ID
   This keeps today's single-store MVP configurable while preparing for future
   logical multi-tenancy.
 
+RUPERTO_DASHBOARD_SESSION_SECRET
+  Secret used to sign the dashboard session cookie.
+  Change it in shared or production environments so staff sessions cannot be
+  forged across instances.
+
+RUPERTO_DASHBOARD_ADMIN_EMAIL
+  Email address of the bootstrap dashboard user created during database
+  initialization when paired with {term}`RUPERTO_DASHBOARD_ADMIN_PASSWORD`.
+
+RUPERTO_DASHBOARD_ADMIN_PASSWORD
+  Password of the bootstrap dashboard user.
+  The password is hashed before it is stored in the database.
+
+RUPERTO_DASHBOARD_ADMIN_NAME
+  Full name shown in the dashboard header for the bootstrap dashboard user.
+
+RUPERTO_SMTP_SERVER
+  SMTP hostname used for future transactional emails sent by the backend.
+
+RUPERTO_SMTP_PORT
+  SMTP port used together with {term}`RUPERTO_SMTP_SERVER`.
+
+RUPERTO_SMTP_USER
+  SMTP username used to authenticate against the configured server.
+
+RUPERTO_SMTP_PASSWORD
+  SMTP password used to authenticate against the configured server.
+  This value is intentionally treated as secret configuration.
+
 RUPERTO_GEMINI_MODEL
   Google Gemini model name used by the PydanticAI ordering assistant.
   The initial value is `gemini-2.5-flash`.

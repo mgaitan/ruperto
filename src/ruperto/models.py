@@ -54,12 +54,20 @@ class PaymentMethod(StrEnum):
     TRANSFER = "transfer"
 
 
+class StaffRole(StrEnum):
+    """Roles available to staff users within one store."""
+
+    OWNER = "owner"
+    MANAGER = "manager"
+    STAFF = "staff"
+
+
 class StoreProfile(Base):
     """Persist the configurable public profile of the business."""
 
     __tablename__ = "store_profile"
 
-    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    id: Mapped[int] = mapped_column(primary_key=True)
     store_name: Mapped[str] = mapped_column(String(length=120))
     bot_name: Mapped[str] = mapped_column(String(length=120))
     store_location: Mapped[str | None] = mapped_column(String(length=255), nullable=True)
@@ -72,15 +80,43 @@ class StoreProfile(Base):
     updated_at: Mapped[datetime] = mapped_column(default=utc_now, onupdate=utc_now)
 
 
+class StaffUser(Base):
+    """One authenticated dashboard user."""
+
+    __tablename__ = "staff_user"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(length=255), unique=True)
+    full_name: Mapped[str] = mapped_column(String(length=120))
+    password_hash: Mapped[str] = mapped_column(String(length=255))
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(default=utc_now, onupdate=utc_now)
+
+
+class StoreMembership(Base):
+    """Map one dashboard user to one store and role."""
+
+    __tablename__ = "store_membership"
+    __table_args__ = (UniqueConstraint("staff_user_id", "store_id", name="uq_store_membership"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    staff_user_id: Mapped[int] = mapped_column(ForeignKey("staff_user.id", ondelete="CASCADE"))
+    store_id: Mapped[int] = mapped_column(ForeignKey("store_profile.id", ondelete="CASCADE"))
+    role: Mapped[StaffRole] = mapped_column(SqlEnum(StaffRole, native_enum=False, length=32), default=StaffRole.OWNER)
+    created_at: Mapped[datetime] = mapped_column(default=utc_now)
+
+
 class StoreBusinessHours(Base):
     """One weekly opening-hours window for the store."""
 
     __tablename__ = "store_business_hours"
-    __table_args__ = (UniqueConstraint("store_id", "weekday", name="uq_store_business_hours"),)
+    __table_args__ = (UniqueConstraint("store_id", "weekday", "slot_index", name="uq_store_business_hours"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     store_id: Mapped[int] = mapped_column(ForeignKey("store_profile.id", ondelete="CASCADE"), default=1)
     weekday: Mapped[int]
+    slot_index: Mapped[int] = mapped_column(default=0)
     opens_at: Mapped[time | None] = mapped_column(Time(), nullable=True)
     closes_at: Mapped[time | None] = mapped_column(Time(), nullable=True)
     closed: Mapped[bool] = mapped_column(default=False)
