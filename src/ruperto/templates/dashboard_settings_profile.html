@@ -1,0 +1,51 @@
+{% extends "dashboard_base.html" %}
+
+{% block content %}
+<section class="rounded-[2rem] border border-white/70 bg-white/85 p-6 shadow-card backdrop-blur">
+    <form action="/dashboard/settings/profile" method="post" class="grid gap-4 md:grid-cols-2">
+        <label class="space-y-2 text-sm font-medium text-slate-700">
+            <span>Nombre del local</span>
+            <input
+                class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                name="store_name"
+                value="{{ store.store_name }}"
+                required
+            />
+        </label>
+        <label class="space-y-2 text-sm font-medium text-slate-700">
+            <span>Alias de transferencia</span>
+            <input
+                class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                name="transfer_alias"
+                value="{{ store.transfer_alias or '' }}"
+                placeholder="mi.local.alias"
+            />
+        </label>
+        <label class="space-y-2 text-sm font-medium text-slate-700 md:col-span-2">
+            <span>Ubicación</span>
+            <input
+                class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                name="store_location"
+                value="{{ store.store_location or '' }}"
+                placeholder="Ciudad, barrio o dirección de referencia"
+            />
+        </label>
+        <label class="space-y-2 text-sm font-medium text-slate-700 md:col-span-2">
+            <span>Descripción del local</span>
+            <textarea
+                class="min-h-36 w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                name="store_description"
+                required
+            >{{ store.store_description }}</textarea>
+        </label>
+        <div class="md:col-span-2 flex justify-end">
+            <button
+                class="rounded-full bg-ink px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-800"
+                type="submit"
+            >
+                Guardar perfil
+            </button>
+        </div>
+    </form>
+</section>
+{% endblock %}

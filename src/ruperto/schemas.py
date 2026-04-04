@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ruperto.models import DeliveryType, OrderStatus, PaymentMethod
+from ruperto.models import DeliveryType, OrderStatus, PaymentMethod, StaffRole
 
 
 def format_price_ars(amount_cents: int) -> str:
@@ -33,6 +34,7 @@ class StoreProfileSnapshot(BaseSchema):
     assistant_personality: str
     locale: str
     currency_code: str
+    transfer_alias: str | None
 
 
 class StoreBusinessHoursSnapshot(BaseSchema):
@@ -41,6 +43,7 @@ class StoreBusinessHoursSnapshot(BaseSchema):
     id: int
     store_id: int
     weekday: int
+    slot_index: int = 0
     opens_at: str | None
     closes_at: str | None
     closed: bool
@@ -61,6 +64,36 @@ class CustomerSnapshot(BaseSchema):
     name: str | None
     phone_number: str | None
     default_address: str | None
+
+
+class StaffUserSnapshot(BaseSchema):
+    """Dashboard user information safe to expose to templates and handlers."""
+
+    id: int
+    email: str
+    full_name: str
+    is_active: bool
+
+
+class StoreMembershipSnapshot(BaseModel):
+    """One store the current dashboard user can operate."""
+
+    store_id: int
+    store_name: str
+    role: StaffRole
+
+
+class StoreStaffMembershipSnapshot(BaseModel):
+    """One staff membership row shown in the dashboard user management page."""
+
+    membership_id: int
+    staff_user_id: int
+    store_id: int
+    store_name: str
+    role: StaffRole
+    email: str
+    full_name: str
+    is_active: bool
 
 
 class MenuItemSnapshot(BaseSchema):
@@ -98,6 +131,8 @@ class OrderSnapshot(BaseModel):
     delivery_type: DeliveryType | None
     delivery_address: str | None
     payment_method: PaymentMethod | None
+    requested_ready_at: datetime | None = None
+    preparation_starts_at: datetime | None = None
     total_amount_cents: int
     total_amount_display: str
     items: list[OrderItemSnapshot] = Field(default_factory=list)
@@ -166,6 +201,7 @@ class StoreBusinessHoursUpdateEntry(BaseModel):
     """One staff-supplied business-hours row."""
 
     weekday: int = Field(ge=0, le=6)
+    slot_index: int = Field(default=0, ge=0, le=9)
     opens_at: str | None = None
     closes_at: str | None = None
     closed: bool = False
@@ -175,3 +211,14 @@ class StoreBusinessHoursUpdateRequest(BaseModel):
     """Payload accepted by staff endpoints to replace the weekly schedule."""
 
     hours: list[StoreBusinessHoursUpdateEntry]
+
+
+class StoreProfileUpdateRequest(BaseModel):
+    """Payload accepted by staff endpoints to update the store customization."""
+
+    store_name: str = Field(min_length=1)
+    bot_name: str = Field(min_length=1)
+    store_location: str | None = None
+    store_description: str = Field(min_length=1)
+    assistant_personality: str = Field(min_length=1)
+    transfer_alias: str | None = None

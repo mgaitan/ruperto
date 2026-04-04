@@ -3,18 +3,26 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
+import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
+from pydantic import SecretStr
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
-from sqlalchemy import select
+from sqlalchemy import create_engine, select, text
 
 from ruperto.config import Settings
-from ruperto.db import DatabaseRuntime, create_database_runtime, init_database
-from ruperto.models import Channel, DeliveryType, MenuItem, OrderStatus, PaymentMethod
-from ruperto.repository import BusinessRepository, normalize_phone_number
-from ruperto.schemas import StoreBusinessHoursSnapshot
+from ruperto.db import DatabaseRuntime, _ensure_schema_columns, create_database_runtime, init_database
+from ruperto.models import Channel, DeliveryType, MenuItem, OrderStatus, PaymentMethod, StaffRole, StaffUser
+from ruperto.repository import (
+    STORE_HOURS_SLOT_ORDER_MESSAGE,
+    STORE_HOURS_SLOT_REQUIRES_BOTH_TIMES_MESSAGE,
+    BusinessRepository,
+    normalize_phone_number,
+)
+from ruperto.schemas import StoreBusinessHoursSnapshot, StoreProfileUpdateRequest
 
 pytestmark = pytest.mark.anyio
 EXPECTED_HISTORY_MESSAGES = 2
@@ -28,8 +36,9 @@ LARGE_ORDER_DELAY_MINUTES = 31
 KITCHEN_LOAD_DELAY_MINUTES = 18
 EMPTY_DRAFT_DELAY_MINUTES = 15
 DEFAULT_WEEKLY_HOURS = 7
-UPDATED_WEEKLY_HOURS = 2
-MIN_MENU_ITEMS = 14
+MIN_MENU_ITEMS = 35
+TENANT_STORE_ID = 7
+STORE_TIMEZONE = "America/Argentina/Cordoba"
 
 
 async def build_repository(tmp_path: Path) -> tuple[BusinessRepository, DatabaseRuntime]:
@@ -77,6 +86,120 @@ async def test_bootstrap_seeds_store_menu_and_empty_memory(tmp_path: Path):
     assert normalize_phone_number("+54 351-555-7788") == "+543515557788"
     assert normalize_phone_number("351 555 7788") == "3515557788"
     assert normalize_phone_number("   ") is None
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_profile_can_be_updated_with_empty_optional_fields(tmp_path: Path):
+    """Store customization trims optional empty fields down to null."""
+    repository, runtime = await build_repository(tmp_path)
+
+    updated = await repository.update_store_profile(
+        StoreProfileUpdateRequest(
+            store_name="Panel Rotisería",
+            bot_name="Panel Bot",
+            store_location=None,
+            store_description="Updated from the dashboard.",
+            assistant_personality="Steady and direct.",
+            transfer_alias=None,
+        )
+    )
+
+    assert updated.store_name == "Panel Rotisería"
+    assert updated.store_location is None
+    assert updated.transfer_alias is None
+
+    await close_repository(repository, runtime)
+
+
+async def test_dashboard_admin_bootstrap_and_staff_authentication(tmp_path: Path):
+    """Database bootstrap can create the initial dashboard admin and memberships."""
+    settings = Settings(
+        environment="test",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'staff.db'}",
+        store_name="Rotisería Test",
+        bot_name="Ruperto Test",
+        dashboard_admin_email="owner@example.com",
+        dashboard_admin_password=SecretStr("super-secret"),
+        dashboard_admin_name="Owner User",
+    )
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        staff_user = await repository.get_staff_user_by_email("OWNER@example.com")
+        authenticated = await repository.authenticate_staff_user(email="owner@example.com", password="super-secret")
+        memberships = await repository.list_store_memberships_for_staff_user(authenticated.id if authenticated else 0)
+
+        assert staff_user is not None
+        assert authenticated is not None
+        assert memberships[0].store_id == 1
+        assert memberships[0].role == StaffRole.OWNER
+        assert await repository.user_can_access_store(staff_user_id=authenticated.id, store_id=1) is True
+        assert await repository.user_can_access_store(staff_user_id=authenticated.id, store_id=999) is False
+
+    await runtime.engine.dispose()
+
+
+async def test_staff_repository_helpers_handle_missing_and_inactive_users(tmp_path: Path):
+    """Staff lookups fail closed for missing records and inactive accounts."""
+    repository, runtime = await build_repository(tmp_path)
+    created = await repository.ensure_staff_user(
+        email="staff@example.com",
+        full_name="Staff User",
+        password="super-secret",
+        store_id=1,
+    )
+
+    assert await repository.get_staff_user_by_id(9999) is None
+    assert await repository.get_staff_user_by_email("missing@example.com") is None
+
+    staff_row = await repository.session.get(StaffUser, created.id)
+    assert staff_row is not None
+    staff_row.is_active = False
+    await repository.session.flush()
+
+    assert await repository.authenticate_staff_user(email="staff@example.com", password="super-secret") is None
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_staff_memberships_can_be_listed_and_reassigned(tmp_path: Path):
+    """Store membership helpers expose staff rows and allow role updates."""
+    repository, runtime = await build_repository(tmp_path)
+    await repository.ensure_staff_user(
+        email="team@example.com",
+        full_name="Equipo Local",
+        password="super-secret",
+        store_id=1,
+        role=StaffRole.STAFF,
+    )
+
+    memberships = await repository.list_staff_memberships_for_store(store_id=1)
+    team_membership = next(membership for membership in memberships if membership.email == "team@example.com")
+    updated_membership = await repository.update_store_membership_role(
+        membership_id=team_membership.membership_id,
+        store_id=1,
+        role=StaffRole.MANAGER,
+    )
+
+    assert team_membership.role == StaffRole.STAFF
+    assert updated_membership.role == StaffRole.MANAGER
+
+    await close_repository(repository, runtime)
+
+
+async def test_update_store_membership_role_raises_for_missing_membership(tmp_path: Path):
+    """Updating an unknown store membership fails with a clear error."""
+    repository, runtime = await build_repository(tmp_path)
+
+    with pytest.raises(ValueError, match=r"Store membership not found\."):
+        await repository.update_store_membership_role(
+            membership_id=999,
+            store_id=1,
+            role=StaffRole.MANAGER,
+        )
 
     await close_repository(repository, runtime)
 
@@ -146,6 +269,28 @@ async def test_customer_identity_and_message_history_are_persisted(tmp_path: Pat
     await close_repository(repository, runtime)
 
 
+async def test_conversation_state_can_remember_a_pending_customer_message(tmp_path: Path):
+    """Conversation state stores deferred intent while onboarding is incomplete."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="cliente-pendiente")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="cliente-pendiente",
+        customer_id=customer.id,
+    )
+
+    assert await repository.get_pending_customer_message(conversation.id) is None
+    assert (
+        await repository.set_pending_customer_message(conversation.id, "quiero una hamburguesa y una coca")
+        == "quiero una hamburguesa y una coca"
+    )
+    assert await repository.get_pending_customer_message(conversation.id) == "quiero una hamburguesa y una coca"
+    assert await repository.set_pending_customer_message(conversation.id, None) is None
+    assert await repository.get_pending_customer_message(conversation.id) is None
+
+    await close_repository(repository, runtime)
+
+
 async def test_customer_phone_and_conversation_can_be_completed_later(tmp_path: Path):
     """Existing identities can gain a phone number and conversations can be re-linked."""
     repository, runtime = await build_repository(tmp_path)
@@ -175,6 +320,31 @@ async def test_customer_phone_and_conversation_can_be_completed_later(tmp_path: 
     assert updated_customer.phone_number == "+543514443322"
     assert reassigned.id == conversation.id
     assert reassigned.customer_id == another_customer.id
+
+    await close_repository(repository, runtime)
+
+
+async def test_init_database_respects_the_configured_default_store_id(tmp_path: Path):
+    """Bootstrap should create the default store profile and schedule with the configured store id."""
+    settings = Settings(
+        environment="test",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'repo-store.db'}",
+        store_name="Rotisería Tenant",
+        bot_name="Ruperto Tenant",
+        default_store_id=TENANT_STORE_ID,
+    )
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    session = runtime.session_factory()
+    repository = BusinessRepository(session)
+
+    store = await repository.get_store_profile(store_id=TENANT_STORE_ID)
+    hours = await repository.list_store_business_hours(store_id=TENANT_STORE_ID)
+
+    assert store.id == TENANT_STORE_ID
+    assert store.store_name == "Rotisería Tenant"
+    assert len(hours) == DEFAULT_WEEKLY_HOURS
+    assert all(row.store_id == TENANT_STORE_ID for row in hours)
 
     await close_repository(repository, runtime)
 
@@ -237,6 +407,340 @@ async def test_order_lifecycle_and_customer_memory(tmp_path: Path):
     await close_repository(repository, runtime)
 
 
+async def test_set_order_requested_ready_at_persists_schedule_and_updates_prep_start(tmp_path: Path):
+    """Scheduled orders keep the requested ready time and derived preparation start."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="schedule-ok")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="schedule-ok",
+        customer_id=customer.id,
+    )
+    await repository.replace_store_business_hours(
+        hours=[
+            StoreBusinessHoursSnapshot(
+                id=0,
+                store_id=1,
+                weekday=weekday,
+                opens_at="00:00",
+                closes_at="23:59",
+                closed=False,
+            )
+            for weekday in range(7)
+        ]
+    )
+    await repository.add_item_to_current_order(
+        customer.id,
+        conversation.id,
+        sku="hamburguesa-completa",
+        quantity=1,
+    )
+
+    local_ready = datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(hours=2)
+    scheduled = await repository.set_order_requested_ready_at(
+        customer.id,
+        conversation.id,
+        local_ready.astimezone(UTC),
+        timezone_name=STORE_TIMEZONE,
+    )
+
+    assert scheduled.requested_ready_at is not None
+    assert scheduled.preparation_starts_at is not None
+    assert scheduled.requested_ready_at == local_ready.astimezone(UTC)
+    assert scheduled.preparation_starts_at == scheduled.requested_ready_at - timedelta(minutes=PICKUP_DELAY_MINUTES)
+
+    delivery_scheduled = await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.DELIVERY)
+
+    assert delivery_scheduled.preparation_starts_at is not None
+    assert scheduled.requested_ready_at.replace(tzinfo=None) - delivery_scheduled.preparation_starts_at == timedelta(
+        minutes=20
+    )
+
+    await close_repository(repository, runtime)
+
+
+async def test_set_order_requested_ready_at_rejects_closed_or_too_soon_slots(tmp_path: Path):
+    """Scheduling fails outside store hours or without enough preparation lead time."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="schedule-invalid")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="schedule-invalid",
+        customer_id=customer.id,
+    )
+    await repository.add_item_to_current_order(
+        customer.id,
+        conversation.id,
+        sku="hamburguesa-completa",
+        quantity=1,
+    )
+
+    local_ready = datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(hours=2)
+    await repository.replace_store_business_hours(
+        hours=[
+            StoreBusinessHoursSnapshot(
+                id=0,
+                store_id=1,
+                weekday=weekday,
+                opens_at=None,
+                closes_at=None,
+                closed=True,
+            )
+            for weekday in range(7)
+        ]
+    )
+    with pytest.raises(ValueError, match="solo dentro del horario"):
+        await repository.set_order_requested_ready_at(
+            customer.id,
+            conversation.id,
+            local_ready.astimezone(UTC),
+            timezone_name=STORE_TIMEZONE,
+        )
+
+    reset_order = await repository.get_current_order(customer.id, conversation.id)
+    assert reset_order is not None
+    assert reset_order.requested_ready_at is None
+    assert reset_order.preparation_starts_at is None
+
+    await repository.replace_store_business_hours(
+        hours=[
+            StoreBusinessHoursSnapshot(
+                id=0,
+                store_id=1,
+                weekday=weekday,
+                opens_at="00:00",
+                closes_at="23:59",
+                closed=False,
+            )
+            for weekday in range(7)
+        ]
+    )
+    too_soon = datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(minutes=5)
+    with pytest.raises(ValueError, match="necesito un poco más de tiempo"):
+        await repository.set_order_requested_ready_at(
+            customer.id,
+            conversation.id,
+            too_soon.astimezone(UTC),
+            timezone_name=STORE_TIMEZONE,
+        )
+
+    await close_repository(repository, runtime)
+
+
+async def test_init_database_backfills_schedule_and_transfer_columns_for_legacy_sqlite(tmp_path: Path):
+    """Legacy SQLite schemas gain the new scheduling and transfer columns during init."""
+    database_path = tmp_path / "legacy.db"
+    sync_engine = create_engine(f"sqlite:///{database_path}")
+    with sync_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE store_profile (
+                    id INTEGER PRIMARY KEY,
+                    store_name VARCHAR(120),
+                    bot_name VARCHAR(120),
+                    store_location VARCHAR(255),
+                    store_description VARCHAR(500),
+                    assistant_personality VARCHAR(255),
+                    locale VARCHAR(32),
+                    currency_code VARCHAR(8),
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO store_profile (
+                    id, store_name, bot_name, store_location, store_description,
+                    assistant_personality, locale, currency_code, created_at, updated_at
+                ) VALUES (
+                    1, 'Legacy Rotisería', 'Legacy Bot', NULL, 'Perfil viejo',
+                    'Amable', 'es-AR', 'ARS', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE customer_order (
+                    id INTEGER PRIMARY KEY,
+                    customer_id INTEGER,
+                    conversation_id INTEGER,
+                    status VARCHAR(32),
+                    delivery_type VARCHAR(32),
+                    delivery_address VARCHAR(255),
+                    payment_method VARCHAR(32),
+                    total_amount_cents INTEGER,
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+        )
+    sync_engine.dispose()
+
+    settings = Settings(
+        environment="test",
+        database_url=f"sqlite+aiosqlite:///{database_path}",
+        store_name="Legacy Rotisería",
+        bot_name="Legacy Bot",
+        store_transfer_alias="legacy.alias",
+    )
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+
+    with sqlite3.connect(database_path) as sqlite_connection:
+        store_columns = {row[1] for row in sqlite_connection.execute("PRAGMA table_info(store_profile)")}
+        order_columns = {row[1] for row in sqlite_connection.execute("PRAGMA table_info(customer_order)")}
+    assert "transfer_alias" in store_columns
+    assert "requested_ready_at" in order_columns
+    assert "preparation_starts_at" in order_columns
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        store = await repository.get_store_profile()
+        assert store.transfer_alias == "legacy.alias"
+
+    await runtime.engine.dispose()
+
+
+async def test_legacy_business_hours_table_gains_slot_index_column(tmp_path: Path):
+    """Legacy opening-hours rows are migrated to the multi-slot schema."""
+    database_path = tmp_path / "legacy-hours.db"
+    sync_engine = create_engine(f"sqlite:///{database_path}")
+    with sync_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE store_profile (
+                    id INTEGER PRIMARY KEY,
+                    store_name VARCHAR(120),
+                    bot_name VARCHAR(120),
+                    store_location VARCHAR(255),
+                    store_description VARCHAR(500),
+                    assistant_personality VARCHAR(255),
+                    locale VARCHAR(32),
+                    currency_code VARCHAR(8),
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE store_business_hours (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    store_id INTEGER NOT NULL,
+                    weekday INTEGER NOT NULL,
+                    opens_at TIME,
+                    closes_at TIME,
+                    closed BOOLEAN NOT NULL DEFAULT 0,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    FOREIGN KEY(store_id) REFERENCES store_profile (id) ON DELETE CASCADE,
+                    CONSTRAINT uq_store_business_hours UNIQUE (store_id, weekday)
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO store_business_hours (
+                    id,
+                    store_id,
+                    weekday,
+                    opens_at,
+                    closes_at,
+                    closed,
+                    created_at,
+                    updated_at
+                ) VALUES (
+                    1,
+                    1,
+                    1,
+                    '11:00',
+                    '15:00',
+                    0,
+                    CURRENT_TIMESTAMP,
+                    CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        _ensure_schema_columns(connection)
+    sync_engine.dispose()
+
+    with sqlite3.connect(database_path) as sqlite_connection:
+        columns = {row[1] for row in sqlite_connection.execute("PRAGMA table_info(store_business_hours)")}
+        migrated_row = sqlite_connection.execute(
+            """
+            SELECT weekday, slot_index, opens_at, closes_at, closed
+            FROM store_business_hours
+            """
+        ).fetchone()
+
+    assert "slot_index" in columns
+    assert migrated_row == (1, 0, "11:00", "15:00", 0)
+
+
+async def test_schedule_validation_helpers_cover_past_missing_prep_and_relative_day_text(tmp_path: Path):
+    """Scheduling validation rejects past times and the local-text helper covers tomorrow and weekdays."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="schedule-helper")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="schedule-helper",
+        customer_id=customer.id,
+    )
+    await repository.replace_store_business_hours(
+        hours=[
+            StoreBusinessHoursSnapshot(
+                id=0,
+                store_id=1,
+                weekday=weekday,
+                opens_at="00:00",
+                closes_at="23:59",
+                closed=False,
+            )
+            for weekday in range(7)
+        ]
+    )
+
+    created = await repository.set_order_requested_ready_at(
+        customer.id,
+        conversation.id,
+        (datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(hours=2)).astimezone(UTC),
+        timezone_name=STORE_TIMEZONE,
+    )
+    assert created.requested_ready_at is not None
+
+    order = await repository._require_current_order(customer.id, conversation.id)
+    order.requested_ready_at = (
+        datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) - timedelta(minutes=5)
+    ).astimezone(UTC)
+    with pytest.raises(ValueError, match="ya pasó"):
+        await repository._validate_requested_ready_at(order, timezone_name=STORE_TIMEZONE, store_id=1)
+
+    order.requested_ready_at = (
+        datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(hours=3)
+    ).astimezone(UTC)
+    order.preparation_starts_at = None
+    await repository._validate_requested_ready_at(order, timezone_name=STORE_TIMEZONE, store_id=1)
+
+    local_now = datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0)
+    assert repository._describe_local_datetime(local_now + timedelta(days=1), local_now).startswith("mañana")
+    assert repository._describe_local_datetime(local_now + timedelta(days=2), local_now).startswith("el ")
+
+    await close_repository(repository, runtime)
+
+
 async def test_order_creation_and_failures_have_explicit_messages(tmp_path: Path):
     """Order helpers create drafts lazily and expose domain errors with clear text."""
     repository, runtime = await build_repository(tmp_path)
@@ -278,6 +782,36 @@ async def test_order_creation_and_failures_have_explicit_messages(tmp_path: Path
             sku="producto-inexistente",
             quantity=1,
         )
+
+    await close_repository(repository, runtime)
+
+
+async def test_confirm_current_order_requires_delivery_choice_address_and_payment(tmp_path: Path):
+    """Draft confirmation requires the core checkout fields before closing the order."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="checkout-user")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="checkout-user",
+        customer_id=customer.id,
+    )
+
+    await repository.add_item_to_current_order(
+        customer.id,
+        conversation.id,
+        sku="hamburguesa-bbq",
+        quantity=1,
+    )
+    with pytest.raises(ValueError, match=re.escape("Necesito saber si es envío o retiro antes de confirmar.")):
+        await repository.confirm_current_order(customer.id, conversation.id)
+
+    await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.DELIVERY)
+    with pytest.raises(ValueError, match=re.escape("Necesito la dirección de entrega antes de confirmar.")):
+        await repository.confirm_current_order(customer.id, conversation.id)
+
+    await repository.set_order_delivery_address(customer.id, conversation.id, "Lavalle 12333")
+    with pytest.raises(ValueError, match=re.escape("Necesito definir el medio de pago antes de confirmar.")):
+        await repository.confirm_current_order(customer.id, conversation.id)
 
     await close_repository(repository, runtime)
 
@@ -369,6 +903,8 @@ async def test_delay_estimate_adds_extra_time_for_large_orders(tmp_path: Path):
         quantity=3,
     )
     await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.DELIVERY)
+    await repository.set_order_delivery_address(customer.id, conversation.id, "Lavalle 12333")
+    await repository.set_order_payment_method(customer.id, conversation.id, PaymentMethod.CASH)
     await repository.confirm_current_order(customer.id, conversation.id)
     delay = await repository.get_estimated_delay(customer.id, conversation.id)
 
@@ -395,6 +931,8 @@ async def test_delay_estimate_reflects_kitchen_load_from_previous_active_orders(
         sku="pizza-muzzarella",
         quantity=1,
     )
+    await repository.set_order_delivery_type(first_customer.id, first_conversation.id, DeliveryType.PICKUP)
+    await repository.set_order_payment_method(first_customer.id, first_conversation.id, PaymentMethod.CASH)
     first_order = await repository.confirm_current_order(first_customer.id, first_conversation.id)
     assert first_order.status == OrderStatus.CONFIRMED
 
@@ -470,6 +1008,16 @@ async def test_store_business_hours_can_be_replaced(tmp_path: Path):
                 id=0,
                 store_id=1,
                 weekday=1,
+                slot_index=0,
+                opens_at="11:30",
+                closes_at="15:00",
+                closed=False,
+            ),
+            StoreBusinessHoursSnapshot(
+                id=0,
+                store_id=1,
+                weekday=1,
+                slot_index=1,
                 opens_at="18:00",
                 closes_at="23:30",
                 closed=False,
@@ -477,9 +1025,10 @@ async def test_store_business_hours_can_be_replaced(tmp_path: Path):
         ]
     )
 
-    assert len(updated) == UPDATED_WEEKLY_HOURS
+    assert len(updated) == DEFAULT_WEEKLY_HOURS + 1
     assert updated[0].closed is True
-    assert updated[1].opens_at == "18:00"
+    assert updated[1].opens_at == "11:30"
+    assert updated[2].opens_at == "18:00"
 
     await close_repository(repository, runtime)
 
@@ -534,5 +1083,147 @@ async def test_store_availability_skips_today_when_the_shift_already_closed(tmp_
     )
 
     assert availability.next_open_text == "mañana a las 18:00"
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_availability_handles_multiple_daily_slots(tmp_path: Path):
+    """Availability should respect later slots on the same day."""
+    repository, runtime = await build_repository(tmp_path)
+    await repository.replace_store_business_hours(
+        hours=[
+            StoreBusinessHoursSnapshot(
+                id=0,
+                store_id=1,
+                weekday=0,
+                slot_index=0,
+                opens_at="11:00",
+                closes_at="15:00",
+                closed=False,
+            ),
+            StoreBusinessHoursSnapshot(
+                id=0,
+                store_id=1,
+                weekday=0,
+                slot_index=1,
+                opens_at="19:00",
+                closes_at="23:00",
+                closed=False,
+            ),
+        ]
+    )
+
+    afternoon_closed = await repository.get_store_availability(
+        timezone_name="America/Argentina/Cordoba",
+        now=datetime(2026, 4, 6, 20, 0, tzinfo=UTC),
+    )
+    evening_open = await repository.get_store_availability(
+        timezone_name="America/Argentina/Cordoba",
+        now=datetime(2026, 4, 6, 23, 30, tzinfo=UTC),
+    )
+
+    assert afternoon_closed.next_open_text == "hoy a las 19:00"
+    assert evening_open.is_open is True
+    assert "hasta las 23:00" in evening_open.message_text
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_business_hours_reject_overlapping_slots(tmp_path: Path):
+    """Overlapping slots on the same day should fail fast."""
+    repository, runtime = await build_repository(tmp_path)
+
+    with pytest.raises(ValueError, match=r"Business-hours slots cannot overlap on the same day\."):
+        await repository.replace_store_business_hours(
+            hours=[
+                StoreBusinessHoursSnapshot(
+                    id=0,
+                    store_id=1,
+                    weekday=0,
+                    slot_index=0,
+                    opens_at="11:00",
+                    closes_at="15:00",
+                    closed=False,
+                ),
+                StoreBusinessHoursSnapshot(
+                    id=0,
+                    store_id=1,
+                    weekday=0,
+                    slot_index=1,
+                    opens_at="14:00",
+                    closes_at="18:00",
+                    closed=False,
+                ),
+            ]
+        )
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_business_hours_ignore_empty_open_rows_and_keep_day_closed(tmp_path: Path):
+    """Rows without any times are ignored when normalizing slots."""
+    repository, runtime = await build_repository(tmp_path)
+
+    updated = await repository.replace_store_business_hours(
+        hours=[
+            StoreBusinessHoursSnapshot(
+                id=0,
+                store_id=1,
+                weekday=0,
+                slot_index=0,
+                opens_at=None,
+                closes_at=None,
+                closed=False,
+            )
+        ]
+    )
+
+    monday_row = next(row for row in updated if row.weekday == 0)
+    assert monday_row.closed is True
+    assert monday_row.opens_at is None
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_business_hours_reject_partial_slots(tmp_path: Path):
+    """A slot must provide both opening and closing times."""
+    repository, runtime = await build_repository(tmp_path)
+
+    with pytest.raises(ValueError, match=re.escape(STORE_HOURS_SLOT_REQUIRES_BOTH_TIMES_MESSAGE)):
+        await repository.replace_store_business_hours(
+            hours=[
+                StoreBusinessHoursSnapshot(
+                    id=0,
+                    store_id=1,
+                    weekday=0,
+                    slot_index=0,
+                    opens_at="11:00",
+                    closes_at=None,
+                    closed=False,
+                )
+            ]
+        )
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_business_hours_reject_inverted_slots(tmp_path: Path):
+    """A slot cannot close before it opens."""
+    repository, runtime = await build_repository(tmp_path)
+
+    with pytest.raises(ValueError, match=re.escape(STORE_HOURS_SLOT_ORDER_MESSAGE)):
+        await repository.replace_store_business_hours(
+            hours=[
+                StoreBusinessHoursSnapshot(
+                    id=0,
+                    store_id=1,
+                    weekday=0,
+                    slot_index=0,
+                    opens_at="15:00",
+                    closes_at="11:00",
+                    closed=False,
+                )
+            ]
+        )
 
     await close_repository(repository, runtime)

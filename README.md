@@ -27,11 +27,30 @@ uv sync
 uv run ruperto init-db
 ```
 
+Create the first dashboard admin interactively:
+
+```bash
+uv run ruperto create-admin
+```
+
 Run the API locally:
 
 ```bash
 uv run fastapi dev
 ```
+
+For automated or non-interactive setups, you can still bootstrap one owner user through environment variables:
+
+```bash
+export RUPERTO_DASHBOARD_SESSION_SECRET="replace-this-in-production"
+export RUPERTO_DASHBOARD_ADMIN_EMAIL="staff@example.com"
+export RUPERTO_DASHBOARD_ADMIN_PASSWORD="change-me"
+export RUPERTO_DASHBOARD_ADMIN_NAME="Store Admin"
+```
+
+If you plan to send transactional email from the same backend, the SMTP
+settings are now also recognized through `RUPERTO_SMTP_SERVER`,
+`RUPERTO_SMTP_PORT`, `RUPERTO_SMTP_USER`, and `RUPERTO_SMTP_PASSWORD`.
 
 Run the development web chat UI:
 
@@ -43,23 +62,47 @@ You should then have:
 
 - API root at `http://127.0.0.1:8000/`
 - health check at `http://127.0.0.1:8000/healthz`
+- staff dashboard at `http://127.0.0.1:8000/dashboard`
 - store profile at `http://127.0.0.1:8000/api/store-profile`
 - menu listing at `http://127.0.0.1:8000/api/menu-items`
 - development chat endpoint at `http://127.0.0.1:8000/api/dev/messages`
 - development web chat at `http://127.0.0.1:7932/`
 
 The current development flow asks for the customer's name before the first
-order unless the customer already introduced themself in the opening message,
-estimates kitchen delay from preparation time plus active workload, and lets
-staff move orders through operational statuses with
-`PATCH /api/orders/{order_id}/status`.
-Store opening hours are now configurable through `GET/PUT /api/store-hours`,
-and customer replies mention the next opening time whenever the store is closed.
-The demo catalog now includes multiple food options plus drinks and desserts so
-local development can exercise simple add-on suggestions.
+order unless the customer already introduced themself in the opening message.
+If the first customer message already contains an order or menu question, that
+intent is now remembered and resumed as soon as the customer shares their
+name, instead of resetting the conversation. The assistant also estimates
+kitchen delay from preparation time plus active workload and lets staff move
+orders through operational statuses with `PATCH /api/orders/{order_id}/status`.
+Store opening hours are now configurable through `GET/PUT /api/store-hours`.
+Each weekday can have zero, one, or many opening slots, so a store can stay
+closed on Mondays, open only at lunch on Sundays, or split the day into as
+many service windows as needed. Customer replies mention the next opening time
+whenever the store is closed.
+If a customer asks for a later ready time such as `para las 12`, the backend
+can now keep the order scheduled for that slot, store when preparation should
+start, and include the configured transfer alias when the payment method is
+`transferencia`.
+The backend also serves a simple Tailwind staff dashboard at `/dashboard`.
+Dashboard access now uses a minimal session cookie login backed by a bootstrap
+staff user configured through environment variables. Once signed in, the team
+gets a split navigation with a home page for metrics and recent orders, a
+dedicated customers page, and separate settings pages for the menu, store
+profile, agent behavior, flexible weekly hours, and store memberships.
+The demo catalog now includes a broader synthetic menu with pizzas,
+hamburgers, lomitos, milanesas, wraps, empanadas, drinks, and desserts so
+local development can exercise more realistic ordering conversations and
+simple add-on suggestions.
 Compact customer messages are also handled more naturally now, so the assistant
 can reuse cues such as a self-introduction, a payment hint like `te pago acá`,
 and a same-turn price question without asking for the same detail twice.
+The service also starts carrying an explicit `default_store_id` setting as the
+first groundwork toward a logical multi-tenant deployment, while still running
+today as one configurable store by default. Dashboard users can already belong
+to more than one store and switch the active store for profile and opening-hour
+management, while orders, customers, and the catalog still use the shared MVP
+data model for now.
 
 ## Development
 

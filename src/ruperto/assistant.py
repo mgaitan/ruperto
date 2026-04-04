@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import cast
+from datetime import UTC, datetime, timedelta
+from typing import Protocol, cast
+from zoneinfo import ZoneInfo
 
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, UserPromptPart
@@ -27,7 +31,10 @@ from ruperto.schemas import (
     MenuItemSnapshot,
     OrderSnapshot,
     StoreAvailabilitySnapshot,
+    StoreProfileSnapshot,
 )
+
+logger = logging.getLogger(__name__)
 
 BASE_INSTRUCTIONS = """
 Sos el asistente virtual de un local de comida en Argentina.
@@ -49,13 +56,27 @@ Reglas operativas:
   podés sugerir una opción de bebida o postre de forma breve y natural.
 - Si el cliente ya expresó una preferencia de pago en el mensaje actual, no la repreguntes.
 - Si el cliente pregunta cuánto sale, incluí el total o subtotal actual cuando ya lo puedas calcular.
+- Si el cliente pide programar un pedido para una hora puntual, tratá ese horario como prioridad.
+- Evitá repetir muletillas como "Perfecto" o copiar exactamente la misma frase en cada turno.
+- Cuando confirmes un pedido, mostrálos con aire visual: resumen separado, líneas cortas y datos fáciles de escanear.
 - Si el cliente pide algo fuera del alcance del bot, deriva a una persona.
 """.strip()
 
 NAME_CONFIRMATION_TEMPLATE = "¡Gracias, {name}! 😄 ¿Qué querés pedir hoy?"
+MODEL_UNAVAILABLE_REPLY = (
+    "Se me complicó responder justo ahora 😓 Si querés, probá de nuevo en unos segundos o te derivo con una persona."
+)
 MAX_NAME_WORDS = 3
-CLOSED_STORE_PREFIX = "{message_text} "
+MAX_SCHEDULE_HOUR = 23
+MAX_SCHEDULE_MINUTE = 59
 NAME_TOKEN_PATTERN = re.compile(r"^[A-Za-zÁÉÍÓÚÜÑáéíóúüñ'-]+$")
+REQUESTED_READY_TIME_PATTERNS = (
+    re.compile(
+        r"\b(?:para|a)\s+las?\s+(?P<hour>\d{1,2})(?:[:.](?P<minute>\d{2}))?\s*(?:hs?|horas?)?\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bpara\s+(?P<hour>\d{1,2})(?:[:.](?P<minute>\d{2}))?\s*hs?\b", re.IGNORECASE),
+)
 INTRO_NAME_PATTERNS = (
     re.compile(r"\bsoy\s+(?P<tail>.+)", re.IGNORECASE),
     re.compile(r"\bme\s+llamo\s+(?P<tail>.+)", re.IGNORECASE),
@@ -136,6 +157,35 @@ NAME_PROMPT_VARIANTS = (
     "👋 Hola, soy {bot_name}, el asistente de pedidos de {store_name}. Antes de seguir, ¿me decís tu nombre?",
     "🍽️ Hola, te habla {bot_name}, el asistente de pedidos de {store_name}. Para arrancar, ¿cómo te llamás?",
 )
+CLOSED_STORE_NOTICE_VARIANTS = (
+    "Ahora estamos cerrados 😴 Abrimos {next_open_text}. ",
+    "Justo ahora el local está cerrado 😴 Abrimos {next_open_text}. ",
+    "En este momento estamos fuera de horario 😴 Abrimos {next_open_text}. ",
+)
+DELIVERY_PROMPT_VARIANTS = (
+    "{lead}, {name}: por ahora llevo {items} por {total}.{timing_text} ¿Querés envío o retirás por el local?",
+    "Anotado, {name}: hasta ahora va {items} por {total}.{timing_text} ¿Querés envío o retirás por el local?",
+    "Bien, {name}: tengo {items} por {total}.{timing_text} ¿Querés envío o retirás por el local?",
+)
+ADDRESS_PROMPT_VARIANTS = (
+    "Dale. ¿Te lo envío a {address}? Si preferís otra dirección, pasámela.",
+    "Buenísimo. ¿Va a {address}? Si querés otro domicilio, decímelo.",
+    "Listo. ¿Te sirve mandarlo a {address}? Si no, pasame la dirección correcta.",
+)
+PAYMENT_PROMPT_VARIANTS = (
+    "{lead}. El total es {total}.{timing_text} ¿Cómo querés pagar: efectivo, transferencia o link de pago?",
+    "Seguimos bien. Son {total}.{timing_text} ¿Preferís efectivo, transferencia o link de pago?",
+    "Ya casi está: el total es {total}.{timing_text} ¿Lo resolvemos con efectivo, transferencia o link de pago?",
+)
+WEEKDAY_LABELS_ES = {
+    0: "lunes",
+    1: "martes",
+    2: "miércoles",
+    3: "jueves",
+    4: "viernes",
+    5: "sábado",
+    6: "domingo",
+}
 
 
 @dataclass(slots=True)
@@ -144,6 +194,7 @@ class AssistantDeps:
 
     settings: Settings
     session_factory: async_sessionmaker[AsyncSession]
+    store_id: int
     customer_id: int
     conversation_id: int
     turn_context_hint: str | None = None
@@ -157,6 +208,36 @@ class TurnPolicy:
 
     allow_order_mutations: bool
     allow_order_confirmation: bool
+
+
+@dataclass(slots=True)
+class NameHandlingResult:
+    """Outcome of the deterministic onboarding guardrails for one turn."""
+
+    customer: CustomerSnapshot
+    direct_reply: AssistantTurnResult | None = None
+    resumed_pending_message: str | None = None
+
+
+@dataclass(slots=True)
+class ModelRunContext:
+    """Inputs required to execute one agent run with retries."""
+
+    message_text: str
+    deps: AssistantDeps
+    history: list[ModelMessage]
+    model: Model | str
+    external_user_id: str
+    conversation_id: int
+
+
+class AgentRunResult(Protocol):
+    """Minimal protocol required from one completed agent run."""
+
+    output: AssistantReply
+
+    def new_messages(self) -> list[ModelMessage]:
+        """Return the messages produced during the run."""
 
 
 class InformationalTurnMutationError(ValueError):
@@ -204,7 +285,7 @@ ordering_agent = cast(
 @ordering_agent.instructions
 async def business_context(ctx: RunContext[AssistantDeps]) -> str:
     """Provide dynamic business context to the model."""
-    store = await with_repository(ctx, lambda repository: repository.get_store_profile())
+    store = await with_repository(ctx, lambda repository: repository.get_store_profile(store_id=ctx.deps.store_id))
     context = (
         f"Atendes {store.store_name}. "
         f"Bot: {store.bot_name}. "
@@ -271,6 +352,7 @@ async def get_store_availability(ctx: RunContext[AssistantDeps]) -> StoreAvailab
         ctx,
         lambda repository: repository.get_store_availability(
             timezone_name=ctx.deps.settings.store_timezone,
+            store_id=ctx.deps.store_id,
         ),
     )
 
@@ -381,6 +463,8 @@ async def confirm_current_order(ctx: RunContext[AssistantDeps]) -> OrderSnapshot
         lambda repository: repository.confirm_current_order(
             ctx.deps.customer_id,
             ctx.deps.conversation_id,
+            timezone_name=ctx.deps.settings.store_timezone,
+            store_id=ctx.deps.store_id,
         ),
         commit=True,
     )
@@ -407,15 +491,96 @@ class OrderingAssistantService:
         self.settings = settings
         self.agent = agent
 
-    async def handle_customer_message(
+    async def _build_model_unavailable_result(
+        self,
+        *,
+        conversation_id: int,
+        customer: CustomerSnapshot,
+        user_text: str,
+    ) -> AssistantTurnResult:
+        """Persist and return a friendly fallback when the model is unavailable."""
+        fallback_reply = AssistantReply(
+            reply_text=MODEL_UNAVAILABLE_REPLY,
+            next_step=AssistantNextStep.HANDOFF,
+            handoff=True,
+        )
+        async with self.session_factory() as session:
+            repository = BusinessRepository(session)
+            await self._persist_direct_reply(
+                repository=repository,
+                conversation_id=conversation_id,
+                user_text=user_text,
+                reply_text=fallback_reply.reply_text,
+            )
+            await session.commit()
+        return AssistantTurnResult(
+            conversation_id=conversation_id,
+            customer=customer,
+            reply=fallback_reply,
+            current_order=None,
+        )
+
+    async def _run_agent_with_retries(
+        self,
+        *,
+        run_context: ModelRunContext,
+    ) -> AgentRunResult:
+        """Run the agent with timeout logging and one or more retry attempts."""
+        attempts = self.settings.assistant_model_retry_attempts + 1
+        last_error: Exception | None = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                async with asyncio.timeout(self.settings.assistant_model_timeout_seconds):
+                    return await self.agent.run(
+                        run_context.message_text,
+                        deps=run_context.deps,
+                        message_history=run_context.history,
+                        model=run_context.model,
+                    )
+            except TimeoutError as error:
+                logger.warning(
+                    "Assistant model timed out",
+                    extra={
+                        "external_user_id": run_context.external_user_id,
+                        "conversation_id": run_context.conversation_id,
+                        "attempt": attempt,
+                        "max_attempts": attempts,
+                    },
+                )
+                last_error = error
+            except Exception as error:
+                if isinstance(error, (InformationalTurnMutationError, MissingConfirmationSignalError)):
+                    raise
+                logger.warning(
+                    "Assistant model failed",
+                    exc_info=error,
+                    extra={
+                        "external_user_id": run_context.external_user_id,
+                        "conversation_id": run_context.conversation_id,
+                        "attempt": attempt,
+                        "max_attempts": attempts,
+                    },
+                )
+                last_error = error
+
+            if attempt < attempts:
+                await asyncio.sleep(min(0.25 * attempt, 1.0))
+
+        assert last_error is not None
+        raise last_error
+
+    async def handle_customer_message(  # noqa: PLR0915
         self,
         *,
         channel: Channel,
         external_user_id: str,
         message_text: str,
         model: Model | str | None = None,
+        store_id: int | None = None,
     ) -> AssistantTurnResult:
         """Process one customer message and persist the resulting turn."""
+        resolved_store_id = store_id if store_id is not None else self.settings.default_store_id
         async with self.session_factory() as session:
             repository = BusinessRepository(session)
             customer = await repository.get_or_create_customer(
@@ -429,61 +594,161 @@ class OrderingAssistantService:
                 customer_id=customer.id,
             )
             history = await repository.load_conversation_messages(conversation.id)
+            latest_assistant_text = self._extract_latest_assistant_text(history)
+            pending_customer_message = await repository.get_pending_customer_message(conversation.id)
+            current_order_before_run = await repository.get_current_order(
+                customer.id,
+                conversation.id,
+                create_if_missing=False,
+            )
+            latest_order_before_run = await repository.get_latest_order(
+                customer.id,
+                conversation.id,
+            )
             customer = await self._capture_customer_name_from_message(
                 repository=repository,
                 customer=customer,
                 history=history,
                 message_text=message_text,
             )
-            availability = await repository.get_store_availability(timezone_name=self.settings.store_timezone)
-            turn_policy = self._analyze_turn_policy(message_text)
-            deps = AssistantDeps(
-                settings=self.settings,
-                session_factory=self.session_factory,
-                customer_id=customer.id,
-                conversation_id=conversation.id,
-                turn_context_hint=self._build_turn_context_hint(
-                    customer=customer,
-                    message_text=message_text,
-                ),
-                allow_order_mutations=turn_policy.allow_order_mutations,
-                allow_order_confirmation=turn_policy.allow_order_confirmation,
+            availability = await repository.get_store_availability(
+                timezone_name=self.settings.store_timezone,
+                store_id=resolved_store_id,
             )
-
-            direct_reply = await self._maybe_handle_missing_customer_name(
+            name_handling = await self._maybe_handle_missing_customer_name(
                 repository=repository,
                 customer=customer,
                 conversation_id=conversation.id,
                 history=history,
                 message_text=message_text,
                 availability=availability,
+                pending_customer_message=pending_customer_message,
+                latest_assistant_text=latest_assistant_text,
             )
-            if direct_reply is not None:
+            if name_handling.direct_reply is not None:
                 await session.commit()
-                return direct_reply
+                return name_handling.direct_reply
+
+            customer = name_handling.customer
+            resumed_pending_message = name_handling.resumed_pending_message
+            turn_policy = self._analyze_turn_policy(
+                resumed_pending_message or message_text,
+                current_order=current_order_before_run,
+            )
+            deps = AssistantDeps(
+                settings=self.settings,
+                session_factory=self.session_factory,
+                store_id=resolved_store_id,
+                customer_id=customer.id,
+                conversation_id=conversation.id,
+                turn_context_hint=self._build_turn_context_hint(
+                    customer=customer,
+                    message_text=message_text,
+                    current_order=current_order_before_run,
+                    pending_customer_message=resumed_pending_message,
+                ),
+                allow_order_mutations=turn_policy.allow_order_mutations,
+                allow_order_confirmation=turn_policy.allow_order_confirmation,
+            )
 
             await session.commit()
             customer_id = customer.id
             conversation_id = conversation.id
 
         active_model = model if model is not None else build_google_model(self.settings)
-        result = await self.agent.run(
-            message_text,
-            deps=deps,
-            message_history=history,
-            model=active_model,
-        )
+        try:
+            result = await self._run_agent_with_retries(
+                run_context=ModelRunContext(
+                    message_text=message_text,
+                    deps=deps,
+                    history=history,
+                    model=active_model,
+                    external_user_id=external_user_id,
+                    conversation_id=conversation_id,
+                ),
+            )
+        except TimeoutError:
+            return await self._build_model_unavailable_result(
+                conversation_id=conversation_id,
+                customer=customer,
+                user_text=message_text,
+            )
+        except Exception as error:
+            if isinstance(error, (InformationalTurnMutationError, MissingConfirmationSignalError)):
+                raise
+            return await self._build_model_unavailable_result(
+                conversation_id=conversation_id,
+                customer=customer,
+                user_text=message_text,
+            )
 
         async with self.session_factory() as session:
             repository = BusinessRepository(session)
             await repository.append_conversation_messages(conversation_id, result.new_messages())
             refreshed_customer = await repository.get_customer(customer_id)
+            store = await repository.get_store_profile(store_id=resolved_store_id)
             current_order = await repository.get_latest_order(
                 customer_id,
                 conversation_id,
             )
-            reply = self._decorate_reply_with_store_availability(result.output, availability)
-            reply = self._ground_reply_for_turn_policy(reply, turn_policy)
+            schedule_error_text: str | None = None
+            requested_ready_at = self._extract_requested_ready_at(
+                message_text,
+                timezone_name=self.settings.store_timezone,
+            )
+            if requested_ready_at is not None and current_order is not None and current_order.items:
+                try:
+                    current_order = await repository.set_order_requested_ready_at(
+                        customer_id,
+                        conversation_id,
+                        requested_ready_at,
+                        timezone_name=self.settings.store_timezone,
+                        store_id=resolved_store_id,
+                    )
+                except ValueError as error:
+                    schedule_error_text = str(error)
+            delay = (
+                await repository.get_estimated_delay(customer_id, conversation_id)
+                if current_order is not None and current_order.items
+                else None
+            )
+            reply = result.output
+            if schedule_error_text is not None:
+                reply = AssistantReply(
+                    reply_text=schedule_error_text,
+                    next_step=self._next_step_for_current_order(current_order),
+                    handoff=False,
+                )
+            reply = self._decorate_reply_with_store_availability(
+                reply,
+                availability,
+                conversation_id=conversation_id,
+                latest_assistant_text=latest_assistant_text,
+                current_order=current_order,
+            )
+            reply = self._ground_reply_for_turn_policy(reply, turn_policy, current_order=current_order)
+            if schedule_error_text is None:
+                reply = self._guide_reply_with_current_order(
+                    reply,
+                    customer=refreshed_customer,
+                    current_order=current_order,
+                    delay=delay,
+                )
+                reply = self._finalize_confirmed_order_reply(
+                    reply,
+                    customer=refreshed_customer,
+                    current_order=current_order,
+                    delay=delay,
+                    store=store,
+                    just_confirmed=(
+                        current_order is not None
+                        and current_order.status.value == "confirmed"
+                        and (latest_order_before_run is None or latest_order_before_run.status.value != "confirmed")
+                    ),
+                    availability=availability,
+                    conversation_id=conversation_id,
+                    latest_assistant_text=latest_assistant_text,
+                )
             if not turn_policy.allow_order_mutations:
                 current_order = None
             await session.commit()
@@ -503,18 +768,29 @@ class OrderingAssistantService:
         history: list[ModelMessage],
         message_text: str,
         availability: StoreAvailabilitySnapshot,
-    ) -> AssistantTurnResult | None:
+        pending_customer_message: str | None,
+        latest_assistant_text: str | None,
+    ) -> NameHandlingResult:
         """Handle the initial name-capture flow deterministically before invoking the model."""
         if customer.name is not None:
-            return None
+            return NameHandlingResult(customer=customer)
 
         if self._is_waiting_for_name(history):
             if name := self._extract_customer_name(message_text):
                 updated_customer = await repository.update_customer_name(customer.id, name)
+                if pending_customer_message is not None:
+                    await repository.set_pending_customer_message(conversation_id, None)
+                    return NameHandlingResult(
+                        customer=updated_customer,
+                        resumed_pending_message=pending_customer_message,
+                    )
+
                 reply = AssistantReply(
                     reply_text=self._decorate_closed_store_text(
                         NAME_CONFIRMATION_TEMPLATE.format(name=updated_customer.name),
                         availability,
+                        conversation_id=conversation_id,
+                        latest_assistant_text=latest_assistant_text,
                     ),
                     next_step=AssistantNextStep.CHOOSE_ITEMS,
                     handoff=False,
@@ -525,17 +801,22 @@ class OrderingAssistantService:
                     user_text=message_text,
                     reply_text=reply.reply_text,
                 )
-                return AssistantTurnResult(
-                    conversation_id=conversation_id,
+                return NameHandlingResult(
                     customer=updated_customer,
-                    reply=reply,
-                    current_order=None,
+                    direct_reply=AssistantTurnResult(
+                        conversation_id=conversation_id,
+                        customer=updated_customer,
+                        reply=reply,
+                        current_order=None,
+                    ),
                 )
 
             reply = AssistantReply(
                 reply_text=self._decorate_closed_store_text(
-                    "🙂 Necesito tu nombre para seguir con el pedido. ¿Cómo te llamás?",
+                    "🙂 Necesito tu nombre para seguir con lo que me pediste. ¿Cómo te llamás?",
                     availability,
+                    conversation_id=conversation_id,
+                    latest_assistant_text=latest_assistant_text,
                 ),
                 next_step=AssistantNextStep.ASK_NAME,
                 handoff=False,
@@ -546,17 +827,27 @@ class OrderingAssistantService:
                 user_text=message_text,
                 reply_text=reply.reply_text,
             )
-            return AssistantTurnResult(
-                conversation_id=conversation_id,
+            return NameHandlingResult(
                 customer=customer,
-                reply=reply,
-                current_order=None,
+                direct_reply=AssistantTurnResult(
+                    conversation_id=conversation_id,
+                    customer=customer,
+                    reply=reply,
+                    current_order=None,
+                ),
             )
 
+        if self._should_store_pending_message_before_name(message_text):
+            await repository.set_pending_customer_message(conversation_id, message_text)
         reply = AssistantReply(
             reply_text=self._decorate_closed_store_text(
-                self._build_name_prompt(conversation_id=conversation_id),
+                self._build_name_prompt(
+                    conversation_id=conversation_id,
+                    remembers_pending_message=self._should_store_pending_message_before_name(message_text),
+                ),
                 availability,
+                conversation_id=conversation_id,
+                latest_assistant_text=latest_assistant_text,
             ),
             next_step=AssistantNextStep.ASK_NAME,
             handoff=False,
@@ -567,11 +858,14 @@ class OrderingAssistantService:
             user_text=message_text,
             reply_text=reply.reply_text,
         )
-        return AssistantTurnResult(
-            conversation_id=conversation_id,
+        return NameHandlingResult(
             customer=customer,
-            reply=reply,
-            current_order=None,
+            direct_reply=AssistantTurnResult(
+                conversation_id=conversation_id,
+                customer=customer,
+                reply=reply,
+                current_order=None,
+            ),
         )
 
     async def _capture_customer_name_from_message(
@@ -656,7 +950,20 @@ class OrderingAssistantService:
 
     def _extract_customer_name(self, message_text: str) -> str | None:
         """Extract a customer name from either a short reply or a longer introduction."""
-        return self._extract_name_candidate(message_text) or self._extract_name_from_introduction(message_text)
+        return self._extract_name_from_introduction(message_text) or self._extract_name_candidate(message_text)
+
+    def _should_store_pending_message_before_name(self, message_text: str) -> bool:
+        """Return whether an unnamed first turn already contains useful order intent to resume later."""
+        lowered = message_text.casefold()
+        if not lowered.strip():
+            return False
+        if any(hint in lowered for hint in ORDER_INTENT_HINTS):
+            return True
+        if any(hint in lowered for hint in INFORMATIONAL_MENU_HINTS):
+            return True
+        if self._message_requests_total(message_text):
+            return True
+        return any(keyword in lowered for keyword in ("bebida", "postre", "combo", "hamburguesa", "pizza", "empanada"))
 
     def _extract_name_from_introduction(self, message_text: str) -> str | None:
         """Extract a first name from a longer self-introduction message."""
@@ -693,15 +1000,20 @@ class OrderingAssistantService:
             return None
         return candidate_tokens[0].title()
 
-    def _analyze_turn_policy(self, message_text: str) -> TurnPolicy:
+    def _analyze_turn_policy(self, message_text: str, *, current_order: OrderSnapshot | None) -> TurnPolicy:
         """Return deterministic mutation/confirmation guardrails for the current turn."""
         lowered = message_text.casefold()
         has_order_intent = any(hint in lowered for hint in ORDER_INTENT_HINTS)
         asks_menu_information = any(hint in lowered for hint in INFORMATIONAL_MENU_HINTS)
         explicit_confirmation = any(hint in lowered for hint in EXPLICIT_CONFIRMATION_HINTS)
+        payment_hint = self._detect_payment_method_hint(message_text)
 
         allow_order_mutations = has_order_intent or not asks_menu_information
-        allow_order_confirmation = explicit_confirmation or has_order_intent
+        allow_order_confirmation = (
+            explicit_confirmation
+            or has_order_intent
+            or (payment_hint is not None and current_order is not None and bool(current_order.items))
+        )
         return TurnPolicy(
             allow_order_mutations=allow_order_mutations,
             allow_order_confirmation=allow_order_confirmation,
@@ -712,6 +1024,8 @@ class OrderingAssistantService:
         *,
         customer: CustomerSnapshot,
         message_text: str,
+        current_order: OrderSnapshot | None,
+        pending_customer_message: str | None = None,
     ) -> str | None:
         """Build safe guidance for dense first-turn customer messages."""
         hints: list[str] = []
@@ -743,12 +1057,58 @@ class OrderingAssistantService:
                 "El cliente quiere saber cuánto sale en este mismo turno. "
                 "Si ya podés calcularlo con herramientas, informá el total o subtotal actual."
             )
+        if pending_customer_message is not None:
+            hints.append(
+                "Antes de identificarse, el cliente dejó una consulta pendiente: "
+                f"'{pending_customer_message}'. "
+                "Retomá eso ahora sin volver a preguntarle qué quiere."
+            )
+        hints.extend(self._build_current_order_context_hints(customer=customer, current_order=current_order))
 
         if not hints:
             return None
         return " ".join(hints)
 
-    def _ground_reply_for_turn_policy(self, reply: AssistantReply, turn_policy: TurnPolicy) -> AssistantReply:
+    def _build_current_order_context_hints(
+        self,
+        *,
+        customer: CustomerSnapshot,
+        current_order: OrderSnapshot | None,
+    ) -> list[str]:
+        """Describe the current draft and the next missing checkout field."""
+        if current_order is None or not current_order.items:
+            return []
+
+        items_text = ", ".join(f"{item.quantity} x {item.name}" for item in current_order.items)
+        hints = [f"Pedido en curso: {items_text}. Total actual: {current_order.total_amount_display}."]
+        if current_order.requested_ready_at is not None:
+            ready_text = self._describe_order_ready_time(current_order.requested_ready_at)
+            hints.append(f"El cliente pidió tenerlo listo {ready_text}.")
+        if current_order.delivery_type is None:
+            hints.append("Antes de confirmar, falta definir si es envío o retiro.")
+            return hints
+
+        if current_order.delivery_type == DeliveryType.DELIVERY and current_order.delivery_address is None:
+            if customer.default_address:
+                hints.append(
+                    "Falta confirmar la dirección de envío. "
+                    f"Dirección conocida del cliente: {customer.default_address}."
+                )
+            else:
+                hints.append("Falta pedir la dirección de envío antes de confirmar.")
+            return hints
+
+        if current_order.payment_method is None:
+            hints.append("Falta definir el medio de pago antes de confirmar.")
+        return hints
+
+    def _ground_reply_for_turn_policy(
+        self,
+        reply: AssistantReply,
+        turn_policy: TurnPolicy,
+        *,
+        current_order: OrderSnapshot | None,
+    ) -> AssistantReply:
         """Strip unsupported order-completion claims from informational turns."""
         if turn_policy.allow_order_mutations:
             return reply
@@ -763,9 +1123,11 @@ class OrderingAssistantService:
         ]
         if safe_sentences:
             safe_text = " ".join(safe_sentences)
+        elif current_order is not None and current_order.items:
+            safe_text = "Puedo contarte las opciones y los precios, pero no hice cambios en tu pedido en este mensaje."
         else:
             safe_text = "Puedo contarte las opciones y los precios, pero todavía no armé ningún pedido."
-        if "todavía no armé ningún pedido" not in safe_text.casefold():
+        if current_order is None and "todavía no armé ningún pedido" not in safe_text.casefold():
             safe_text = f"{safe_text} Todavía no armé ningún pedido."
         return reply.model_copy(
             update={
@@ -773,6 +1135,63 @@ class OrderingAssistantService:
                 "next_step": AssistantNextStep.CHOOSE_ITEMS,
             }
         )
+
+    def _guide_reply_with_current_order(
+        self,
+        reply: AssistantReply,
+        *,
+        customer: CustomerSnapshot,
+        current_order: OrderSnapshot | None,
+        delay: DelayEstimateSnapshot | None,
+    ) -> AssistantReply:
+        """Prefer deterministic checkout guidance once a draft already exists."""
+        if current_order is None or not current_order.items or current_order.status.value != "draft":
+            return reply
+
+        timing_text = self._build_timing_prompt_fragment(current_order=current_order, delay=delay)
+        if current_order.delivery_type is None:
+            item_summary = ", ".join(f"{item.quantity} x {item.name}" for item in current_order.items)
+            template = self._pick_variant(DELIVERY_PROMPT_VARIANTS, seed=current_order.id)
+            return reply.model_copy(
+                update={
+                    "reply_text": template.format(
+                        lead=self._pick_lead_phrase(current_order.id),
+                        name=customer.name or "che",
+                        items=item_summary,
+                        total=current_order.total_amount_display,
+                        timing_text=timing_text,
+                    ),
+                    "next_step": AssistantNextStep.CHOOSE_DELIVERY,
+                }
+            )
+
+        if current_order.delivery_type == DeliveryType.DELIVERY and current_order.delivery_address is None:
+            if customer.default_address:
+                template = self._pick_variant(ADDRESS_PROMPT_VARIANTS, seed=current_order.id)
+                reply_text = template.format(address=customer.default_address)
+            else:
+                reply_text = "Dale. Pasame la dirección de envío, por favor."
+            return reply.model_copy(
+                update={
+                    "reply_text": reply_text,
+                    "next_step": AssistantNextStep.ASK_ADDRESS,
+                }
+            )
+
+        if current_order.payment_method is None:
+            template = self._pick_variant(PAYMENT_PROMPT_VARIANTS, seed=current_order.id)
+            return reply.model_copy(
+                update={
+                    "reply_text": template.format(
+                        lead=self._pick_lead_phrase(current_order.id + 1),
+                        total=current_order.total_amount_display,
+                        timing_text=timing_text,
+                    ),
+                    "next_step": AssistantNextStep.CHOOSE_PAYMENT,
+                }
+            )
+
+        return reply
 
     def _detect_payment_method_hint(self, message_text: str) -> PaymentMethod | None:
         """Infer payment intent from common Argentine customer phrasing."""
@@ -827,32 +1246,219 @@ class OrderingAssistantService:
             )
         )
 
-    def _build_name_prompt(self, *, conversation_id: int) -> str:
+    def _build_name_prompt(self, *, conversation_id: int, remembers_pending_message: bool = False) -> str:
         """Build the first-contact greeting asking for the customer's name."""
         template = NAME_PROMPT_VARIANTS[conversation_id % len(NAME_PROMPT_VARIANTS)]
-        return template.format(
+        prompt = template.format(
             bot_name=self.settings.bot_name,
             store_name=self.settings.store_name,
         )
+        if not remembers_pending_message:
+            return prompt
+        return f"{prompt} Así sigo con lo que me pediste recién."
 
     def _decorate_reply_with_store_availability(
         self,
         reply: AssistantReply,
         availability: StoreAvailabilitySnapshot,
+        *,
+        conversation_id: int,
+        latest_assistant_text: str | None,
+        current_order: OrderSnapshot | None,
     ) -> AssistantReply:
         """Prefix replies when the store is currently closed."""
         if availability.is_open:
             return reply
+        if current_order is not None and (
+            current_order.requested_ready_at is not None or current_order.status.value == "confirmed"
+        ):
+            return reply
         return reply.model_copy(
             update={
-                "reply_text": self._decorate_closed_store_text(reply.reply_text, availability),
+                "reply_text": self._decorate_closed_store_text(
+                    reply.reply_text,
+                    availability,
+                    conversation_id=conversation_id,
+                    latest_assistant_text=latest_assistant_text,
+                ),
             }
         )
 
-    def _decorate_closed_store_text(self, reply_text: str, availability: StoreAvailabilitySnapshot) -> str:
+    def _decorate_closed_store_text(
+        self,
+        reply_text: str,
+        availability: StoreAvailabilitySnapshot,
+        *,
+        conversation_id: int = 0,
+        latest_assistant_text: str | None = None,
+    ) -> str:
         """Prefix a reply with the store-closed notice when needed."""
         if availability.is_open:
             return reply_text
-        if reply_text.startswith(availability.message_text):
+        if self._contains_recent_closed_store_notice(reply_text):
             return reply_text
-        return CLOSED_STORE_PREFIX.format(message_text=availability.message_text) + reply_text
+        if self._contains_recent_closed_store_notice(latest_assistant_text):
+            return reply_text
+        message_text = self._build_closed_store_notice(availability, conversation_id=conversation_id)
+        if reply_text.startswith(message_text):
+            return reply_text
+        return f"{message_text}{reply_text}"
+
+    def _finalize_confirmed_order_reply(  # noqa: PLR0913
+        self,
+        reply: AssistantReply,
+        *,
+        customer: CustomerSnapshot,
+        current_order: OrderSnapshot | None,
+        delay: DelayEstimateSnapshot | None,
+        store: StoreProfileSnapshot,
+        just_confirmed: bool,
+        availability: StoreAvailabilitySnapshot,
+        conversation_id: int,
+        latest_assistant_text: str | None,
+    ) -> AssistantReply:
+        """Replace free-form model confirmations with a consistent final summary."""
+        if current_order is None or current_order.status.value != "confirmed" or not just_confirmed:
+            return reply
+
+        item_lines = "\n".join(f"- {item.quantity} x {item.name}" for item in current_order.items)
+        delivery_text = (
+            f"Envío a {current_order.delivery_address}"
+            if current_order.delivery_type == DeliveryType.DELIVERY
+            else "Retiro por el local"
+        )
+        assert current_order.payment_method is not None
+        payment_text = {
+            PaymentMethod.CASH: "Efectivo",
+            PaymentMethod.CARD_LINK: "Link de pago",
+            PaymentMethod.TRANSFER: "Transferencia",
+        }[current_order.payment_method]
+
+        schedule_block = ""
+        if current_order.requested_ready_at is not None:
+            ready_text = self._describe_order_ready_time(current_order.requested_ready_at)
+            schedule_block = f"\n**Horario**\nPedido programado para {ready_text}."
+            if current_order.preparation_starts_at is not None:
+                start_text = self._format_local_time(current_order.preparation_starts_at)
+                schedule_block += f"\nEmpezamos a prepararlo cerca de las {start_text}."
+        elif delay is not None:
+            schedule_block = f"\n**Demora estimada**\n{delay.display_text.capitalize()}."
+
+        payment_block = f"\n**Pago**\n{payment_text}"
+        if current_order.payment_method is PaymentMethod.TRANSFER and store.transfer_alias:
+            payment_block += f" a `{store.transfer_alias}`"
+        payment_block += "."
+
+        reply_text = (
+            f"Listo, {customer.name or 'te confirmo'}.\n\n"
+            f"**Pedido**\n{item_lines}\n\n"
+            f"**Entrega**\n{delivery_text}\n"
+            f"{schedule_block}\n"
+            f"{payment_block}\n\n"
+            f"**Total**\n{current_order.total_amount_display}"
+        )
+        if not availability.is_open and current_order.requested_ready_at is None:
+            reply_text = self._decorate_closed_store_text(
+                reply_text,
+                availability,
+                conversation_id=conversation_id,
+                latest_assistant_text=latest_assistant_text,
+            )
+
+        return reply.model_copy(
+            update={
+                "reply_text": reply_text,
+                "next_step": AssistantNextStep.COMPLETE,
+            }
+        )
+
+    def _next_step_for_current_order(self, current_order: OrderSnapshot | None) -> AssistantNextStep:
+        """Infer the next deterministic checkout step from the current order state."""
+        if current_order is None or not current_order.items:
+            return AssistantNextStep.CHOOSE_ITEMS
+        if current_order.delivery_type is None:
+            return AssistantNextStep.CHOOSE_DELIVERY
+        if current_order.delivery_type == DeliveryType.DELIVERY and current_order.delivery_address is None:
+            return AssistantNextStep.ASK_ADDRESS
+        if current_order.payment_method is None:
+            return AssistantNextStep.CHOOSE_PAYMENT
+        return AssistantNextStep.COMPLETE
+
+    def _build_timing_prompt_fragment(
+        self,
+        *,
+        current_order: OrderSnapshot,
+        delay: DelayEstimateSnapshot | None,
+    ) -> str:
+        """Describe either a scheduled ready time or the current estimated delay."""
+        if current_order.requested_ready_at is not None:
+            return f" Lo dejo programado para {self._describe_order_ready_time(current_order.requested_ready_at)}."
+        if delay is not None:
+            return f" La demora estimada es de {delay.display_text}."
+        return ""
+
+    def _extract_requested_ready_at(self, message_text: str, *, timezone_name: str) -> datetime | None:
+        """Parse a customer request such as `para las 12` into a timezone-aware datetime."""
+        normalized = " ".join(message_text.split())
+        if not normalized:
+            return None
+
+        match = None
+        for pattern in REQUESTED_READY_TIME_PATTERNS:
+            if candidate := pattern.search(normalized):
+                match = candidate
+                break
+        if match is None:
+            return None
+
+        hour = int(match.group("hour"))
+        minute_text = match.groupdict().get("minute")
+        minute = int(minute_text) if minute_text is not None else 0
+        if hour > MAX_SCHEDULE_HOUR or minute > MAX_SCHEDULE_MINUTE:
+            return None
+
+        zone = ZoneInfo(timezone_name)
+        local_now = datetime.now(zone).replace(second=0, microsecond=0)
+        local_target = local_now.replace(hour=hour, minute=minute)
+        mentions_tomorrow = "mañana" in normalized.casefold() or "manana" in normalized.casefold()
+        if mentions_tomorrow or local_target <= local_now:
+            local_target = local_target + timedelta(days=1)
+        return local_target.astimezone(UTC)
+
+    def _describe_order_ready_time(self, value: datetime) -> str:
+        """Describe a UTC timestamp using today, tomorrow, or weekday in store time."""
+        zone = ZoneInfo(self.settings.store_timezone)
+        local_now = datetime.now(zone)
+        local_value = value.astimezone(zone)
+        if local_value.date() == local_now.date():
+            day_text = "hoy"
+        elif local_value.date() == (local_now + timedelta(days=1)).date():
+            day_text = "mañana"
+        else:
+            day_text = f"el {WEEKDAY_LABELS_ES[local_value.weekday()]}"
+        return f"{day_text} a las {local_value.strftime('%H:%M')}"
+
+    def _format_local_time(self, value: datetime) -> str:
+        """Format a UTC timestamp as a local `HH:MM` string."""
+        return value.astimezone(ZoneInfo(self.settings.store_timezone)).strftime("%H:%M")
+
+    def _build_closed_store_notice(self, availability: StoreAvailabilitySnapshot, *, conversation_id: int) -> str:
+        """Select a slightly different closed-store notice for each conversation."""
+        next_open_text = availability.next_open_text or "pronto"
+        template = self._pick_variant(CLOSED_STORE_NOTICE_VARIANTS, seed=conversation_id)
+        return template.format(next_open_text=next_open_text)
+
+    def _contains_recent_closed_store_notice(self, latest_assistant_text: str | None) -> bool:
+        """Avoid repeating the same closed-store notice in consecutive turns."""
+        if latest_assistant_text is None:
+            return False
+        lowered = latest_assistant_text.casefold()
+        return "cerrad" in lowered and "abrimos" in lowered
+
+    def _pick_variant(self, variants: tuple[str, ...], *, seed: int) -> str:
+        """Choose one deterministic variant without adding randomness to tests."""
+        return variants[seed % len(variants)]
+
+    def _pick_lead_phrase(self, seed: int) -> str:
+        """Return a short natural lead-in that avoids repeating a single filler."""
+        return ("Dale", "Perfecto", "Buenísimo")[seed % 3]

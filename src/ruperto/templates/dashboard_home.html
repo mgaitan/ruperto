@@ -1,0 +1,110 @@
+{% extends "dashboard_base.html" %}
+
+{% block content %}
+<section class="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+    <article class="rounded-[2rem] border border-white/70 bg-white/85 p-5 shadow-card backdrop-blur">
+        <p class="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">Pedidos recientes</p>
+        <p class="mt-3 text-4xl font-semibold">{{ stats.orders }}</p>
+        <p class="mt-2 text-sm text-slate-500">Últimos pedidos registrados en el flujo actual.</p>
+    </article>
+    <article class="rounded-[2rem] border border-white/70 bg-slate-950 p-5 text-white shadow-card">
+        <p class="text-xs font-semibold uppercase tracking-[0.22em] text-slate-300">Clientes</p>
+        <p class="mt-3 text-4xl font-semibold">{{ stats.customers }}</p>
+        <p class="mt-2 text-sm text-slate-300">Contactos conocidos por el sistema.</p>
+    </article>
+    <article class="rounded-[2rem] border border-white/70 bg-white/85 p-5 shadow-card backdrop-blur">
+        <p class="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">Productos disponibles</p>
+        <p class="mt-3 text-4xl font-semibold">{{ stats.available_menu_items }}</p>
+        <p class="mt-2 text-sm text-slate-500">Ítems activos hoy en la carta.</p>
+    </article>
+    <article class="rounded-[2rem] border border-white/70 bg-white/85 p-5 shadow-card backdrop-blur">
+        <p class="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">Catálogo total</p>
+        <p class="mt-3 text-4xl font-semibold">{{ stats.catalog_items }}</p>
+        <p class="mt-2 text-sm text-slate-500">Cantidad de productos cargados.</p>
+    </article>
+</section>
+
+<section class="rounded-[2rem] border border-white/70 bg-white/85 p-6 shadow-card backdrop-blur">
+    <div class="flex items-center justify-between gap-4">
+        <div>
+            <p class="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">Operación</p>
+            <h3 class="mt-2 text-2xl font-semibold">Pedidos recientes</h3>
+        </div>
+        <span class="rounded-full bg-amber-100 px-4 py-2 text-xs font-semibold uppercase tracking-[0.2em] text-amber-800">
+            En vivo
+        </span>
+    </div>
+    <div class="mt-6 space-y-4">
+        {% for order in orders %}
+        <article class="rounded-3xl border border-slate-200 bg-white p-5">
+            <div class="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+                <div class="space-y-3">
+                    <div class="flex flex-wrap items-center gap-3">
+                        <span class="text-lg font-semibold">Pedido #{{ order.id }}</span>
+                        <span class="rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] {{ order.status_style }}">
+                            {{ order.status_label }}
+                        </span>
+                    </div>
+                    <p class="text-sm text-slate-600">{{ order.item_summary }}</p>
+                    <dl class="grid gap-3 text-sm text-slate-600 sm:grid-cols-2 xl:grid-cols-3">
+                        <div>
+                            <dt class="font-semibold text-slate-900">Entrega</dt>
+                            <dd>{{ order.delivery_type }}</dd>
+                        </div>
+                        <div>
+                            <dt class="font-semibold text-slate-900">Pago</dt>
+                            <dd>{{ order.payment_method }}</dd>
+                        </div>
+                        <div>
+                            <dt class="font-semibold text-slate-900">Total</dt>
+                            <dd>{{ order.total_amount_display }}</dd>
+                        </div>
+                        <div>
+                            <dt class="font-semibold text-slate-900">Dirección</dt>
+                            <dd>{{ order.delivery_address }}</dd>
+                        </div>
+                        <div>
+                            <dt class="font-semibold text-slate-900">Listo para</dt>
+                            <dd>{{ order.requested_ready_at or "Sin horario programado" }}</dd>
+                        </div>
+                        <div>
+                            <dt class="font-semibold text-slate-900">Preparar desde</dt>
+                            <dd>{{ order.preparation_starts_at or "Automático" }}</dd>
+                        </div>
+                    </dl>
+                </div>
+                <form
+                    action="/dashboard/orders/{{ order.id }}/status"
+                    method="post"
+                    class="flex w-full flex-col gap-3 xl:max-w-xs"
+                >
+                    <label class="space-y-2 text-sm font-medium text-slate-700">
+                        <span>Estado operativo</span>
+                        <select
+                            class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                            name="status"
+                        >
+                            {% for option in order_statuses %}
+                            <option value="{{ option.value }}" {% if option.value == order.status.value %}selected{% endif %}>
+                                {{ option.label }}
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                    <button
+                        class="rounded-full bg-ember px-5 py-3 text-sm font-semibold text-white transition hover:bg-orange-600"
+                        type="submit"
+                    >
+                        Actualizar pedido
+                    </button>
+                </form>
+            </div>
+        </article>
+        {% else %}
+        <article class="rounded-3xl border border-dashed border-slate-300 bg-slate-50 p-6 text-sm text-slate-600">
+            Todavía no hay pedidos. Cuando el asistente confirme uno, va a aparecer acá.
+        </article>
+        {% endfor %}
+    </div>
+</section>
+{% endblock %}
