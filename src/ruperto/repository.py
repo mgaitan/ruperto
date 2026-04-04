@@ -41,6 +41,7 @@ from ruperto.schemas import (
     StoreAvailabilitySnapshot,
     StoreBusinessHoursSnapshot,
     StoreProfileSnapshot,
+    StoreProfileUpdateRequest,
     format_price_ars,
 )
 
@@ -186,6 +187,25 @@ class BusinessRepository:
         """Return the single store profile used by the MVP."""
         row = await self.session.scalar(select(StoreProfile).where(StoreProfile.id == store_id))
         assert row is not None
+        return StoreProfileSnapshot.model_validate(row)
+
+    async def update_store_profile(
+        self,
+        payload: StoreProfileUpdateRequest,
+        *,
+        store_id: int = 1,
+    ) -> StoreProfileSnapshot:
+        """Persist the editable store profile used by staff and the assistant."""
+        row = await self.session.scalar(select(StoreProfile).where(StoreProfile.id == store_id))
+        assert row is not None
+        row.store_name = payload.store_name.strip()
+        row.bot_name = payload.bot_name.strip()
+        row.store_location = self._normalize_optional_text(payload.store_location)
+        row.store_description = payload.store_description.strip()
+        row.assistant_personality = payload.assistant_personality.strip()
+        row.transfer_alias = self._normalize_optional_text(payload.transfer_alias)
+        row.updated_at = utc_now()
+        await self.session.flush()
         return StoreProfileSnapshot.model_validate(row)
 
     async def list_store_business_hours(self, *, store_id: int = 1) -> list[StoreBusinessHoursSnapshot]:
@@ -986,3 +1006,10 @@ class BusinessRepository:
             return None
         hour_text, minute_text = value.split(":")
         return time(hour=int(hour_text), minute=int(minute_text))
+
+    def _normalize_optional_text(self, value: str | None) -> str | None:
+        """Normalize optional text fields by trimming and collapsing empties."""
+        if value is None:
+            return None
+        cleaned = value.strip()
+        return cleaned or None

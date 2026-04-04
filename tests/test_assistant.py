@@ -1545,6 +1545,36 @@ async def test_closed_store_text_helpers_cover_open_and_exact_prefix(tmp_path: P
     await runtime.engine.dispose()
 
 
+async def test_closed_store_text_helpers_cover_recent_notice_branches(tmp_path: Path):
+    """Closed-store helpers should skip re-prefixing when the notice was already sent recently."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    availability = StoreAvailabilitySnapshot(
+        is_open=False,
+        message_text="Ahora estamos cerrados 😴 Abrimos mañana a las 11:00.",
+        next_open_text="mañana a las 11:00",
+    )
+    reply = AssistantReply(reply_text="Seguimos con el pedido", next_step=AssistantNextStep.CHOOSE_ITEMS, handoff=False)
+
+    decorated_reply = service._decorate_reply_with_store_availability(
+        reply,
+        availability,
+        conversation_id=1,
+        latest_assistant_text=None,
+        current_order=None,
+    )
+    recent_notice = service._decorate_closed_store_text(
+        "Seguimos con el pedido",
+        availability,
+        latest_assistant_text="Ahora estamos cerrados 😴 Abrimos mañana a las 11:00. Hola",
+    )
+
+    assert "cerrad" in decorated_reply.reply_text.lower()
+    assert recent_notice == "Seguimos con el pedido"
+
+    await runtime.engine.dispose()
+
+
 async def test_scheduling_and_next_step_helpers_cover_remaining_branches(tmp_path: Path):
     """Scheduling helpers should parse tomorrow, reject invalid hours, and infer next steps."""
     runtime = create_database_runtime(build_settings(tmp_path))

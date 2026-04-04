@@ -43,6 +43,7 @@ Then open:
 
 - `http://127.0.0.1:8000/`
 - `http://127.0.0.1:8000/healthz`
+- `http://127.0.0.1:8000/dashboard`
 - `http://127.0.0.1:8000/api/store-profile`
 - `http://127.0.0.1:8000/api/store-hours`
 - `http://127.0.0.1:8000/api/menu-items`
@@ -118,6 +119,10 @@ curl -X PUT http://127.0.0.1:8000/api/store-hours \
 
 When the store is currently closed, customer replies mention the next opening
 time automatically.
+The same backend also exposes a simple Tailwind dashboard for staff at
+`/dashboard`. The first version is intentionally small: it shows recent
+orders and customers, lets staff move order statuses, and provides HTML forms
+to update the store profile and weekly opening hours.
 
 ## 4. Run quality checks
 

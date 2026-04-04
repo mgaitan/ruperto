@@ -43,6 +43,7 @@ You should then have:
 
 - API root at `http://127.0.0.1:8000/`
 - health check at `http://127.0.0.1:8000/healthz`
+- staff dashboard at `http://127.0.0.1:8000/dashboard`
 - store profile at `http://127.0.0.1:8000/api/store-profile`
 - menu listing at `http://127.0.0.1:8000/api/menu-items`
 - development chat endpoint at `http://127.0.0.1:8000/api/dev/messages`
@@ -61,6 +62,9 @@ If a customer asks for a later ready time such as `para las 12`, the backend
 can now keep the order scheduled for that slot, store when preparation should
 start, and include the configured transfer alias when the payment method is
 `transferencia`.
+The backend also serves a simple Tailwind staff dashboard at `/dashboard` so
+the team can review recent orders, adjust order statuses, and edit store and
+bot settings without calling the API by hand.
 The demo catalog now includes a broader synthetic menu with pizzas,
 hamburgers, lomitos, milanesas, wraps, empanadas, drinks, and desserts so
 local development can exercise more realistic ordering conversations and

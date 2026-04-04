@@ -16,7 +16,7 @@ from ruperto.config import Settings
 from ruperto.db import DatabaseRuntime, create_database_runtime, init_database
 from ruperto.models import Channel, DeliveryType, MenuItem, OrderStatus, PaymentMethod
 from ruperto.repository import BusinessRepository, normalize_phone_number
-from ruperto.schemas import StoreBusinessHoursSnapshot
+from ruperto.schemas import StoreBusinessHoursSnapshot, StoreProfileUpdateRequest
 
 pytestmark = pytest.mark.anyio
 EXPECTED_HISTORY_MESSAGES = 2
@@ -81,6 +81,28 @@ async def test_bootstrap_seeds_store_menu_and_empty_memory(tmp_path: Path):
     assert normalize_phone_number("+54 351-555-7788") == "+543515557788"
     assert normalize_phone_number("351 555 7788") == "3515557788"
     assert normalize_phone_number("   ") is None
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_profile_can_be_updated_with_empty_optional_fields(tmp_path: Path):
+    """Store customization trims optional empty fields down to null."""
+    repository, runtime = await build_repository(tmp_path)
+
+    updated = await repository.update_store_profile(
+        StoreProfileUpdateRequest(
+            store_name="Panel Rotisería",
+            bot_name="Panel Bot",
+            store_location=None,
+            store_description="Updated from the dashboard.",
+            assistant_personality="Steady and direct.",
+            transfer_alias=None,
+        )
+    )
+
+    assert updated.store_name == "Panel Rotisería"
+    assert updated.store_location is None
+    assert updated.transfer_alias is None
 
     await close_repository(repository, runtime)
 

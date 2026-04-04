@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -11,12 +12,13 @@ from pydantic import SecretStr
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from ruperto.app import create_app
+from ruperto.app import create_app, format_dashboard_datetime
 from ruperto.config import Settings
 from ruperto.models import OrderStatus
 
 HTTP_OK = 200
 HTTP_NOT_FOUND = 404
+HTTP_UNPROCESSABLE_ENTITY = 422
 MIN_MENU_ITEMS = 35
 DEFAULT_WEEKLY_HOURS = 7
 UPDATED_WEEKLY_HOURS = 2
@@ -66,6 +68,13 @@ def test_root_endpoint_without_auto_init(tmp_path: Path):
 
     assert response.status_code == HTTP_OK
     assert response.json()["environment"] == "test"
+
+
+def test_format_dashboard_datetime_formats_local_time():
+    """Dashboard timestamps are shown in the configured local timezone."""
+    value = datetime(2026, 4, 4, 15, 30, tzinfo=UTC)
+
+    assert format_dashboard_datetime(value, "America/Argentina/Cordoba") == "2026-04-04 12:30"
 
 
 def test_public_settings_marks_secret_configuration():
@@ -234,3 +243,133 @@ def test_staff_can_replace_store_hours(tmp_path: Path):
     assert len(response.json()) == UPDATED_WEEKLY_HOURS
     assert response.json()[0]["closed"] is True
     assert response.json()[1]["opens_at"] == "18:00"
+
+
+def test_staff_can_update_store_profile_via_api(tmp_path: Path):
+    """The store profile API persists bot customization fields."""
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/api/store-profile",
+            json={
+                "store_name": "Nueva Rotisería",
+                "bot_name": "Ruperto Plus",
+                "store_location": "Alta Gracia",
+                "store_description": "Pedidos con atención propia.",
+                "assistant_personality": "Calm, warm, and concise.",
+                "transfer_alias": "nueva.rotiseria",
+            },
+        )
+        refreshed = client.get("/api/store-profile")
+
+    assert response.status_code == HTTP_OK
+    assert response.json()["store_name"] == "Nueva Rotisería"
+    assert response.json()["bot_name"] == "Ruperto Plus"
+    assert refreshed.json()["transfer_alias"] == "nueva.rotiseria"
+
+
+def test_dashboard_renders_sections_with_tailwind(tmp_path: Path):
+    """The staff dashboard exposes the Tailwind-rendered operational view."""
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.get("/dashboard")
+
+    assert response.status_code == HTTP_OK
+    assert "Staff Dashboard" in response.text
+    assert "tailwindcss.com" in response.text
+    assert "Profile and bot settings" in response.text
+    assert "Recent orders" in response.text
+
+
+def test_dashboard_forms_can_update_profile_and_hours(tmp_path: Path):
+    """The dashboard forms persist store customization and opening hours."""
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        profile_response = client.post(
+            "/dashboard/store-profile",
+            data={
+                "store_name": "Panel Rotisería",
+                "bot_name": "Panel Bot",
+                "store_location": "Anisacate",
+                "store_description": "Simple dashboard edits.",
+                "assistant_personality": "Helpful and steady.",
+                "transfer_alias": "panel.rotiseria",
+            },
+            follow_redirects=True,
+        )
+        hours_response = client.post(
+            "/dashboard/store-hours",
+            data={
+                "closed_0": "on",
+                "opens_at_1": "11:30",
+                "closes_at_1": "15:00",
+                "opens_at_2": "19:00",
+                "closes_at_2": "23:00",
+            },
+            follow_redirects=True,
+        )
+        store_response = client.get("/api/store-profile")
+        store_hours_response = client.get("/api/store-hours")
+
+    assert profile_response.status_code == HTTP_OK
+    assert "Store profile updated." in profile_response.text
+    assert hours_response.status_code == HTTP_OK
+    assert "Opening hours updated." in hours_response.text
+    assert store_response.json()["store_name"] == "Panel Rotisería"
+    assert store_response.json()["transfer_alias"] == "panel.rotiseria"
+    assert store_hours_response.json()[0]["closed"] is True
+    assert store_hours_response.json()[1]["opens_at"] == "11:30"
+
+
+def test_dashboard_rejects_invalid_form_payloads(tmp_path: Path):
+    """The dashboard returns validation errors for malformed form submissions."""
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        profile_response = client.post(
+            "/dashboard/store-profile",
+            data={
+                "store_name": "",
+                "bot_name": "",
+                "store_description": "",
+                "assistant_personality": "",
+            },
+        )
+        order_response = client.post("/dashboard/orders/999/status", data={"status": "not-a-real-status"})
+
+    assert profile_response.status_code == HTTP_UNPROCESSABLE_ENTITY
+    assert order_response.status_code == HTTP_UNPROCESSABLE_ENTITY
+
+
+def test_dashboard_can_update_order_status_and_handles_missing_orders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The dashboard can move orders and still reports missing records explicitly."""
+    monkeypatch.setattr("ruperto.assistant.build_google_model", lambda settings: FunctionModel(dev_message_model))
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Hola"})
+        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Martina"})
+        order_response = client.post(
+            "/api/dev/messages",
+            json={"external_user_id": "cli-user", "message_text": "Quiero una hamburguesa"},
+        )
+        order_id = order_response.json()["current_order"]["id"]
+        dashboard_response = client.post(
+            f"/dashboard/orders/{order_id}/status",
+            data={"status": OrderStatus.ALMOST_READY.value},
+            follow_redirects=True,
+        )
+        refreshed = client.get("/api/orders", params={"limit": 10})
+        missing_response = client.post(
+            "/dashboard/orders/999/status",
+            data={"status": OrderStatus.ALMOST_READY.value},
+        )
+
+    assert dashboard_response.status_code == HTTP_OK
+    assert "Order status updated." in dashboard_response.text
+    assert refreshed.json()[0]["status"] == OrderStatus.ALMOST_READY.value
+    assert missing_response.status_code == HTTP_NOT_FOUND
+    assert missing_response.json()["detail"] == "Order not found."

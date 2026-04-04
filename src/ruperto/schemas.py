@@ -179,3 +179,14 @@ class StoreBusinessHoursUpdateRequest(BaseModel):
     """Payload accepted by staff endpoints to replace the weekly schedule."""
 
     hours: list[StoreBusinessHoursUpdateEntry]
+
+
+class StoreProfileUpdateRequest(BaseModel):
+    """Payload accepted by staff endpoints to update the store customization."""
+
+    store_name: str = Field(min_length=1)
+    bot_name: str = Field(min_length=1)
+    store_location: str | None = None
+    store_description: str = Field(min_length=1)
+    assistant_personality: str = Field(min_length=1)
+    transfer_alias: str | None = None
