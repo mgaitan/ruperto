@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
-from datetime import datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from pydantic_ai import ModelMessage
 from pydantic_ai.messages import ModelMessagesTypeAdapter
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from ruperto.models import (
     Channel,
@@ -72,15 +73,6 @@ ACTIVE_ORDER_STATUSES = {
     OrderStatus.ALMOST_READY,
     OrderStatus.READY_FOR_PICKUP,
     OrderStatus.OUT_FOR_DELIVERY,
-}
-WEEKDAY_LABELS_ES = {
-    0: "lunes",
-    1: "martes",
-    2: "miércoles",
-    3: "jueves",
-    4: "viernes",
-    5: "sábado",
-    6: "domingo",
 }
 WEEKDAY_LABELS_ES = {
     0: "lunes",
@@ -155,6 +147,33 @@ class IncompleteOrderError(ValueError):
     def missing_payment_method(cls) -> IncompleteOrderError:
         """Return the error raised when the draft still lacks a payment method."""
         return cls("Necesito definir el medio de pago antes de confirmar.")
+
+
+class RequestedReadyTimeError(ValueError):
+    """Raised when a scheduled ready time cannot be fulfilled."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+    @classmethod
+    def past_time(cls) -> RequestedReadyTimeError:
+        """Return the error raised when the requested ready time already passed."""
+        return cls("Ese horario ya pasó. Decime otra hora y lo programo.")
+
+    @classmethod
+    def outside_business_hours(cls, next_open_text: str) -> RequestedReadyTimeError:
+        """Return the error raised when the requested slot is outside business hours."""
+        return cls(
+            f"Puedo programarlo solo dentro del horario del local. El próximo horario disponible es {next_open_text}."
+        )
+
+    @classmethod
+    def insufficient_lead_time(cls, earliest_ready_text: str) -> RequestedReadyTimeError:
+        """Return the error raised when there is not enough preparation lead time."""
+        return cls(
+            "Para tenerlo listo a esa hora necesito un poco más de tiempo. "
+            f"El primer horario que puedo prometerte es {earliest_ready_text}."
+        )
 
 
 class BusinessRepository:
@@ -502,6 +521,50 @@ class BusinessRepository:
         await self._refresh_order_total(order)
         return await self._build_order_snapshot(order)
 
+    async def set_order_requested_ready_at(
+        self,
+        customer_id: int,
+        conversation_id: int,
+        requested_ready_at: datetime,
+        *,
+        timezone_name: str,
+        store_id: int = 1,
+    ) -> OrderSnapshot:
+        """Schedule the active order to be ready at a concrete local time."""
+        order = await self._get_draft_order(customer_id, conversation_id)
+        if order is None:
+            order = await self.session.scalar(
+                select(Order)
+                .where(
+                    Order.customer_id == customer_id,
+                    Order.conversation_id == conversation_id,
+                )
+                .order_by(Order.updated_at.desc(), Order.id.desc())
+            )
+        if order is None:
+            order = Order(customer_id=customer_id, conversation_id=conversation_id)
+            self.session.add(order)
+            await self.session.flush()
+        previous_requested_ready_at = order.requested_ready_at
+        previous_preparation_starts_at = order.preparation_starts_at
+        order.requested_ready_at = requested_ready_at.astimezone(UTC)
+        order.updated_at = utc_now()
+        try:
+            await self._sync_requested_ready_metadata(order)
+            await self._validate_requested_ready_at(
+                order,
+                timezone_name=timezone_name,
+                store_id=store_id,
+            )
+        except RequestedReadyTimeError:
+            order.requested_ready_at = previous_requested_ready_at
+            order.preparation_starts_at = previous_preparation_starts_at
+            await self.session.flush()
+            raise
+
+        await self.session.flush()
+        return await self._build_order_snapshot(order)
+
     async def set_order_delivery_type(
         self,
         customer_id: int,
@@ -512,6 +575,7 @@ class BusinessRepository:
         order = await self._require_current_order(customer_id, conversation_id)
         order.delivery_type = delivery_type
         order.updated_at = utc_now()
+        await self._sync_requested_ready_metadata(order)
         await self.session.flush()
         return await self._build_order_snapshot(order)
 
@@ -542,7 +606,14 @@ class BusinessRepository:
         await self.session.flush()
         return await self._build_order_snapshot(order)
 
-    async def confirm_current_order(self, customer_id: int, conversation_id: int) -> OrderSnapshot:
+    async def confirm_current_order(
+        self,
+        customer_id: int,
+        conversation_id: int,
+        *,
+        timezone_name: str = "America/Argentina/Cordoba",
+        store_id: int = 1,
+    ) -> OrderSnapshot:
         """Confirm the active order if it already contains items."""
         order = await self._get_draft_order(customer_id, conversation_id)
         if order is None:
@@ -558,6 +629,8 @@ class BusinessRepository:
         if order.payment_method is None:
             raise IncompleteOrderError.missing_payment_method()
 
+        await self._sync_requested_ready_metadata(order)
+        await self._validate_requested_ready_at(order, timezone_name=timezone_name, store_id=store_id)
         order.status = OrderStatus.CONFIRMED
         order.updated_at = utc_now()
         await self._refresh_order_total(order)
@@ -612,17 +685,24 @@ class BusinessRepository:
 
     async def count_active_orders(self) -> int:
         """Count currently active non-draft orders in the kitchen pipeline."""
-        result = await self.session.scalar(select(func.count(Order.id)).where(Order.status.in_(ACTIVE_ORDER_STATUSES)))
+        result = await self.session.scalar(
+            select(func.count(Order.id)).where(
+                Order.status.in_(ACTIVE_ORDER_STATUSES),
+                self._active_order_pipeline_clause(reference_time=utc_now()),
+            )
+        )
         return int(result or 0)
 
     async def count_active_orders_ahead_by_order_id(self, order_id: int) -> int:
         """Count active orders created before the given order."""
         current_order = await self.session.get(Order, order_id)
         assert current_order is not None
+        reference_time = utc_now()
         result = await self.session.scalar(
             select(func.count(Order.id)).where(
                 Order.id != current_order.id,
                 Order.status.in_(ACTIVE_ORDER_STATUSES),
+                self._active_order_pipeline_clause(reference_time=reference_time),
                 Order.created_at <= current_order.created_at,
             )
         )
@@ -696,8 +776,81 @@ class BusinessRepository:
         """Recalculate the current order total from its line items."""
         items = await self._load_order_items(order.id)
         order.total_amount_cents = sum(item.quantity * item.unit_price_cents for item in items)
+        await self._sync_requested_ready_metadata(order)
         order.updated_at = utc_now()
         await self.session.flush()
+
+    async def _sync_requested_ready_metadata(self, order: Order) -> None:
+        """Keep derived scheduling timestamps aligned with the current order contents."""
+        if order.requested_ready_at is None:
+            order.preparation_starts_at = None
+            return
+
+        items = await self._load_order_items(order.id)
+        order_snapshot = OrderSnapshot(
+            id=order.id,
+            customer_id=order.customer_id,
+            conversation_id=order.conversation_id,
+            status=order.status,
+            delivery_type=order.delivery_type,
+            delivery_address=order.delivery_address,
+            payment_method=order.payment_method,
+            requested_ready_at=order.requested_ready_at,
+            preparation_starts_at=order.preparation_starts_at,
+            total_amount_cents=order.total_amount_cents,
+            total_amount_display=format_price_ars(order.total_amount_cents),
+            items=[
+                OrderItemSnapshot(
+                    menu_item_id=item.menu_item_id,
+                    name=item.name_snapshot,
+                    quantity=item.quantity,
+                    unit_price_cents=item.unit_price_cents,
+                    unit_price_display=format_price_ars(item.unit_price_cents),
+                    notes=item.notes,
+                )
+                for item in items
+            ],
+        )
+        preparation_minutes = self._estimate_preparation_minutes(order_snapshot)
+        order.preparation_starts_at = order.requested_ready_at - timedelta(minutes=preparation_minutes)
+
+    async def _validate_requested_ready_at(
+        self,
+        order: Order,
+        *,
+        timezone_name: str,
+        store_id: int,
+    ) -> None:
+        """Ensure a scheduled order can be fulfilled during business hours."""
+        if order.requested_ready_at is None:
+            return
+
+        zone = ZoneInfo(timezone_name)
+        local_now = utc_now().astimezone(zone)
+        local_ready = order.requested_ready_at.astimezone(zone)
+        if local_ready <= local_now:
+            raise RequestedReadyTimeError.past_time()
+
+        schedule = await self.list_store_business_hours(store_id=store_id)
+        schedule_row = self._schedule_row_for_datetime(schedule, local_ready)
+        if schedule_row is None or not self._is_open_at(
+            schedule_row, local_ready.time().replace(second=0, microsecond=0)
+        ):
+            next_open_text = self._find_next_opening_text(schedule, local_now)
+            raise RequestedReadyTimeError.outside_business_hours(next_open_text)
+
+        if order.preparation_starts_at is None:
+            return
+
+        local_open = self._opening_datetime_for_row(schedule_row, local_ready)
+        local_preparation_start = order.preparation_starts_at.astimezone(zone)
+        earliest_start = max(local_now, local_open)
+        if local_preparation_start < earliest_start:
+            preparation_minutes = int((order.requested_ready_at - order.preparation_starts_at).total_seconds() // 60)
+            earliest_ready = earliest_start + timedelta(minutes=preparation_minutes)
+            raise RequestedReadyTimeError.insufficient_lead_time(
+                self._describe_local_datetime(earliest_ready, local_now)
+            )
 
     async def _build_order_snapshot(self, order: Order) -> OrderSnapshot:
         """Build a serializable snapshot for the current order."""
@@ -710,6 +863,8 @@ class BusinessRepository:
             delivery_type=order.delivery_type,
             delivery_address=order.delivery_address,
             payment_method=order.payment_method,
+            requested_ready_at=order.requested_ready_at,
+            preparation_starts_at=order.preparation_starts_at,
             total_amount_cents=order.total_amount_cents,
             total_amount_display=format_price_ars(order.total_amount_cents),
             items=[
@@ -763,6 +918,13 @@ class BusinessRepository:
             base_minutes += 4
         return base_minutes
 
+    def _active_order_pipeline_clause(self, *, reference_time: datetime) -> ColumnElement[bool]:
+        """Exclude scheduled orders until their preparation window actually starts."""
+        return or_(
+            Order.preparation_starts_at.is_(None),
+            Order.preparation_starts_at <= reference_time,
+        )
+
     def _is_open_at(self, row: StoreBusinessHoursSnapshot | None, current_time: time) -> bool:
         """Return whether one schedule row covers the current time."""
         if row is None or row.closed or row.opens_at is None or row.closes_at is None:
@@ -772,6 +934,30 @@ class BusinessRepository:
         assert opens_at is not None
         assert closes_at is not None
         return opens_at <= current_time < closes_at
+
+    def _schedule_row_for_datetime(
+        self,
+        schedule: list[StoreBusinessHoursSnapshot],
+        local_dt: datetime,
+    ) -> StoreBusinessHoursSnapshot | None:
+        """Return the weekly row that applies to a given local datetime."""
+        return next((row for row in schedule if row.weekday == local_dt.weekday()), None)
+
+    def _opening_datetime_for_row(self, row: StoreBusinessHoursSnapshot, local_dt: datetime) -> datetime:
+        """Return the opening datetime for the schedule row on the given local date."""
+        opens_at = self._parse_hour_text(row.opens_at)
+        assert opens_at is not None
+        return datetime.combine(local_dt.date(), opens_at, tzinfo=local_dt.tzinfo)
+
+    def _describe_local_datetime(self, local_dt: datetime, local_now: datetime) -> str:
+        """Describe a local datetime as today, tomorrow, or weekday plus hour."""
+        if local_dt.date() == local_now.date():
+            day_text = "hoy"
+        elif local_dt.date() == (local_now + timedelta(days=1)).date():
+            day_text = "mañana"
+        else:
+            day_text = f"el {WEEKDAY_LABELS_ES[local_dt.weekday()]}"
+        return f"{day_text} a las {local_dt.strftime('%H:%M')}"
 
     def _find_next_opening_text(self, schedule: list[StoreBusinessHoursSnapshot], local_now: datetime) -> str:
         """Find the next opening slot as a short Spanish phrase."""

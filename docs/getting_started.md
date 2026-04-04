@@ -75,6 +75,10 @@ The same applies to denser opening messages like `Hola, soy Martín, mandame 2
 pizzas muzza, ¿cuánto es? te pago acá`: the backend now passes safe turn hints
 so the assistant can avoid re-asking the name and can reuse explicit payment or
 price cues in the same turn.
+If the customer asks for a later ready time such as `Quiero una hamburguesa
+para las 12`, the order can now stay scheduled for that slot instead of being
+treated as immediate. Confirmed summaries also include the configured transfer
+alias whenever the chosen payment method is `transferencia`.
 
 The seeded demo menu now includes a broader synthetic catalog with pizzas,
 hamburgers, lomitos, milanesas, wraps, empanadas, drinks, and desserts. That

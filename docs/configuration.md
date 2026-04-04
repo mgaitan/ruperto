@@ -37,6 +37,10 @@ RUPERTO_STORE_LOCALE
   The current default is `es-AR`, which is the main language for customer and
   staff interactions in the MVP.
 
+RUPERTO_STORE_TRANSFER_ALIAS
+  Transfer alias shown to customers when an order is confirmed with the
+  `transferencia` payment method.
+
 RUPERTO_DEFAULT_STORE_ID
   Store identifier resolved by default when the service boots without an
   explicit tenant resolution step.

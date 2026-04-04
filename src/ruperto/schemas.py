@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -33,6 +34,7 @@ class StoreProfileSnapshot(BaseSchema):
     assistant_personality: str
     locale: str
     currency_code: str
+    transfer_alias: str | None
 
 
 class StoreBusinessHoursSnapshot(BaseSchema):
@@ -98,6 +100,8 @@ class OrderSnapshot(BaseModel):
     delivery_type: DeliveryType | None
     delivery_address: str | None
     payment_method: PaymentMethod | None
+    requested_ready_at: datetime | None = None
+    preparation_starts_at: datetime | None = None
     total_amount_cents: int
     total_amount_display: str
     items: list[OrderItemSnapshot] = Field(default_factory=list)

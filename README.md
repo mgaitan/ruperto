@@ -57,6 +57,10 @@ kitchen delay from preparation time plus active workload and lets staff move
 orders through operational statuses with `PATCH /api/orders/{order_id}/status`.
 Store opening hours are now configurable through `GET/PUT /api/store-hours`,
 and customer replies mention the next opening time whenever the store is closed.
+If a customer asks for a later ready time such as `para las 12`, the backend
+can now keep the order scheduled for that slot, store when preparation should
+start, and include the configured transfer alias when the payment method is
+`transferencia`.
 The demo catalog now includes a broader synthetic menu with pizzas,
 hamburgers, lomitos, milanesas, wraps, empanadas, drinks, and desserts so
 local development can exercise more realistic ordering conversations and

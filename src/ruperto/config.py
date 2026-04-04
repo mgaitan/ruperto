@@ -34,9 +34,10 @@ class Settings(BaseSettings):
     assistant_personality: str = "Amable, ágil y confiable."
     store_locale: str = "es-AR"
     store_timezone: str = "America/Argentina/Cordoba"
+    store_transfer_alias: str | None = "demo.rotiseria"
     default_store_id: int = 1
 
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = "gemini-2.5-flash-lite"
     gemini_api_key: SecretStr | None = None
     assistant_model_timeout_seconds: float = 25.0
     assistant_model_retry_attempts: int = 1
@@ -56,6 +57,7 @@ class Settings(BaseSettings):
             "assistant_personality": self.assistant_personality,
             "store_locale": self.store_locale,
             "store_timezone": self.store_timezone,
+            "store_transfer_alias": self.store_transfer_alias,
             "default_store_id": self.default_store_id,
             "gemini_model": self.gemini_model,
             "gemini_api_key_configured": self.gemini_api_key is not None,

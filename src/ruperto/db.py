@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect, select, text
+from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from ruperto.bootstrap import DEFAULT_BUSINESS_HOURS, DEMO_MENU_ITEMS
@@ -37,6 +38,7 @@ async def init_database(*, settings: Settings, runtime: DatabaseRuntime | None =
     active_runtime = runtime or create_database_runtime(settings)
     async with active_runtime.engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        await connection.run_sync(_ensure_schema_columns)
 
     async with active_runtime.session_factory() as session:
         result = await session.execute(select(StoreProfile).where(StoreProfile.id == settings.default_store_id))
@@ -51,8 +53,11 @@ async def init_database(*, settings: Settings, runtime: DatabaseRuntime | None =
                     store_description=settings.store_description,
                     assistant_personality=settings.assistant_personality,
                     locale=settings.store_locale,
+                    transfer_alias=settings.store_transfer_alias,
                 )
             )
+        elif profile.transfer_alias is None and settings.store_transfer_alias is not None:
+            profile.transfer_alias = settings.store_transfer_alias
         existing_skus = set((await session.scalars(select(MenuItem.sku))).all())
         missing_menu_items = [item for item in DEMO_MENU_ITEMS if item.sku not in existing_skus]
         if missing_menu_items:
@@ -91,3 +96,19 @@ async def ping_database(runtime: DatabaseRuntime) -> None:
     """Verify the configured database is reachable."""
     async with runtime.session_factory() as session:
         await session.execute(select(1))
+
+
+def _ensure_schema_columns(connection: Connection) -> None:
+    """Backfill additive columns for databases created by older MVP versions."""
+    inspector = inspect(connection)
+    if "store_profile" in inspector.get_table_names():
+        store_profile_columns = {column["name"] for column in inspector.get_columns("store_profile")}
+        if "transfer_alias" not in store_profile_columns:
+            connection.execute(text("ALTER TABLE store_profile ADD COLUMN transfer_alias VARCHAR(120)"))
+
+    if "customer_order" in inspector.get_table_names():
+        order_columns = {column["name"] for column in inspector.get_columns("customer_order")}
+        if "requested_ready_at" not in order_columns:
+            connection.execute(text("ALTER TABLE customer_order ADD COLUMN requested_ready_at DATETIME"))
+        if "preparation_starts_at" not in order_columns:
+            connection.execute(text("ALTER TABLE customer_order ADD COLUMN preparation_starts_at DATETIME"))

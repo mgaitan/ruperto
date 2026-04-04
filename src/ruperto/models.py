@@ -5,8 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, time
 from enum import StrEnum
 
+from sqlalchemy import DateTime, ForeignKey, String, Text, Time, UniqueConstraint
 from sqlalchemy import Enum as SqlEnum
-from sqlalchemy import ForeignKey, String, Text, Time, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -67,6 +67,7 @@ class StoreProfile(Base):
     assistant_personality: Mapped[str] = mapped_column(String(length=255))
     locale: Mapped[str] = mapped_column(String(length=32), default="es-AR")
     currency_code: Mapped[str] = mapped_column(String(length=8), default="ARS")
+    transfer_alias: Mapped[str | None] = mapped_column(String(length=120), nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(default=utc_now, onupdate=utc_now)
 
@@ -191,6 +192,8 @@ class Order(Base):
         SqlEnum(PaymentMethod, native_enum=False, length=32),
         nullable=True,
     )
+    requested_ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    preparation_starts_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     total_amount_cents: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(default=utc_now, onupdate=utc_now)

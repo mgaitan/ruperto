@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import SecretStr
@@ -42,6 +44,7 @@ from ruperto.schemas import (
 pytestmark = pytest.mark.anyio
 MIN_HISTORY_MESSAGES = 10
 RETRY_SUCCESS_CALLS = 2
+STORE_TIMEZONE = "America/Argentina/Cordoba"
 
 
 def build_settings(tmp_path: Path) -> Settings:
@@ -51,6 +54,7 @@ def build_settings(tmp_path: Path) -> Settings:
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'assistant.db'}",
         store_name="Rotisería Test",
         bot_name="Ruperto Test",
+        gemini_model="gemini-2.5-flash-lite",
         gemini_api_key=SecretStr("test-key"),
     )
 
@@ -202,6 +206,34 @@ def delay_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
     )
 
 
+def add_item_only_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Create a draft order without confirming it."""
+    tool_returns = collect_tool_returns(messages)
+    if "get_current_order" not in tool_returns:
+        return ModelResponse(
+            parts=[ToolCallPart("get_current_order", {})],
+            model_name="function:test-add-item-only",
+        )
+    if "add_item_to_current_order" not in tool_returns:
+        return ModelResponse(
+            parts=[ToolCallPart("add_item_to_current_order", {"sku": "hamburguesa-completa", "quantity": 1})],
+            model_name="function:test-add-item-only",
+        )
+    return ModelResponse(
+        parts=[
+            ToolCallPart(
+                info.output_tools[0].name,
+                {
+                    "reply_text": "Anoté la hamburguesa.",
+                    "next_step": "choose_delivery",
+                    "handoff": False,
+                },
+            )
+        ],
+        model_name="function:test-add-item-only",
+    )
+
+
 async def test_build_google_model(tmp_path: Path):
     """The production Gemini model can be constructed from settings."""
     model = build_google_model(build_settings(tmp_path))
@@ -345,7 +377,7 @@ async def test_assistant_retries_once_before_fallback(tmp_path: Path):
     )
 
     assert flaky_agent.calls == RETRY_SUCCESS_CALLS
-    assert result.reply.reply_text == "Hola Martina, te tomo ese pedido 🍕"
+    assert "Hola Martina, te tomo ese pedido 🍕" in result.reply.reply_text
     assert result.reply.handoff is False
 
     await runtime.engine.dispose()
@@ -407,13 +439,108 @@ async def test_assistant_handles_order_flow_in_spanish(tmp_path: Path):
     assert result.customer.name == "Martina"
     assert result.customer.phone_number == "+543515557788"
     assert result.reply.next_step == AssistantNextStep.COMPLETE
-    assert "ya te tomé el pedido" in result.reply.reply_text
+    assert "**Pedido**" in result.reply.reply_text
+    assert "**Pago**" in result.reply.reply_text
     assert result.current_order is not None
     assert result.current_order.payment_method is not None
     assert result.current_order.status.value == "confirmed"
     assert result.current_order.delivery_address == "Olegario Andrade 330"
     assert result.current_order.payment_method.value == "transfer"
     assert result.current_order.items[0].notes == "sin cebolla"
+
+    await runtime.engine.dispose()
+
+
+async def test_assistant_schedules_a_closed_store_order_for_a_future_time(tmp_path: Path):
+    """A requested ready time becomes a scheduled confirmation with transfer details."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        service,
+        channel=Channel.DEV,
+        external_user_id="cliente-programado",
+        name="Martina",
+    )
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        await repository.replace_store_business_hours(
+            hours=[
+                StoreBusinessHoursSnapshot(
+                    id=0,
+                    store_id=1,
+                    weekday=weekday,
+                    opens_at="00:00",
+                    closes_at="23:59",
+                    closed=False,
+                )
+                for weekday in range(7)
+            ]
+        )
+        await session.commit()
+
+    local_ready = datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(hours=2)
+    time_text = local_ready.strftime("%H:%M")
+    reply = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-programado",
+        message_text=f"Quiero una hamburguesa para las {time_text}",
+        model=FunctionModel(transactional_model),
+    )
+
+    assert reply.current_order is not None
+    assert reply.current_order.requested_ready_at is not None
+    assert reply.current_order.preparation_starts_at is not None
+    assert "**Horario**" in reply.reply.reply_text
+    assert "Pedido programado" in reply.reply.reply_text
+    assert "`demo.rotiseria`" in reply.reply.reply_text
+
+    await runtime.engine.dispose()
+
+
+async def test_assistant_reports_schedule_errors_without_overwriting_them(tmp_path: Path):
+    """An invalid requested time should surface the scheduling error instead of normal checkout guidance."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        service,
+        channel=Channel.DEV,
+        external_user_id="cliente-hora-invalida",
+        name="Martina",
+    )
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        await repository.replace_store_business_hours(
+            hours=[
+                StoreBusinessHoursSnapshot(
+                    id=0,
+                    store_id=1,
+                    weekday=weekday,
+                    opens_at="00:00",
+                    closes_at="23:59",
+                    closed=False,
+                )
+                for weekday in range(7)
+            ]
+        )
+        await session.commit()
+
+    local_ready = datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(minutes=5)
+    time_text = local_ready.strftime("%H:%M")
+    reply = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-hora-invalida",
+        message_text=f"Quiero una hamburguesa para las {time_text}",
+        model=FunctionModel(add_item_only_model),
+    )
+
+    assert "necesito un poco más de tiempo" in reply.reply.reply_text
+    assert reply.reply.next_step == AssistantNextStep.CHOOSE_DELIVERY
 
     await runtime.engine.dispose()
 
@@ -882,6 +1009,48 @@ async def test_turn_context_hint_describes_missing_address_and_payment(tmp_path:
     await runtime.engine.dispose()
 
 
+async def test_turn_context_hint_mentions_requested_ready_time(tmp_path: Path):
+    """Draft hints should mention when the customer already asked for a ready time."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    requested_ready_at = datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(days=2)
+    order = OrderSnapshot(
+        id=1,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=None,
+        delivery_address=None,
+        payment_method=None,
+        requested_ready_at=requested_ready_at.astimezone(UTC),
+        preparation_starts_at=(requested_ready_at - timedelta(minutes=15)).astimezone(UTC),
+        total_amount_cents=950000,
+        total_amount_display="$ 9.500",
+        items=[
+            OrderItemSnapshot(
+                menu_item_id=1,
+                name="Hamburguesa completa",
+                quantity=1,
+                unit_price_cents=950000,
+                unit_price_display="$ 9.500",
+                notes=None,
+            )
+        ],
+    )
+
+    hint = service._build_turn_context_hint(
+        customer=CustomerSnapshot(id=1, name="Martín", phone_number=None, default_address=None),
+        message_text="Te confirmo después",
+        current_order=order,
+    )
+
+    assert hint is not None
+    assert "tenerlo listo" in hint
+    assert "el" in hint or "mañana" in hint
+
+    await runtime.engine.dispose()
+
+
 async def test_turn_policy_blocks_order_mutations_for_menu_only_questions(tmp_path: Path):
     """Pure menu questions should not be allowed to mutate or confirm orders."""
     runtime = create_database_runtime(build_settings(tmp_path))
@@ -1011,7 +1180,7 @@ async def test_assistant_mentions_next_opening_when_store_is_closed(tmp_path: Pa
         model=FunctionModel(transactional_model),
     )
 
-    assert "ahora estamos cerrados" in reply.reply.reply_text.lower()
+    assert "cerrad" in reply.reply.reply_text.lower()
     assert "abrimos pronto" in reply.reply.reply_text.lower()
 
     await runtime.engine.dispose()
@@ -1352,5 +1521,98 @@ async def test_closed_store_text_is_not_prefixed_twice(tmp_path: Path):
     decorated = service._decorate_closed_store_text(availability.message_text, availability)
 
     assert decorated == availability.message_text
+
+    await runtime.engine.dispose()
+
+
+async def test_closed_store_text_helpers_cover_open_and_exact_prefix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Closed-store decoration helpers should pass through open replies and exact existing prefixes."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    open_availability = StoreAvailabilitySnapshot(is_open=True, message_text="Estamos abiertos", next_open_text=None)
+    closed_availability = StoreAvailabilitySnapshot(
+        is_open=False,
+        message_text="Ahora estamos cerrados 😴 Abrimos mañana a las 11:00.",
+        next_open_text="mañana a las 11:00",
+    )
+    assert service._decorate_closed_store_text("Mensaje libre", open_availability) == "Mensaje libre"
+    monkeypatch.setattr(service, "_build_closed_store_notice", lambda availability, conversation_id: "Prefijo: ")
+    assert (
+        service._decorate_closed_store_text("Prefijo: mensaje ya armado", closed_availability, conversation_id=0)
+        == "Prefijo: mensaje ya armado"
+    )
+
+    await runtime.engine.dispose()
+
+
+async def test_scheduling_and_next_step_helpers_cover_remaining_branches(tmp_path: Path):
+    """Scheduling helpers should parse tomorrow, reject invalid hours, and infer next steps."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    requested_ready_at = datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(days=1)
+    base_order = OrderSnapshot(
+        id=1,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=None,
+        delivery_address=None,
+        payment_method=None,
+        requested_ready_at=requested_ready_at.astimezone(UTC),
+        preparation_starts_at=(requested_ready_at - timedelta(minutes=15)).astimezone(UTC),
+        total_amount_cents=950000,
+        total_amount_display="$ 9.500",
+        items=[
+            OrderItemSnapshot(
+                menu_item_id=1,
+                name="Hamburguesa completa",
+                quantity=1,
+                unit_price_cents=950000,
+                unit_price_display="$ 9.500",
+                notes=None,
+            )
+        ],
+    )
+
+    parsed_tomorrow = service._extract_requested_ready_at(
+        "Quiero una hamburguesa mañana a las 12", timezone_name=STORE_TIMEZONE
+    )
+
+    assert service._next_step_for_current_order(None) == AssistantNextStep.CHOOSE_ITEMS
+    assert service._next_step_for_current_order(base_order) == AssistantNextStep.CHOOSE_DELIVERY
+    assert (
+        service._next_step_for_current_order(base_order.model_copy(update={"delivery_type": DeliveryType.DELIVERY}))
+        == AssistantNextStep.ASK_ADDRESS
+    )
+    assert (
+        service._next_step_for_current_order(
+            base_order.model_copy(update={"delivery_type": DeliveryType.DELIVERY, "delivery_address": "Lavalle 12333"})
+        )
+        == AssistantNextStep.CHOOSE_PAYMENT
+    )
+    assert (
+        service._next_step_for_current_order(
+            base_order.model_copy(
+                update={
+                    "delivery_type": DeliveryType.DELIVERY,
+                    "delivery_address": "Lavalle 12333",
+                    "payment_method": PaymentMethod.CASH,
+                }
+            )
+        )
+        == AssistantNextStep.COMPLETE
+    )
+    assert service._build_timing_prompt_fragment(current_order=base_order, delay=None).startswith(" Lo dejo programado")
+    assert (
+        service._build_timing_prompt_fragment(
+            current_order=base_order.model_copy(update={"requested_ready_at": None}),
+            delay=None,
+        )
+        == ""
+    )
+    assert service._extract_requested_ready_at("", timezone_name=STORE_TIMEZONE) is None
+    assert service._extract_requested_ready_at("para las 25", timezone_name=STORE_TIMEZONE) is None
+    assert parsed_tomorrow is not None
+    assert service._describe_order_ready_time(parsed_tomorrow).startswith("mañana")
 
     await runtime.engine.dispose()

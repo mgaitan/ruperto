@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
+import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
-from sqlalchemy import select
+from sqlalchemy import create_engine, select, text
 
 from ruperto.config import Settings
 from ruperto.db import DatabaseRuntime, create_database_runtime, init_database
@@ -31,6 +33,7 @@ DEFAULT_WEEKLY_HOURS = 7
 UPDATED_WEEKLY_HOURS = 2
 MIN_MENU_ITEMS = 35
 TENANT_STORE_ID = 7
+STORE_TIMEZONE = "America/Argentina/Cordoba"
 
 
 async def build_repository(tmp_path: Path) -> tuple[BusinessRepository, DatabaseRuntime]:
@@ -281,6 +284,258 @@ async def test_order_lifecycle_and_customer_memory(tmp_path: Path):
     assert delay.display_text == "22 minutos aproximadamente"
     assert memory.favorite_item_name == "Hamburguesa completa"
     assert memory.recent_items == ["Hamburguesa completa"]
+
+    await close_repository(repository, runtime)
+
+
+async def test_set_order_requested_ready_at_persists_schedule_and_updates_prep_start(tmp_path: Path):
+    """Scheduled orders keep the requested ready time and derived preparation start."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="schedule-ok")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="schedule-ok",
+        customer_id=customer.id,
+    )
+    await repository.replace_store_business_hours(
+        hours=[
+            StoreBusinessHoursSnapshot(
+                id=0,
+                store_id=1,
+                weekday=weekday,
+                opens_at="00:00",
+                closes_at="23:59",
+                closed=False,
+            )
+            for weekday in range(7)
+        ]
+    )
+    await repository.add_item_to_current_order(
+        customer.id,
+        conversation.id,
+        sku="hamburguesa-completa",
+        quantity=1,
+    )
+
+    local_ready = datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(hours=2)
+    scheduled = await repository.set_order_requested_ready_at(
+        customer.id,
+        conversation.id,
+        local_ready.astimezone(UTC),
+        timezone_name=STORE_TIMEZONE,
+    )
+
+    assert scheduled.requested_ready_at is not None
+    assert scheduled.preparation_starts_at is not None
+    assert scheduled.requested_ready_at == local_ready.astimezone(UTC)
+    assert scheduled.preparation_starts_at == scheduled.requested_ready_at - timedelta(minutes=PICKUP_DELAY_MINUTES)
+
+    delivery_scheduled = await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.DELIVERY)
+
+    assert delivery_scheduled.preparation_starts_at is not None
+    assert scheduled.requested_ready_at.replace(tzinfo=None) - delivery_scheduled.preparation_starts_at == timedelta(
+        minutes=20
+    )
+
+    await close_repository(repository, runtime)
+
+
+async def test_set_order_requested_ready_at_rejects_closed_or_too_soon_slots(tmp_path: Path):
+    """Scheduling fails outside store hours or without enough preparation lead time."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="schedule-invalid")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="schedule-invalid",
+        customer_id=customer.id,
+    )
+    await repository.add_item_to_current_order(
+        customer.id,
+        conversation.id,
+        sku="hamburguesa-completa",
+        quantity=1,
+    )
+
+    local_ready = datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(hours=2)
+    await repository.replace_store_business_hours(
+        hours=[
+            StoreBusinessHoursSnapshot(
+                id=0,
+                store_id=1,
+                weekday=weekday,
+                opens_at=None,
+                closes_at=None,
+                closed=True,
+            )
+            for weekday in range(7)
+        ]
+    )
+    with pytest.raises(ValueError, match="solo dentro del horario"):
+        await repository.set_order_requested_ready_at(
+            customer.id,
+            conversation.id,
+            local_ready.astimezone(UTC),
+            timezone_name=STORE_TIMEZONE,
+        )
+
+    reset_order = await repository.get_current_order(customer.id, conversation.id)
+    assert reset_order is not None
+    assert reset_order.requested_ready_at is None
+    assert reset_order.preparation_starts_at is None
+
+    await repository.replace_store_business_hours(
+        hours=[
+            StoreBusinessHoursSnapshot(
+                id=0,
+                store_id=1,
+                weekday=weekday,
+                opens_at="00:00",
+                closes_at="23:59",
+                closed=False,
+            )
+            for weekday in range(7)
+        ]
+    )
+    too_soon = datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(minutes=5)
+    with pytest.raises(ValueError, match="necesito un poco más de tiempo"):
+        await repository.set_order_requested_ready_at(
+            customer.id,
+            conversation.id,
+            too_soon.astimezone(UTC),
+            timezone_name=STORE_TIMEZONE,
+        )
+
+    await close_repository(repository, runtime)
+
+
+async def test_init_database_backfills_schedule_and_transfer_columns_for_legacy_sqlite(tmp_path: Path):
+    """Legacy SQLite schemas gain the new scheduling and transfer columns during init."""
+    database_path = tmp_path / "legacy.db"
+    sync_engine = create_engine(f"sqlite:///{database_path}")
+    with sync_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE store_profile (
+                    id INTEGER PRIMARY KEY,
+                    store_name VARCHAR(120),
+                    bot_name VARCHAR(120),
+                    store_location VARCHAR(255),
+                    store_description VARCHAR(500),
+                    assistant_personality VARCHAR(255),
+                    locale VARCHAR(32),
+                    currency_code VARCHAR(8),
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO store_profile (
+                    id, store_name, bot_name, store_location, store_description,
+                    assistant_personality, locale, currency_code, created_at, updated_at
+                ) VALUES (
+                    1, 'Legacy Rotisería', 'Legacy Bot', NULL, 'Perfil viejo',
+                    'Amable', 'es-AR', 'ARS', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE customer_order (
+                    id INTEGER PRIMARY KEY,
+                    customer_id INTEGER,
+                    conversation_id INTEGER,
+                    status VARCHAR(32),
+                    delivery_type VARCHAR(32),
+                    delivery_address VARCHAR(255),
+                    payment_method VARCHAR(32),
+                    total_amount_cents INTEGER,
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+        )
+    sync_engine.dispose()
+
+    settings = Settings(
+        environment="test",
+        database_url=f"sqlite+aiosqlite:///{database_path}",
+        store_name="Legacy Rotisería",
+        bot_name="Legacy Bot",
+        store_transfer_alias="legacy.alias",
+    )
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+
+    with sqlite3.connect(database_path) as sqlite_connection:
+        store_columns = {row[1] for row in sqlite_connection.execute("PRAGMA table_info(store_profile)")}
+        order_columns = {row[1] for row in sqlite_connection.execute("PRAGMA table_info(customer_order)")}
+    assert "transfer_alias" in store_columns
+    assert "requested_ready_at" in order_columns
+    assert "preparation_starts_at" in order_columns
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        store = await repository.get_store_profile()
+        assert store.transfer_alias == "legacy.alias"
+
+    await runtime.engine.dispose()
+
+
+async def test_schedule_validation_helpers_cover_past_missing_prep_and_relative_day_text(tmp_path: Path):
+    """Scheduling validation rejects past times and the local-text helper covers tomorrow and weekdays."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="schedule-helper")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="schedule-helper",
+        customer_id=customer.id,
+    )
+    await repository.replace_store_business_hours(
+        hours=[
+            StoreBusinessHoursSnapshot(
+                id=0,
+                store_id=1,
+                weekday=weekday,
+                opens_at="00:00",
+                closes_at="23:59",
+                closed=False,
+            )
+            for weekday in range(7)
+        ]
+    )
+
+    created = await repository.set_order_requested_ready_at(
+        customer.id,
+        conversation.id,
+        (datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(hours=2)).astimezone(UTC),
+        timezone_name=STORE_TIMEZONE,
+    )
+    assert created.requested_ready_at is not None
+
+    order = await repository._require_current_order(customer.id, conversation.id)
+    order.requested_ready_at = (
+        datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) - timedelta(minutes=5)
+    ).astimezone(UTC)
+    with pytest.raises(ValueError, match="ya pasó"):
+        await repository._validate_requested_ready_at(order, timezone_name=STORE_TIMEZONE, store_id=1)
+
+    order.requested_ready_at = (
+        datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(hours=3)
+    ).astimezone(UTC)
+    order.preparation_starts_at = None
+    await repository._validate_requested_ready_at(order, timezone_name=STORE_TIMEZONE, store_id=1)
+
+    local_now = datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0)
+    assert repository._describe_local_datetime(local_now + timedelta(days=1), local_now).startswith("mañana")
+    assert repository._describe_local_datetime(local_now + timedelta(days=2), local_now).startswith("el ")
 
     await close_repository(repository, runtime)
 
