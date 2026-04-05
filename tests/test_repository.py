@@ -26,6 +26,7 @@ from ruperto.models import (
     PaymentMethod,
     StaffRole,
     StaffUser,
+    StoreVertical,
 )
 from ruperto.repository import (
     STORE_HOURS_SLOT_ORDER_MESSAGE,
@@ -127,6 +128,7 @@ async def test_store_profile_can_be_updated_with_empty_optional_fields(tmp_path:
             store_location=None,
             store_description="Updated from the dashboard.",
             assistant_personality="Steady and direct.",
+            vertical=StoreVertical.MUNICIPAL,
             transfer_alias=None,
         )
     )
@@ -134,6 +136,7 @@ async def test_store_profile_can_be_updated_with_empty_optional_fields(tmp_path:
     assert updated.store_name == "Panel Rotisería"
     assert updated.store_location is None
     assert updated.transfer_alias is None
+    assert updated.vertical == StoreVertical.MUNICIPAL
 
     await close_repository(repository, runtime)
 
@@ -789,6 +792,30 @@ async def test_init_database_backfills_schedule_and_transfer_columns_for_legacy_
         store = await repository.get_store_profile()
         assert store.transfer_alias == "legacy.alias"
 
+    await runtime.engine.dispose()
+
+
+async def test_init_database_updates_existing_store_vertical_from_settings(tmp_path: Path):
+    """Bootstrap updates the default store vertical when settings request a different tenant type."""
+    database_path = tmp_path / "vertical-sync.db"
+    base_settings = Settings(
+        environment="test",
+        database_url=f"sqlite+aiosqlite:///{database_path}",
+        store_name="Rotisería Test",
+        bot_name="Ruperto Test",
+    )
+    runtime = create_database_runtime(base_settings)
+    await init_database(settings=base_settings, runtime=runtime)
+    await runtime.engine.dispose()
+
+    municipal_settings = base_settings.model_copy(update={"store_vertical": StoreVertical.MUNICIPAL})
+    runtime = create_database_runtime(municipal_settings)
+    await init_database(settings=municipal_settings, runtime=runtime)
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        store = await repository.get_store_profile()
+
+    assert store.vertical == StoreVertical.MUNICIPAL
     await runtime.engine.dispose()
 
 

@@ -4,13 +4,23 @@
 <section class="rounded-[2rem] border border-white/70 bg-white/85 p-6 shadow-card backdrop-blur">
     <form action="/dashboard/settings/profile" method="post" class="grid gap-4 md:grid-cols-2">
         <label class="space-y-2 text-sm font-medium text-slate-700">
-            <span>Nombre del local</span>
+            <span>{% if store.vertical == "municipal" %}Nombre del municipio{% else %}Nombre del local{% endif %}</span>
             <input
                 class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
                 name="store_name"
                 value="{{ store.store_name }}"
                 required
             />
+        </label>
+        <label class="space-y-2 text-sm font-medium text-slate-700">
+            <span>Vertical</span>
+            <select
+                class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                name="vertical"
+            >
+                <option value="ordering" {% if store.vertical == "ordering" %}selected{% endif %}>Rotisería</option>
+                <option value="municipal" {% if store.vertical == "municipal" %}selected{% endif %}>Municipio</option>
+            </select>
         </label>
         <label class="space-y-2 text-sm font-medium text-slate-700">
             <span>Alias de transferencia</span>
@@ -31,7 +41,7 @@
             />
         </label>
         <label class="space-y-2 text-sm font-medium text-slate-700 md:col-span-2">
-            <span>Descripción del local</span>
+            <span>{% if store.vertical == "municipal" %}Descripción del municipio{% else %}Descripción del local{% endif %}</span>
             <textarea
                 class="min-h-36 w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
                 name="store_description"

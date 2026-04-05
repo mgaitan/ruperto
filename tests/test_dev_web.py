@@ -158,10 +158,10 @@ async def test_web_chat_stream_wraps_stream_builder():
 
 
 async def test_submit_customer_message_uses_real_service(mocker, tmp_path: Path):
-    """The wrapper tool forwards the message through the ordering service."""
+    """The wrapper tool forwards the message through the tenant-aware router."""
     fake_result = mocker.Mock()
     fake_result.reply.reply_text = "Hola, ¿qué querés pedir?"
-    handle = mocker.patch("ruperto.dev_web.OrderingAssistantService.handle_customer_message", return_value=fake_result)
+    handle = mocker.patch("ruperto.dev_web.handle_customer_message_for_store", return_value=fake_result)
     ctx = mocker.Mock()
     ctx.deps.session_factory = create_database_runtime(build_settings(tmp_path)).session_factory
     ctx.deps.settings = build_settings(tmp_path)

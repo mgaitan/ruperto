@@ -29,7 +29,7 @@ from ruperto.channels.service import (
 )
 from ruperto.config import Settings
 from ruperto.db import DatabaseRuntime, create_database_runtime, init_database, ping_database
-from ruperto.models import Channel, ChannelProvider, DeliveryType, OrderStatus, PaymentMethod, StaffRole
+from ruperto.models import Channel, ChannelProvider, DeliveryType, OrderStatus, PaymentMethod, StaffRole, StoreVertical
 from ruperto.repository import BusinessRepository, OrderNotFoundError
 from ruperto.schemas import (
     AssistantTurnResult,
@@ -63,6 +63,10 @@ DASHBOARD_FLASH_MESSAGES = {
     "profile-updated": "Perfil del local actualizado.",
     "role-updated": "Rol actualizado.",
     "store-switched": "Local activo actualizado.",
+}
+DASHBOARD_VERTICAL_LABELS = {
+    StoreVertical.ORDERING: "Rotisería",
+    StoreVertical.MUNICIPAL: "Municipio",
 }
 DASHBOARD_ORDER_STATUS_LABELS = {
     OrderStatus.DRAFT: "Borrador",
@@ -137,7 +141,7 @@ class DashboardNavSectionState(TypedDict):
     items: list[DashboardNavItemState]
 
 
-DASHBOARD_NAVIGATION: list[DashboardNavSection] = [
+DASHBOARD_NAVIGATION_ORDERING: list[DashboardNavSection] = [
     {
         "section": "Operación",
         "items": [
@@ -152,6 +156,25 @@ DASHBOARD_NAVIGATION: list[DashboardNavSection] = [
             {"key": "profile", "label": "Perfil del local", "path": "/dashboard/settings/profile"},
             {"key": "agent", "label": "Configuración del agente", "path": "/dashboard/settings/agent"},
             {"key": "hours", "label": "Agenda semanal", "path": "/dashboard/settings/hours"},
+            {"key": "users", "label": "Usuarios / roles", "path": "/dashboard/settings/users"},
+        ],
+    },
+]
+
+DASHBOARD_NAVIGATION_MUNICIPAL: list[DashboardNavSection] = [
+    {
+        "section": "Operación",
+        "items": [
+            {"key": "home", "label": "Inicio", "path": "/dashboard"},
+            {"key": "customers", "label": "Vecinos", "path": "/dashboard/customers"},
+            {"key": "menu", "label": "Áreas y categorías", "path": "/dashboard/settings/menu"},
+        ],
+    },
+    {
+        "section": "Configuración",
+        "items": [
+            {"key": "profile", "label": "Perfil del municipio", "path": "/dashboard/settings/profile"},
+            {"key": "agent", "label": "Configuración del agente", "path": "/dashboard/settings/agent"},
             {"key": "users", "label": "Usuarios / roles", "path": "/dashboard/settings/users"},
         ],
     },
@@ -387,8 +410,9 @@ def dashboard_store_scope_note(memberships: list[StoreMembershipSnapshot]) -> st
     )
 
 
-def dashboard_navigation(active_page: str) -> list[DashboardNavSectionState]:
+def dashboard_navigation(active_page: str, *, vertical: StoreVertical) -> list[DashboardNavSectionState]:
     """Return the dashboard navigation with the current page marked as active."""
+    sections = DASHBOARD_NAVIGATION_MUNICIPAL if vertical == StoreVertical.MUNICIPAL else DASHBOARD_NAVIGATION_ORDERING
     return [
         {
             "section": section["section"],
@@ -402,7 +426,7 @@ def dashboard_navigation(active_page: str) -> list[DashboardNavSectionState]:
                 for item in section["items"]
             ],
         }
-        for section in DASHBOARD_NAVIGATION
+        for section in sections
     ]
 
 
@@ -445,12 +469,92 @@ def dashboard_page_context(
         "current_user": identity.staff_user,
         "flash_message": DASHBOARD_FLASH_MESSAGES.get(flash or ""),
         "memberships": identity.memberships,
-        "nav_sections": dashboard_navigation(page.active_page),
+        "nav_sections": dashboard_navigation(page.active_page, vertical=store.vertical),
         "page_description": page.description,
         "page_title": page.title,
         "store": store,
+        "store_vertical_label": DASHBOARD_VERTICAL_LABELS[store.vertical],
         "tenant_scope_note": dashboard_store_scope_note(identity.memberships),
     }
+
+
+def profile_page_copy(store: StoreProfileSnapshot) -> DashboardPageSpec:
+    """Return the dashboard copy for the store profile page."""
+    if store.vertical == StoreVertical.MUNICIPAL:
+        return DashboardPageSpec(
+            active_page="profile",
+            title="Perfil del municipio",
+            description="Datos públicos y operativos del municipio que usa este asistente.",
+        )
+    return DashboardPageSpec(
+        active_page="profile",
+        title="Perfil del local",
+        description="Datos públicos y operativos del local visibles para el equipo y el checkout.",
+    )
+
+
+def customers_page_copy(store: StoreProfileSnapshot) -> DashboardPageSpec:
+    """Return the dashboard copy for the contacts page."""
+    if store.vertical == StoreVertical.MUNICIPAL:
+        return DashboardPageSpec(
+            active_page="customers",
+            title="Vecinos",
+            description="Base de vecinos conocida por el sistema, con búsqueda por nombre, teléfono o dirección.",
+        )
+    return DashboardPageSpec(
+        active_page="customers",
+        title="Clientes",
+        description="Listado de clientes recientes con búsqueda por nombre, teléfono o dirección.",
+    )
+
+
+def menu_page_copy(store: StoreProfileSnapshot) -> DashboardPageSpec:
+    """Return the dashboard copy for the catalog-like settings page."""
+    if store.vertical == StoreVertical.MUNICIPAL:
+        return DashboardPageSpec(
+            active_page="menu",
+            title="Áreas y categorías",
+            description="La configuración de áreas, categorías y subcategorías se habilita en la próxima etapa.",
+        )
+    return DashboardPageSpec(
+        active_page="menu",
+        title="Carta de productos",
+        description="Vista general del catálogo actual. Por ahora es una página de consulta y revisión.",
+    )
+
+
+def home_page_copy(store: StoreProfileSnapshot) -> DashboardPageSpec:
+    """Return the dashboard copy for the tenant home page."""
+    if store.vertical == StoreVertical.MUNICIPAL:
+        return DashboardPageSpec(
+            active_page="home",
+            title="Inicio",
+            description=(
+                "Vista inicial del vertical municipal. En la próxima etapa vamos a sumar casos, áreas y tablero."
+            ),
+        )
+    return DashboardPageSpec(
+        active_page="home",
+        title="Inicio",
+        description="Resumen rápido del local, con métricas y los pedidos más recientes.",
+    )
+
+
+def hours_page_copy(store: StoreProfileSnapshot) -> DashboardPageSpec:
+    """Return the dashboard copy for weekly schedule settings."""
+    if store.vertical == StoreVertical.MUNICIPAL:
+        return DashboardPageSpec(
+            active_page="hours",
+            title="Agenda semanal",
+            description=(
+                "Este vertical no usa la agenda comercial. Las excepciones y turnos municipales llegan después."
+            ),
+        )
+    return DashboardPageSpec(
+        active_page="hours",
+        title="Agenda semanal",
+        description="Configurá los horarios de apertura del local por día de la semana.",
+    )
 
 
 async def load_dashboard_identity(request: Request) -> DashboardIdentity | None:
@@ -634,13 +738,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
             request=request,
             identity=identity,
             flash=flash,
-            page=DashboardPageSpec(
-                active_page="home",
-                title="Inicio",
-                description="Resumen rápido del local, con métricas y los pedidos más recientes.",
-            ),
+            page=home_page_copy(store),
             store=store,
         )
+        if store.vertical == StoreVertical.MUNICIPAL:
+            context["placeholder_points"] = [
+                "El tenant ya enruta conversaciones al vertical municipal.",
+                "El próximo paso suma áreas, categorías y casos con estado.",
+                "La base compartida de vecinos, canales y usuarios ya está lista.",
+            ]
+            return TEMPLATES.TemplateResponse(
+                request=request, name="dashboard_vertical_placeholder.html", context=context
+            )
         context.update(
             {
                 "order_statuses": [
@@ -681,11 +790,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
             request=request,
             identity=identity,
             flash=flash,
-            page=DashboardPageSpec(
-                active_page="customers",
-                title="Clientes",
-                description="Listado de clientes recientes con búsqueda por nombre, teléfono o dirección.",
-            ),
+            page=customers_page_copy(store),
             store=store,
         )
         context.update(
@@ -722,13 +827,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
             request=request,
             identity=identity,
             flash=flash,
-            page=DashboardPageSpec(
-                active_page="menu",
-                title="Carta de productos",
-                description="Vista general del catálogo actual. Por ahora es una página de consulta y revisión.",
-            ),
+            page=menu_page_copy(store),
             store=store,
         )
+        if store.vertical == StoreVertical.MUNICIPAL:
+            context["placeholder_points"] = [
+                "Cada municipio va a definir sus propias áreas de servicio.",
+                "Después sumamos subcategorías y reglas especiales por área.",
+                "La UI definitiva va a reemplazar esta vista transicional.",
+            ]
+            return TEMPLATES.TemplateResponse(
+                request=request, name="dashboard_vertical_placeholder.html", context=context
+            )
         context.update(
             {
                 "menu_categories": categories,
@@ -754,11 +864,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
             request=request,
             identity=identity,
             flash=flash,
-            page=DashboardPageSpec(
-                active_page="profile",
-                title="Perfil del local",
-                description="Datos públicos y operativos del local visibles para el equipo y el checkout.",
-            ),
+            page=profile_page_copy(store),
             store=store,
         )
         return TEMPLATES.TemplateResponse(request=request, name="dashboard_settings_profile.html", context=context)
@@ -781,6 +887,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
                     store_location=str(form.get("store_location", "")) or None,
                     store_description=str(form.get("store_description", "")),
                     assistant_personality=current_store.assistant_personality,
+                    vertical=StoreVertical(str(form.get("vertical", current_store.vertical.value))),
                     transfer_alias=str(form.get("transfer_alias", "")) or None,
                 )
             except ValidationError as error:
@@ -838,6 +945,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
                     store_location=current_store.store_location,
                     store_description=current_store.store_description,
                     assistant_personality=str(form.get("assistant_personality", "")),
+                    vertical=current_store.vertical,
                     transfer_alias=current_store.transfer_alias,
                 )
             except ValidationError as error:
@@ -888,13 +996,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
             request=request,
             identity=identity,
             flash=flash,
-            page=DashboardPageSpec(
-                active_page="hours",
-                title="Agenda semanal",
-                description="Configurá los horarios de apertura del local por día de la semana.",
-            ),
+            page=hours_page_copy(store),
             store=store,
         )
+        if store.vertical == StoreVertical.MUNICIPAL:
+            context["placeholder_points"] = [
+                "La agenda comercial queda desactivada para tenants municipales.",
+                "Más adelante sumamos excepciones por fecha y turnos presenciales.",
+            ]
+            return TEMPLATES.TemplateResponse(
+                request=request, name="dashboard_vertical_placeholder.html", context=context
+            )
         context["hours"] = serialize_store_hours_for_dashboard(hours)
         return TEMPLATES.TemplateResponse(request=request, name="dashboard_settings_hours.html", context=context)
 

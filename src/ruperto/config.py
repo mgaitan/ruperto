@@ -7,6 +7,8 @@ import json
 from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from ruperto.models import StoreVertical
+
 
 class Settings(BaseSettings):
     """Configuration loaded from the environment.
@@ -32,6 +34,7 @@ class Settings(BaseSettings):
     store_location: str | None = None
     store_description: str = "Rotisería de barrio con pedidos asistidos por chat."
     assistant_personality: str = "Amable, ágil y confiable."
+    store_vertical: StoreVertical = StoreVertical.ORDERING
     store_locale: str = "es-AR"
     store_timezone: str = "America/Argentina/Cordoba"
     store_transfer_alias: str | None = "demo.rotiseria"
@@ -97,6 +100,7 @@ class Settings(BaseSettings):
             "store_location": self.store_location,
             "store_description": self.store_description,
             "assistant_personality": self.assistant_personality,
+            "store_vertical": self.store_vertical,
             "store_locale": self.store_locale,
             "store_timezone": self.store_timezone,
             "store_transfer_alias": self.store_transfer_alias,

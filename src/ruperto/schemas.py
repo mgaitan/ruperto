@@ -7,7 +7,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ruperto.models import Channel, ChannelProvider, DeliveryType, OrderStatus, PaymentMethod, StaffRole
+from ruperto.models import Channel, ChannelProvider, DeliveryType, OrderStatus, PaymentMethod, StaffRole, StoreVertical
 
 
 def format_price_ars(amount_cents: int) -> str:
@@ -32,6 +32,7 @@ class StoreProfileSnapshot(BaseSchema):
     store_location: str | None
     store_description: str
     assistant_personality: str
+    vertical: StoreVertical
     locale: str
     currency_code: str
     transfer_alias: str | None
@@ -274,6 +275,7 @@ class StoreProfileUpdateRequest(BaseModel):
     store_location: str | None = None
     store_description: str = Field(min_length=1)
     assistant_personality: str = Field(min_length=1)
+    vertical: StoreVertical = StoreVertical.ORDERING
     transfer_alias: str | None = None
 
 
