@@ -37,6 +37,7 @@ from ruperto.models import (
     utc_now,
 )
 from ruperto.schemas import (
+    ConversationTargetSnapshot,
     CustomerMemorySnapshot,
     CustomerSnapshot,
     DelayEstimateSnapshot,
@@ -701,6 +702,13 @@ class BusinessRepository:
         orders = (await self.session.scalars(statement)).all()
         return [await self._build_order_snapshot(order) for order in orders]
 
+    async def get_order(self, order_id: int) -> OrderSnapshot:
+        """Return one order snapshot by identifier."""
+        order = await self.session.get(Order, order_id)
+        if order is None:
+            raise OrderNotFoundError
+        return await self._build_order_snapshot(order)
+
     async def update_order_status(self, order_id: int, status: OrderStatus) -> OrderSnapshot:
         """Update the operational status for one order."""
         order = await self.session.get(Order, order_id)
@@ -747,6 +755,17 @@ class BusinessRepository:
         external_id: str,
     ) -> list[OutboundNotificationSnapshot]:
         """Return undelivered notifications for one conversation and mark them as delivered."""
+        snapshots = await self.peek_pending_notifications(channel=channel, external_id=external_id)
+        await self.mark_notifications_delivered([snapshot.id for snapshot in snapshots])
+        return snapshots
+
+    async def peek_pending_notifications(
+        self,
+        *,
+        channel: Channel,
+        external_id: str,
+    ) -> list[OutboundNotificationSnapshot]:
+        """Return undelivered notifications for one conversation without consuming them."""
         rows = (
             await self.session.scalars(
                 select(OutboundNotification)
@@ -759,22 +778,48 @@ class BusinessRepository:
                 .order_by(OutboundNotification.id.asc())
             )
         ).all()
+        return [
+            OutboundNotificationSnapshot(
+                id=row.id,
+                order_id=row.order_id,
+                conversation_id=row.conversation_id,
+                event_type=row.event_type,
+                message_text=row.message_text,
+                created_at=row.created_at,
+            )
+            for row in rows
+        ]
+
+    async def mark_notifications_delivered(self, notification_ids: list[int]) -> None:
+        """Mark the given outbound notifications as delivered."""
+        if not notification_ids:
+            return
+        rows = (
+            await self.session.scalars(
+                select(OutboundNotification).where(OutboundNotification.id.in_(notification_ids))
+            )
+        ).all()
         delivered_at = utc_now()
-        snapshots: list[OutboundNotificationSnapshot] = []
         for row in rows:
             row.delivered_at = delivered_at
-            snapshots.append(
-                OutboundNotificationSnapshot(
-                    id=row.id,
-                    order_id=row.order_id,
-                    conversation_id=row.conversation_id,
-                    event_type=row.event_type,
-                    message_text=row.message_text,
-                    created_at=row.created_at,
-                )
-            )
         await self.session.flush()
-        return snapshots
+
+    async def get_order_conversation_target(self, order_id: int) -> ConversationTargetSnapshot | None:
+        """Return the outbound conversation target for one order when available."""
+        row = await self.session.execute(
+            select(Conversation.id, Conversation.channel, Conversation.external_id)
+            .join(Order, Order.conversation_id == Conversation.id)
+            .where(Order.id == order_id)
+        )
+        target = row.one_or_none()
+        if target is None:
+            return None
+        conversation_id, channel, external_id = target
+        return ConversationTargetSnapshot(
+            conversation_id=conversation_id,
+            channel=channel,
+            external_id=external_id,
+        )
 
     async def add_item_to_current_order(
         self,

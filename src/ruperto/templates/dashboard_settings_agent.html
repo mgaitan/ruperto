@@ -1,9 +1,13 @@
-{% extends "dashboard_base.html" %}
-
-{% block content %}
+{% extends "dashboard_base.html" %} {% block content %}
 <section class="grid gap-6 xl:grid-cols-[minmax(0,1fr)_320px]">
-    <article class="rounded-[2rem] border border-white/70 bg-white/85 p-6 shadow-card backdrop-blur">
-        <form action="/dashboard/settings/agent" method="post" class="space-y-4">
+    <article
+        class="rounded-[2rem] border border-white/70 bg-white/85 p-6 shadow-card backdrop-blur"
+    >
+        <form
+            action="/dashboard/settings/agent"
+            method="post"
+            class="space-y-4"
+        >
             <label class="block space-y-2 text-sm font-medium text-slate-700">
                 <span>Nombre del agente</span>
                 <input
@@ -19,7 +23,9 @@
                     class="min-h-48 w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
                     name="assistant_personality"
                     required
-                >{{ store.assistant_personality }}</textarea>
+                >
+{{ store.assistant_personality }}</textarea
+                >
             </label>
             <div class="flex justify-end">
                 <button
@@ -32,28 +38,47 @@
         </form>
     </article>
 
-    <article class="rounded-[2rem] border border-white/70 bg-slate-950 p-6 text-white shadow-card">
-        <p class="text-xs font-semibold uppercase tracking-[0.22em] text-slate-300">Instancia</p>
+    <article
+        class="rounded-[2rem] border border-white/70 bg-slate-950 p-6 text-white shadow-card"
+    >
+        <p
+            class="text-xs font-semibold uppercase tracking-[0.22em] text-slate-300"
+        >
+            Instancia
+        </p>
         <h3 class="mt-2 text-2xl font-semibold">{{ store.bot_name }}</h3>
         <dl class="mt-6 space-y-4 text-sm">
             <div class="rounded-2xl bg-white/5 px-4 py-3">
                 <dt class="font-semibold text-slate-200">Modelo</dt>
-                <dd class="mt-1 text-slate-300">{{ settings_snapshot.gemini_model }}</dd>
+                <dd class="mt-1 text-slate-300">
+                    {{ settings_snapshot.gemini_model }}
+                </dd>
             </div>
             <div class="rounded-2xl bg-white/5 px-4 py-3">
                 <dt class="font-semibold text-slate-200">Entorno</dt>
-                <dd class="mt-1 text-slate-300">{{ settings_snapshot.environment }}</dd>
+                <dd class="mt-1 text-slate-300">
+                    {{ settings_snapshot.environment }}
+                </dd>
             </div>
             <div class="rounded-2xl bg-white/5 px-4 py-3">
                 <dt class="font-semibold text-slate-200">SMTP</dt>
                 <dd class="mt-1 text-slate-300">
-                    {% if settings_snapshot.smtp_configured %}Configurado{% else %}Pendiente{% endif %}
+                    {% if settings_snapshot.smtp_configured %}Configurado{% else
+                    %}Pendiente{% endif %}
                 </dd>
             </div>
             <div class="rounded-2xl bg-white/5 px-4 py-3">
                 <dt class="font-semibold text-slate-200">Kapso</dt>
                 <dd class="mt-1 text-slate-300">
-                    {% if settings_snapshot.kapso_api_key_configured %}Configurado{% else %}Pendiente{% endif %}
+                    {% if settings_snapshot.kapso_api_key_configured
+                    %}Configurado{% else %}Pendiente{% endif %}
+                </dd>
+            </div>
+            <div class="rounded-2xl bg-white/5 px-4 py-3">
+                <dt class="font-semibold text-slate-200">Webhook Kapso</dt>
+                <dd class="mt-1 text-slate-300">
+                    {% if settings_snapshot.kapso_webhook_secret_configured
+                    %}Configurado{% else %}Pendiente{% endif %}
                 </dd>
             </div>
         </dl>

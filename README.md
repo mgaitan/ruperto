@@ -52,6 +52,12 @@ If you plan to send transactional email from the same backend, the SMTP
 settings are now also recognized through `RUPERTO_SMTP_SERVER`,
 `RUPERTO_SMTP_PORT`, `RUPERTO_SMTP_USER`, and `RUPERTO_SMTP_PASSWORD`.
 
+For Kapso-backed WhatsApp, configure:
+
+- `RUPERTO_KAPSO_API_KEY`
+- `RUPERTO_KAPSO_PHONE_NUMBER_ID`
+- `RUPERTO_KAPSO_WEBHOOK_SECRET`
+
 Run the development web chat UI:
 
 ```bash
@@ -75,6 +81,7 @@ You should then have:
 - store profile at `http://127.0.0.1:8000/api/store-profile`
 - menu listing at `http://127.0.0.1:8000/api/menu-items`
 - development chat endpoint at `http://127.0.0.1:8000/api/dev/messages`
+- Kapso WhatsApp webhook at `http://127.0.0.1:8000/webhooks/whatsapp/kapso`
 - development web chat at `http://127.0.0.1:7932/`
 
 The current development flow no longer blocks purely informational questions
@@ -127,6 +134,12 @@ today as one configurable store by default. Dashboard users can already belong
 to more than one store and switch the active store for profile and opening-hour
 management, while orders, customers, and the catalog still use the shared MVP
 data model for now.
+There is now also a first production-shaped WhatsApp integration path through
+Kapso: the backend can receive inbound text messages from the
+`/webhooks/whatsapp/kapso` endpoint, answer through the Kapso proxy, and send
+automatic ready/almost-ready/out-for-delivery notifications when a WhatsApp
+order changes status. The adapter is intentionally isolated behind a channel
+layer so future providers or channels do not leak into the assistant logic.
 
 ## Development
 

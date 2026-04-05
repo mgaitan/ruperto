@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import AsyncIterator, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -19,8 +20,9 @@ from pydantic import ValidationError
 from starlette.middleware.sessions import SessionMiddleware
 
 from ruperto import get_version
-from ruperto.assistant import OrderingAssistantService
 from ruperto.auth import normalize_email
+from ruperto.channels.base import ChannelDeliveryError, InboundCustomerMessage, OutboundCustomerMessage
+from ruperto.channels.service import build_channel_gateway, deliver_order_notifications, handle_inbound_customer_message
 from ruperto.config import Settings
 from ruperto.db import DatabaseRuntime, create_database_runtime, init_database, ping_database
 from ruperto.models import Channel, DeliveryType, OrderStatus, PaymentMethod, StaffRole
@@ -955,6 +957,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
             except OrderNotFoundError as error:
                 raise HTTPException(status_code=404, detail="Order not found.") from error
             await session.commit()
+        with suppress(ChannelDeliveryError):
+            await deliver_order_notifications(
+                session_factory=runtime.database.session_factory,
+                settings=runtime.settings,
+                order_id=order_id,
+            )
         return dashboard_redirect(path="/dashboard", flash="order-updated")
 
     @app.get("/api/store-profile", response_model=StoreProfileSnapshot)
@@ -1056,23 +1064,67 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
         async with runtime.database.session_factory() as session:
             repository = BusinessRepository(session)
             try:
-                updated_order = await repository.update_order_status(order_id, payload.status)
+                await repository.update_order_status(order_id, payload.status)
             except OrderNotFoundError as error:
                 raise HTTPException(status_code=404, detail="Order not found.") from error
             await session.commit()
-            return updated_order
+        with suppress(ChannelDeliveryError):
+            await deliver_order_notifications(
+                session_factory=runtime.database.session_factory,
+                settings=runtime.settings,
+                order_id=order_id,
+            )
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            return await repository.get_order(order_id)
+
+    @app.post("/webhooks/whatsapp/kapso")
+    async def post_kapso_whatsapp_webhook(request: Request) -> dict[str, Any]:
+        runtime = get_runtime(request)
+        gateway = build_channel_gateway(channel=Channel.WHATSAPP, settings=runtime.settings)
+        if gateway is None:
+            raise HTTPException(status_code=503, detail="Kapso WhatsApp is not configured.")
+
+        raw_payload = await request.body()
+        signature = request.headers.get("X-Webhook-Signature")
+        if not gateway.verify_webhook(raw_payload=raw_payload, signature=signature):
+            raise HTTPException(status_code=401, detail="Invalid Kapso webhook signature.")
+
+        try:
+            payload = json.loads(raw_payload)
+        except json.JSONDecodeError as error:
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from error
+
+        inbound_messages = gateway.parse_inbound_messages(payload)
+        handled = 0
+        for inbound_message in inbound_messages:
+            result = await handle_inbound_customer_message(
+                session_factory=runtime.database.session_factory,
+                settings=runtime.settings,
+                inbound_message=inbound_message,
+            )
+            await gateway.send_text(
+                OutboundCustomerMessage(
+                    channel=Channel.WHATSAPP,
+                    external_user_id=inbound_message.external_user_id,
+                    message_text=result.reply.reply_text,
+                )
+            )
+            handled += 1
+
+        return {"status": "ok", "processed": handled}
 
     @app.post("/api/dev/messages", response_model=AssistantTurnResult)
     async def post_dev_message(request: Request, payload: DevMessageRequest) -> AssistantTurnResult:
         runtime = get_runtime(request)
-        service = OrderingAssistantService(
+        return await handle_inbound_customer_message(
             session_factory=runtime.database.session_factory,
             settings=runtime.settings,
-        )
-        return await service.handle_customer_message(
-            channel=Channel.DEV,
-            external_user_id=payload.external_user_id,
-            message_text=payload.message_text,
+            inbound_message=InboundCustomerMessage(
+                channel=Channel.DEV,
+                external_user_id=payload.external_user_id,
+                message_text=payload.message_text,
+            ),
         )
 
     @app.get("/api/dev/notifications", response_model=list[OutboundNotificationSnapshot])

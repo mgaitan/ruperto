@@ -47,6 +47,14 @@ export RUPERTO_SMTP_USER="mailer@example.com"
 export RUPERTO_SMTP_PASSWORD="change-me"
 ```
 
+If you want to test the first Kapso-backed WhatsApp channel, also configure:
+
+```bash
+export RUPERTO_KAPSO_API_KEY="change-me"
+export RUPERTO_KAPSO_PHONE_NUMBER_ID="123456789012345"
+export RUPERTO_KAPSO_WEBHOOK_SECRET="change-me"
+```
+
 You can inspect the effective non-secret settings with:
 
 ```bash
@@ -75,6 +83,7 @@ Then open:
 - `http://127.0.0.1:8000/api/menu-items`
 - `http://127.0.0.1:8000/api/customers`
 - `http://127.0.0.1:8000/api/orders`
+- `http://127.0.0.1:8000/webhooks/whatsapp/kapso`
 
 When invoking modules directly from source, set {term}`PYTHONPATH` so imports resolve cleanly:
 
@@ -157,6 +166,11 @@ curl -X PATCH http://127.0.0.1:8000/api/orders/1/status \
   -H 'content-type: application/json' \
   -d '{"status":"almost_ready"}'
 ```
+
+When that order belongs to a WhatsApp conversation handled through Kapso, the
+backend now tries to deliver the matching proactive customer notification
+automatically through the same channel instead of waiting for the next inbound
+message.
 
 You can also replace the weekly opening-hours schedule. Each weekday accepts
 zero or more slots, so leaving a day without open ranges means the store stays

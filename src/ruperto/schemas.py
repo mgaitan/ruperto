@@ -7,7 +7,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ruperto.models import DeliveryType, OrderStatus, PaymentMethod, StaffRole
+from ruperto.models import Channel, DeliveryType, OrderStatus, PaymentMethod, StaffRole
 
 
 def format_price_ars(amount_cents: int) -> str:
@@ -201,6 +201,14 @@ class OutboundNotificationSnapshot(BaseModel):
     event_type: str
     message_text: str
     created_at: datetime
+
+
+class ConversationTargetSnapshot(BaseModel):
+    """One channel target that can receive outbound notifications."""
+
+    conversation_id: int
+    channel: Channel
+    external_id: str
 
 
 class DevNotificationPollRequest(BaseModel):

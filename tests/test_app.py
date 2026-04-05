@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 from base64 import b64encode
 from datetime import UTC, datetime
@@ -20,8 +22,9 @@ from sqlalchemy import select
 from ruperto.app import create_app, format_dashboard_datetime, parse_store_hours_form
 from ruperto.config import Settings
 from ruperto.db import create_database_runtime, init_database
-from ruperto.models import OrderStatus, StaffRole, StoreMembership
+from ruperto.models import Channel, DeliveryType, OrderStatus, PaymentMethod, StaffRole, StoreMembership
 from ruperto.repository import BusinessRepository
+from ruperto.schemas import AssistantTurnResult
 
 HTTP_OK = 200
 HTTP_NOT_FOUND = 404
@@ -29,6 +32,8 @@ HTTP_FOUND = 303
 HTTP_FORBIDDEN = 403
 HTTP_UNAUTHORIZED = 401
 HTTP_UNPROCESSABLE_ENTITY = 422
+HTTP_BAD_REQUEST = 400
+HTTP_SERVICE_UNAVAILABLE = 503
 MIN_MENU_ITEMS = 35
 DEFAULT_WEEKLY_HOURS = 7
 TENANT_STORE_ID = 7
@@ -49,6 +54,11 @@ def build_settings(tmp_path: Path, *, auto_init_db: bool = True) -> Settings:
         dashboard_admin_password=SecretStr("super-secret"),
         dashboard_admin_name="Staff User",
     )
+
+
+def build_kapso_signature(*, payload: bytes, secret: str) -> str:
+    """Build the Kapso HMAC signature for one raw payload."""
+    return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
 
 
 def login_dashboard(client: TestClient, *, email: str = "staff@example.com", password: str = "super-secret"):
@@ -132,6 +142,36 @@ async def add_staff_user_to_default_store(settings: Settings):
     await runtime.engine.dispose()
 
 
+async def create_whatsapp_confirmed_order(settings: Settings) -> int:
+    """Create one confirmed WhatsApp order ready for status transitions."""
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(
+            channel=Channel.WHATSAPP,
+            external_id="+5493513308454",
+            phone_number="+5493513308454",
+        )
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.WHATSAPP,
+            external_id="+5493513308454",
+            customer_id=customer.id,
+        )
+        await repository.add_item_to_current_order(
+            customer_id=customer.id,
+            conversation_id=conversation.id,
+            sku="hamburguesa-doble",
+            quantity=1,
+        )
+        await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.PICKUP)
+        confirmed_order = await repository.set_order_payment_method(customer.id, conversation.id, PaymentMethod.CASH)
+        confirmed_order = await repository.confirm_current_order(customer.id, conversation.id)
+        await session.commit()
+    await runtime.engine.dispose()
+    return confirmed_order.id
+
+
 def test_root_endpoint(tmp_path: Path):
     """The root endpoint exposes basic service metadata."""
     app = create_app(build_settings(tmp_path))
@@ -183,6 +223,147 @@ def test_demo_chat_page_renders_the_browser_harness(tmp_path: Path):
     assert "purify.min.js" in response.text
 
 
+def test_kapso_webhook_requires_valid_signature(tmp_path: Path):
+    """Kapso webhooks are rejected when the signature does not match."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "kapso_api_key": SecretStr("kapso-key"),
+            "kapso_phone_number_id": "597907523413541",
+            "kapso_webhook_secret": SecretStr("kapso-secret"),
+        }
+    )
+    app = create_app(settings)
+    payload = {
+        "event": "whatsapp.message.received",
+        "message": {
+            "id": "wamid.123",
+            "from": "5493513308454",
+            "timestamp": "1730092800",
+            "type": "text",
+            "text": {"body": "Hola"},
+        },
+        "conversation": {
+            "id": "conv_123",
+            "phone_number": "+5493513308454",
+            "phone_number_id": "597907523413541",
+            "kapso": {"contact_name": "Pedro"},
+        },
+        "phone_number_id": "597907523413541",
+    }
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhooks/whatsapp/kapso",
+            content=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-Webhook-Signature": "bad-signature"},
+        )
+
+    assert response.status_code == HTTP_UNAUTHORIZED
+
+
+def test_kapso_webhook_requires_runtime_configuration(tmp_path: Path):
+    """Kapso webhook processing stays disabled until the runtime credentials exist."""
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhooks/whatsapp/kapso",
+            content=b"{}",
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert response.status_code == HTTP_SERVICE_UNAVAILABLE
+
+
+def test_kapso_webhook_rejects_invalid_json(tmp_path: Path):
+    """Kapso webhook processing rejects malformed JSON payloads."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "kapso_api_key": SecretStr("kapso-key"),
+            "kapso_phone_number_id": "597907523413541",
+            "kapso_webhook_secret": SecretStr("kapso-secret"),
+        }
+    )
+    app = create_app(settings)
+    raw_payload = b"{bad json"
+    signature = build_kapso_signature(payload=raw_payload, secret="kapso-secret")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhooks/whatsapp/kapso",
+            content=raw_payload,
+            headers={"Content-Type": "application/json", "X-Webhook-Signature": signature},
+        )
+
+    assert response.status_code == HTTP_BAD_REQUEST
+
+
+def test_kapso_webhook_processes_inbound_message_and_sends_reply(tmp_path: Path, mocker):
+    """Kapso inbound webhooks are normalized, processed, and answered."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "kapso_api_key": SecretStr("kapso-key"),
+            "kapso_phone_number_id": "597907523413541",
+            "kapso_webhook_secret": SecretStr("kapso-secret"),
+        }
+    )
+    app = create_app(settings)
+    fake_result = AssistantTurnResult.model_validate(
+        {
+            "conversation_id": 1,
+            "customer": {"id": 1, "name": "Pedro", "phone_number": "+5493513308454", "default_address": None},
+            "reply": {"reply_text": "Hola Pedro, ¿qué te gustaría pedir?", "next_step": "choose_items"},
+            "current_order": None,
+        }
+    )
+    handled_messages = []
+    sent_payloads: list[dict[str, Any]] = []
+
+    async def fake_handle_inbound_customer_message(*, session_factory, settings, inbound_message):
+        handled_messages.append(inbound_message)
+        return fake_result
+
+    async def fake_send_text(self, message):
+        sent_payloads.append({"to": message.external_user_id, "text": message.message_text})
+
+    mocker.patch("ruperto.app.handle_inbound_customer_message", side_effect=fake_handle_inbound_customer_message)
+    mocker.patch("ruperto.channels.kapso_whatsapp.KapsoWhatsAppGateway.send_text", new=fake_send_text)
+
+    payload = {
+        "event": "whatsapp.message.received",
+        "message": {
+            "id": "wamid.123",
+            "from": "5493513308454",
+            "timestamp": "1730092800",
+            "type": "text",
+            "text": {"body": "Hola, ¿tenés menú?"},
+        },
+        "conversation": {
+            "id": "conv_123",
+            "phone_number": "+5493513308454",
+            "phone_number_id": "597907523413541",
+            "kapso": {"contact_name": "Pedro"},
+        },
+        "phone_number_id": "597907523413541",
+    }
+    raw_payload = json.dumps(payload).encode("utf-8")
+    signature = build_kapso_signature(payload=raw_payload, secret="kapso-secret")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhooks/whatsapp/kapso",
+            content=raw_payload,
+            headers={"Content-Type": "application/json", "X-Webhook-Signature": signature},
+        )
+
+    assert response.status_code == HTTP_OK
+    assert response.json() == {"status": "ok", "processed": 1}
+    assert handled_messages[0].external_user_id == "+5493513308454"
+    assert handled_messages[0].sender_name == "Pedro"
+    assert handled_messages[0].message_text == "Hola, ¿tenés menú?"
+    assert sent_payloads == [{"to": "+5493513308454", "text": "Hola Pedro, ¿qué te gustaría pedir?"}]
+
+
 def test_format_dashboard_datetime_formats_local_time():
     """Dashboard timestamps are shown in the configured local timezone."""
     value = datetime(2026, 4, 4, 15, 30, tzinfo=UTC)
@@ -206,11 +387,27 @@ def test_public_settings_marks_secret_configuration():
     assert public["gemini_api_key_configured"] is True
     assert public["kapso_api_key_configured"] is True
     assert public["default_store_id"] == TENANT_STORE_ID
+    assert public["kapso_webhook_secret_configured"] is False
     assert public["smtp_server"] == "smtp.example.com"
     assert public["smtp_port"] == SMTP_PORT
     assert public["smtp_user"] == "mailer@example.com"
     assert public["smtp_password_configured"] is True
     assert public["smtp_configured"] is True
+
+
+def test_public_settings_marks_kapso_webhook_secret_configuration():
+    """Kapso webhook secrets are exposed as safe configured flags only."""
+    settings = Settings(
+        kapso_api_key=SecretStr("kapso-key"),
+        kapso_phone_number_id="597907523413541",
+        kapso_webhook_secret=SecretStr("kapso-secret"),
+    )
+
+    public = settings.public_settings()
+
+    assert public["kapso_api_key_configured"] is True
+    assert public["kapso_phone_number_id"] == "597907523413541"
+    assert public["kapso_webhook_secret_configured"] is True
 
 
 def collect_tool_returns(messages: list[ModelMessage]) -> dict[str, Any]:
@@ -394,6 +591,34 @@ def test_staff_can_update_order_status(tmp_path: Path, monkeypatch: pytest.Monke
 
     assert status_response.status_code == HTTP_OK
     assert status_response.json()["status"] == OrderStatus.ALMOST_READY.value
+
+
+def test_order_status_update_delivers_whatsapp_notifications(tmp_path: Path, mocker):
+    """Status changes dispatch queued notifications through the WhatsApp gateway."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "kapso_api_key": SecretStr("kapso-key"),
+            "kapso_phone_number_id": "597907523413541",
+            "kapso_webhook_secret": SecretStr("kapso-secret"),
+        }
+    )
+    order_id = anyio.run(create_whatsapp_confirmed_order, settings)
+    app = create_app(settings)
+    sent_payloads: list[dict[str, Any]] = []
+
+    async def fake_send_text(self, message):
+        sent_payloads.append({"to": message.external_user_id, "text": message.message_text})
+
+    mocker.patch("ruperto.channels.kapso_whatsapp.KapsoWhatsAppGateway.send_text", new=fake_send_text)
+
+    with TestClient(app) as client:
+        response = client.patch(
+            f"/api/orders/{order_id}/status",
+            json={"status": OrderStatus.ALMOST_READY.value},
+        )
+
+    assert response.status_code == HTTP_OK
+    assert sent_payloads == [{"to": "+5493513308454", "text": "Tu pedido ya casi está 👀"}]
 
 
 def test_dev_notifications_endpoint_returns_pending_messages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

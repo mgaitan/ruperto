@@ -94,10 +94,17 @@ RUPERTO_ASSISTANT_MODEL_RETRY_ATTEMPTS
 
 RUPERTO_KAPSO_API_KEY
   API key for Kapso WhatsApp operations.
-  This is reserved for the future channel adapter work.
+  Used by the Kapso-backed WhatsApp adapter to send assistant replies and
+  proactive order-status notifications.
 
 RUPERTO_KAPSO_PHONE_NUMBER_ID
   Kapso or WhatsApp phone number identifier used by outbound messaging.
+
+RUPERTO_KAPSO_WEBHOOK_SECRET
+  Shared secret used to verify the `X-Webhook-Signature` header sent by Kapso
+  phone-number webhooks.
+  Use the same value when you create the webhook in Kapso for
+  `/webhooks/whatsapp/kapso`.
 
 PYTHONPATH
   Python import search path.
