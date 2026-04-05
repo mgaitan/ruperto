@@ -54,6 +54,8 @@ Reglas operativas:
 - Si el cliente ya es conocido y hay una memoria útil, podés mencionarla con naturalidad.
 - Si preguntan por demora o tiempo estimado, usá la herramienta de demora disponible.
 - Si el local está cerrado, podés seguir ayudando pero avisá claramente cuándo vuelve a abrir.
+- No repitas el aviso de local cerrado en todos los turnos: alcanza con mencionarlo al inicio
+  o cuando el horario realmente cambie la respuesta.
 - Los avisos de estado salen automáticamente por este medio
   cuando el pedido está casi listo, listo para retirar o en reparto.
 - Si el cliente ya eligió una comida y todavía no sumó bebida ni postre,
@@ -127,6 +129,11 @@ SUSPICIOUS_INFORMATIONAL_REPLY_PATTERNS = (
     re.compile(r"\bgracias por tu compra\b", re.IGNORECASE),
     re.compile(r"\babonar[áa]s?\b", re.IGNORECASE),
 )
+MENU_NOT_FOUND_REPLY_PATTERNS = (
+    re.compile(r"\bno encontr[ée]\b", re.IGNORECASE),
+    re.compile(r"\bno tenemos\b", re.IGNORECASE),
+    re.compile(r"\bno figura\b", re.IGNORECASE),
+)
 ORDER_INTENT_HINTS = (
     "quiero",
     "quisiera",
@@ -157,6 +164,11 @@ INFORMATIONAL_MENU_HINTS = (
     "menu",
 )
 MENU_INFORMATION_GROUPS = {
+    "cervezas": {
+        "message_hints": ("cerveza", "cervezas", "birra", "birrita", "cervecita", "ipa", "rubia", "roja"),
+        "item_hints": ("cerveza", "ipa", "rubia", "roja"),
+        "category_hints": ("bebidas",),
+    },
     "gaseosas": {
         "message_hints": ("gaseosa", "gaseosas", "coca", "cola", "sprite", "lima-limón", "naranja"),
         "item_hints": ("gaseosa", "cola", "lima-limón", "naranja"),
@@ -189,6 +201,30 @@ MENU_CONSTRAINT_PATTERNS = {
         "sin bebidas alcohólicas",
     ),
 }
+COLLOQUIAL_MENU_ITEM_ALIASES = {
+    "burger veggie": "hamburguesa-veg",
+    "burguer veggie": "hamburguesa-veg",
+}
+COLLOQUIAL_MENU_CATEGORY_ALIASES = {
+    "cervecita": "cervezas",
+    "cervecitas": "cervezas",
+    "birrita": "cervezas",
+    "birra": "cervezas",
+}
+UNSUPPORTED_CUSTOMIZATION_HINTS = (
+    "doble picante",
+    "triple cheddar",
+    "doble cheddar",
+    "triple picante",
+    "extra cheddar",
+    "extra picante",
+)
+CUSTOMIZATION_ACCEPTANCE_PATTERNS = (
+    re.compile(r"\bya anot", re.IGNORECASE),
+    re.compile(r"\banotamos\b", re.IGNORECASE),
+    re.compile(r"\blo (?:vamos a )?preparar as[ií]\b", re.IGNORECASE),
+    re.compile(r"\bqued[oó] con\b", re.IGNORECASE),
+)
 COMMON_MENU_SYNONYMS = {
     "muzzarella": ("muzza",),
     "hamburguesa": ("burger", "burguer"),
@@ -899,6 +935,11 @@ class OrderingAssistantService:
             history = await repository.load_conversation_messages(conversation.id)
             latest_assistant_text = self._extract_latest_assistant_text(history)
             latest_user_text = self._extract_latest_user_text(history)
+            closed_store_context_text = (
+                latest_assistant_text
+                if latest_assistant_text is not None or not self._has_prior_conversation(history)
+                else "closed-store-notice already shown"
+            )
             pending_customer_message = await repository.get_pending_customer_message(conversation.id)
             current_order_before_run = await repository.get_current_order(
                 customer.id,
@@ -951,7 +992,7 @@ class OrderingAssistantService:
                     current_order=current_order_before_run,
                     pending_customer_message=resumed_pending_message,
                     previous_user_message=latest_user_text,
-                    latest_assistant_text=latest_assistant_text,
+                    latest_assistant_text=closed_store_context_text,
                 ),
                 allow_order_mutations=turn_policy.allow_order_mutations,
                 allow_order_confirmation=turn_policy.allow_order_confirmation,
@@ -1056,7 +1097,7 @@ class OrderingAssistantService:
                 reply,
                 availability,
                 conversation_id=conversation_id,
-                latest_assistant_text=latest_assistant_text,
+                latest_assistant_text=closed_store_context_text,
                 current_order=current_order,
             )
             reply = self._ground_reply_for_turn_policy(reply, turn_policy, current_order=current_order)
@@ -1066,6 +1107,17 @@ class OrderingAssistantService:
                     repository=repository,
                     message_text=message_text,
                     previous_user_message=latest_user_text,
+                    turn_policy=turn_policy,
+                )
+                reply, current_order = await self._recover_colloquial_menu_reply(
+                    reply,
+                    repository=repository,
+                    message_text=message_text,
+                    customer=refreshed_customer,
+                    conversation_id=conversation_id,
+                    current_order=current_order,
+                    delay=delay,
+                    store=store,
                     turn_policy=turn_policy,
                 )
                 reply = self._guide_reply_with_current_order(
@@ -1097,13 +1149,19 @@ class OrderingAssistantService:
                     ),
                     availability=availability,
                     conversation_id=conversation_id,
-                    latest_assistant_text=latest_assistant_text,
+                    latest_assistant_text=closed_store_context_text,
+                )
+                reply = self._stabilize_customization_reply(
+                    reply,
+                    message_text=message_text,
+                    previous_user_message=latest_user_text,
+                    current_order=current_order,
                 )
                 reply = self._decorate_reply_with_store_availability(
                     reply,
                     availability,
                     conversation_id=conversation_id,
-                    latest_assistant_text=latest_assistant_text,
+                    latest_assistant_text=closed_store_context_text,
                     current_order=current_order,
                 )
             delivery_info_request = self._message_requests_delivery_information(message_text)
@@ -1479,6 +1537,21 @@ class OrderingAssistantService:
                 f"{menu_information_focus}. "
                 "Usá el menú para responder con 2 a 4 opciones concretas y sus precios, no solo con un sí o un no."
             )
+        if item_alias_sku := self._detect_colloquial_item_alias(message_text):
+            hints.append(
+                "El cliente usó un alias coloquial del menú. "
+                f"Interpretalo como el SKU `{item_alias_sku}` y no respondas que no existe."
+            )
+        if category_alias := self._detect_colloquial_category_alias(message_text):
+            hints.append(
+                "El cliente usó una forma coloquial de pedir una categoría del menú. "
+                f"Interpretala como `{category_alias}` y ofrecé opciones concretas."
+            )
+        if self._message_requests_unsupported_customization(message_text, previous_user_message):
+            hints.append(
+                "El cliente está pidiendo una personalización que no está modelada como variante del menú. "
+                "No prometas que ya quedó aceptada si no la pudiste persistir explícitamente."
+            )
 
         if self._message_requests_total(message_text):
             if menu_information_focus is not None:
@@ -1495,6 +1568,11 @@ class OrderingAssistantService:
             hints.append(
                 "El cliente está haciendo una consulta informativa sobre envío o zona. "
                 "Respondé eso sin empujarlo al próximo paso del checkout ni asumir que ya confirmó el pedido."
+            )
+        if self._contains_recent_closed_store_notice(latest_assistant_text):
+            hints.append(
+                "Ya avisaste hace poco que el local está cerrado. "
+                "No repitas ese aviso salvo que sea necesario para explicar una restricción horaria."
             )
         if pending_customer_message is not None:
             hints.append(
@@ -1532,6 +1610,30 @@ class OrderingAssistantService:
         if not hints:
             return None
         return " ".join(hints)
+
+    def _reply_denies_menu_match(self, reply_text: str) -> bool:
+        """Return whether the assistant just claimed that no menu match was found."""
+        return any(pattern.search(reply_text) for pattern in MENU_NOT_FOUND_REPLY_PATTERNS)
+
+    def _message_requests_unsupported_customization(
+        self,
+        message_text: str,
+        previous_user_message: str | None = None,
+    ) -> bool:
+        """Return whether the customer is asking for extras the current menu model cannot promise."""
+        messages = [message_text]
+        if previous_user_message is not None:
+            messages.append(previous_user_message)
+
+        return any(
+            hint in self._normalize_menu_text(raw_message)
+            for raw_message in messages
+            for hint in UNSUPPORTED_CUSTOMIZATION_HINTS
+        )
+
+    def _reply_claims_customization_supported(self, reply_text: str) -> bool:
+        """Return whether the assistant is claiming that a customization was already accepted."""
+        return any(pattern.search(reply_text) for pattern in CUSTOMIZATION_ACCEPTANCE_PATTERNS)
 
     def _build_current_order_context_hints(
         self,
@@ -1796,6 +1898,11 @@ class OrderingAssistantService:
         lowered = message_text.casefold()
         return "uno y uno" in lowered or "uno de cada" in lowered
 
+    def _message_is_generic_customization_follow_up(self, message_text: str) -> bool:
+        """Return whether the customer is asking if a previously mentioned customization is feasible."""
+        lowered = self._normalize_menu_text(message_text)
+        return "eso se puede" in lowered or lowered.startswith("se puede")
+
     def _message_requests_delivery_information(self, message_text: str) -> bool:
         """Return whether the user is asking for delivery coverage or delivery pricing."""
         lowered = message_text.casefold()
@@ -1863,8 +1970,26 @@ class OrderingAssistantService:
             return None
         return self._match_menu_information_focus(previous_user_message.casefold())
 
+    def _detect_colloquial_item_alias(self, message_text: str) -> str | None:
+        """Return the canonical SKU for one supported colloquial menu alias."""
+        lowered = self._normalize_menu_text(message_text)
+        for alias, sku in COLLOQUIAL_MENU_ITEM_ALIASES.items():
+            if alias in lowered:
+                return sku
+        return None
+
+    def _detect_colloquial_category_alias(self, message_text: str) -> str | None:
+        """Return the canonical menu-information focus for one colloquial category alias."""
+        lowered = self._normalize_menu_text(message_text)
+        for alias, focus in COLLOQUIAL_MENU_CATEGORY_ALIASES.items():
+            if alias in lowered:
+                return focus
+        return None
+
     def _match_menu_information_focus(self, lowered_message: str) -> str | None:
         """Return the canonical menu-information focus mentioned in one message."""
+        if focus := self._detect_colloquial_category_alias(lowered_message):
+            return focus
         for focus, config in MENU_INFORMATION_GROUPS.items():
             if any(hint in lowered_message for hint in config["message_hints"]):
                 return focus
@@ -2058,6 +2183,7 @@ class OrderingAssistantService:
             return reply
 
         focus_label = {
+            "cervezas": "cervezas",
             "gaseosas": "gaseosas",
             "bebidas": "bebidas",
             "papas": "papas",
@@ -2077,6 +2203,109 @@ class OrderingAssistantService:
             update={
                 "reply_text": reply_text,
                 "next_step": AssistantNextStep.CHOOSE_ITEMS,
+            }
+        )
+
+    async def _recover_colloquial_menu_reply(  # noqa: PLR0913
+        self,
+        reply: AssistantReply,
+        *,
+        repository: BusinessRepository,
+        message_text: str,
+        customer: CustomerSnapshot,
+        conversation_id: int,
+        current_order: OrderSnapshot | None,
+        delay: DelayEstimateSnapshot | None,
+        store: StoreProfileSnapshot,
+        turn_policy: TurnPolicy,
+    ) -> tuple[AssistantReply, OrderSnapshot | None]:
+        """Recover useful outcomes when the model misses a common colloquial menu alias."""
+        if not turn_policy.allow_order_mutations or not self._reply_denies_menu_match(reply.reply_text):
+            return reply, current_order
+
+        if (item_alias_sku := self._detect_colloquial_item_alias(message_text)) and (
+            current_order is None or not current_order.items
+        ):
+            current_order = await repository.add_item_to_current_order(
+                customer.id,
+                conversation_id,
+                sku=item_alias_sku,
+                quantity=1,
+            )
+            delay = await repository.get_estimated_delay(customer.id, conversation_id)
+            recovered_reply = self._guide_reply_with_current_order(
+                AssistantReply(
+                    reply_text="Anotado.",
+                    next_step=AssistantNextStep.CHOOSE_ITEMS,
+                    handoff=False,
+                ),
+                customer=customer,
+                current_order=current_order,
+                message_text=message_text,
+                delay=delay,
+                store=store,
+                order_changed_during_turn=True,
+                item_lines_changed_during_turn=True,
+            )
+            return recovered_reply, current_order
+
+        if focus := self._detect_colloquial_category_alias(message_text):
+            matching_items = self._filter_menu_options_for_focus(
+                await repository.list_menu_items(),
+                focus=focus,
+            )[:3]
+            if matching_items:
+                options_block = "\n".join(f"- {item.name}: {item.price_display}" for item in matching_items)
+                return (
+                    reply.model_copy(
+                        update={
+                            "reply_text": (
+                                f"Si querías una cerveza, tenemos estas opciones:\n{options_block}\n\n"
+                                "¿Cuál te gustaría sumar?"
+                            ),
+                            "next_step": AssistantNextStep.CHOOSE_ITEMS,
+                            "handoff": False,
+                        }
+                    ),
+                    current_order,
+                )
+
+        return reply, current_order
+
+    def _stabilize_customization_reply(
+        self,
+        reply: AssistantReply,
+        *,
+        message_text: str,
+        previous_user_message: str | None,
+        current_order: OrderSnapshot | None,
+    ) -> AssistantReply:
+        """Avoid promising unsupported customizations that were not persisted in the draft."""
+        if current_order is None or not current_order.items:
+            return reply
+        if any(item.notes for item in current_order.items):
+            return reply
+        if not self._message_requests_unsupported_customization(message_text, previous_user_message):
+            return reply
+        if not (
+            self._reply_claims_customization_supported(reply.reply_text)
+            or (
+                self._message_is_generic_customization_follow_up(message_text) and self._reply_is_checkout_prompt(reply)
+            )
+        ):
+            return reply
+
+        base_item_name = current_order.items[-1].name
+        return reply.model_copy(
+            update={
+                "reply_text": (
+                    f"Puedo dejarte {base_item_name} tal como figura en el menú, "
+                    "pero desde acá no tengo cargadas variantes como doble picante o triple cheddar "
+                    "para prometerlas automáticamente. Si querés, sigo con la versión estándar o te derivo "
+                    "con una persona para confirmarlo."
+                ),
+                "next_step": AssistantNextStep.CHOOSE_ITEMS,
+                "handoff": False,
             }
         )
 
@@ -2101,11 +2330,19 @@ class OrderingAssistantService:
         current_order: OrderSnapshot | None,
     ) -> AssistantReply:
         """Prefix replies when the store is currently closed."""
+        cleaned_text = self._strip_redundant_closed_store_notice(
+            reply.reply_text,
+            latest_assistant_text=latest_assistant_text,
+        )
+        if cleaned_text != reply.reply_text:
+            reply = reply.model_copy(update={"reply_text": cleaned_text})
         if availability.is_open:
             return reply
         if current_order is not None and (
             current_order.requested_ready_at is not None or current_order.status.value == "confirmed"
         ):
+            return reply
+        if latest_assistant_text is not None:
             return reply
         return reply.model_copy(
             update={
@@ -2137,6 +2374,32 @@ class OrderingAssistantService:
         if reply_text.startswith(message_text):
             return reply_text
         return f"{message_text}{reply_text}"
+
+    def _strip_redundant_closed_store_notice(
+        self,
+        reply_text: str,
+        *,
+        latest_assistant_text: str | None,
+    ) -> str:
+        """Remove one leading closed-store notice when the conversation already received it recently."""
+        if latest_assistant_text is None:
+            return reply_text
+        stripped = reply_text.strip()
+        if not self._contains_recent_closed_store_notice(stripped):
+            return reply_text
+
+        if match := re.match(
+            r"^(?:Ahora|Justo ahora|En este momento)[^.?!]*abrimos[^.?!]*[.?!]\s*",
+            stripped,
+            re.IGNORECASE,
+        ):
+            remainder = stripped[match.end() :].lstrip()
+            return remainder or reply_text
+
+        sentences = re.split(r"(?<=[.!?])\s+", stripped, maxsplit=1)
+        if len(sentences) > 1 and self._contains_recent_closed_store_notice(sentences[0]):
+            return sentences[1]
+        return reply_text
 
     def _finalize_confirmed_order_reply(  # noqa: PLR0913
         self,

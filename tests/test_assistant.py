@@ -11,7 +11,15 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import SecretStr
-from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from ruperto.assistant import (
@@ -266,6 +274,62 @@ def price_comparison_model(messages: list[ModelMessage], info: AgentInfo) -> Mod
             )
         ],
         model_name="function:test-price-comparison",
+    )
+
+
+def colloquial_not_found_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Pretend the model missed a colloquial menu alias."""
+    return ModelResponse(
+        parts=[
+            ToolCallPart(
+                info.output_tools[0].name,
+                {
+                    "reply_text": "No encontré ese producto en el menú.",
+                    "next_step": "choose_items",
+                    "handoff": False,
+                },
+            )
+        ],
+        model_name="function:test-colloquial-not-found",
+    )
+
+
+def unsupported_customization_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Pretend the model is wrongly promising an unsupported customization."""
+    return ModelResponse(
+        parts=[
+            ToolCallPart(
+                info.output_tools[0].name,
+                {
+                    "reply_text": (
+                        "Sí, ya anotamos tu hamburguesa con doble picante y triple cheddar. La vamos a preparar así."
+                    ),
+                    "next_step": "choose_items",
+                    "handoff": False,
+                },
+            )
+        ],
+        model_name="function:test-unsupported-customization",
+    )
+
+
+def unsupported_customization_checkout_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Pretend the model ignored the feasibility question and jumped to checkout."""
+    return ModelResponse(
+        parts=[
+            ToolCallPart(
+                info.output_tools[0].name,
+                {
+                    "reply_text": (
+                        "Anotado, Nico: hasta ahora va 1 x Hamburguesa picante por $ 12.100. "
+                        "¿Querés envío o retirás por el local?"
+                    ),
+                    "next_step": "choose_delivery",
+                    "handoff": False,
+                },
+            )
+        ],
+        model_name="function:test-unsupported-customization-checkout",
     )
 
 
@@ -635,7 +699,10 @@ async def test_assistant_schedules_a_closed_store_order_for_a_future_time(tmp_pa
     await runtime.engine.dispose()
 
 
-async def test_assistant_reports_schedule_errors_without_overwriting_them(tmp_path: Path):
+async def test_assistant_reports_schedule_errors_without_overwriting_them(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     """An invalid requested time should surface the scheduling error instead of normal checkout guidance."""
     settings = build_settings(tmp_path)
     runtime = create_database_runtime(settings)
@@ -648,33 +715,27 @@ async def test_assistant_reports_schedule_errors_without_overwriting_them(tmp_pa
         name="Martina",
     )
 
-    async with runtime.session_factory() as session:
-        repository = BusinessRepository(session)
-        await repository.replace_store_business_hours(
-            hours=[
-                StoreBusinessHoursSnapshot(
-                    id=0,
-                    store_id=1,
-                    weekday=weekday,
-                    opens_at="00:00",
-                    closes_at="23:59",
-                    closed=False,
-                )
-                for weekday in range(7)
-            ]
-        )
-        await session.commit()
+    fixed_local_now = datetime(2026, 4, 4, 12, 0, tzinfo=ZoneInfo(STORE_TIMEZONE))
+    local_ready = fixed_local_now + timedelta(minutes=5)
+    monkeypatch.setattr(
+        service,
+        "_extract_requested_ready_at",
+        lambda message_text, *, timezone_name: local_ready.astimezone(UTC),
+    )
+    schedule_error = ValueError("Horario inválido de prueba.")
 
-    local_ready = datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(minutes=5)
-    time_text = local_ready.strftime("%H:%M")
+    async def raise_schedule_error(*args: Any, **kwargs: Any) -> OrderSnapshot:
+        raise schedule_error
+
+    monkeypatch.setattr(BusinessRepository, "set_order_requested_ready_at", raise_schedule_error)
     reply = await service.handle_customer_message(
         channel=Channel.DEV,
         external_user_id="cliente-hora-invalida",
-        message_text=f"Quiero una hamburguesa para las {time_text}",
+        message_text="Quiero una hamburguesa para las 12:05",
         model=FunctionModel(add_item_only_model),
     )
 
-    assert "necesito un poco más de tiempo" in reply.reply.reply_text
+    assert "Horario inválido de prueba." in reply.reply.reply_text
     assert reply.reply.next_step == AssistantNextStep.CHOOSE_DELIVERY
 
     await runtime.engine.dispose()
@@ -2521,6 +2582,101 @@ async def test_handle_customer_message_stabilizes_delivery_info_questions_withou
     await runtime.engine.dispose()
 
 
+async def test_handle_customer_message_recovers_colloquial_item_aliases(tmp_path: Path):
+    """Colloquial exact aliases should still add the intended item when the model misses them."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        service,
+        channel=Channel.DEV,
+        external_user_id="colloquial-item-user",
+        name="Fer",
+    )
+
+    result = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="colloquial-item-user",
+        message_text="Quiero una burger veggie.",
+        model=FunctionModel(colloquial_not_found_model),
+    )
+
+    assert result.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
+    assert "Hamburguesa veggie" in result.reply.reply_text
+    assert result.current_order is not None
+    assert [item.name for item in result.current_order.items] == ["Hamburguesa veggie"]
+
+    await runtime.engine.dispose()
+
+
+async def test_handle_customer_message_recovers_colloquial_category_aliases(tmp_path: Path):
+    """Colloquial beverage aliases should fall back to concrete menu options instead of a miss."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        service,
+        channel=Channel.DEV,
+        external_user_id="colloquial-category-user",
+        name="Fer",
+    )
+
+    result = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="colloquial-category-user",
+        message_text="Sumame una cervecita.",
+        model=FunctionModel(colloquial_not_found_model),
+    )
+
+    assert result.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
+    assert "si querías una cerveza" in result.reply.reply_text.lower()
+    assert "Cerveza rubia lata" in result.reply.reply_text
+    assert result.current_order is None
+
+    await runtime.engine.dispose()
+
+
+async def test_recover_colloquial_menu_reply_keeps_original_when_no_alias_matches(tmp_path: Path):
+    """Unknown colloquial wording should keep the original reply unchanged."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(channel=Channel.WHATSAPP, external_id="alias-fallback")
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.WHATSAPP,
+            external_id="alias-fallback",
+            customer_id=customer.id,
+        )
+        store = await repository.get_store_profile()
+        reply = AssistantReply(
+            reply_text="No encontré ese producto en el menú.",
+            next_step=AssistantNextStep.CHOOSE_ITEMS,
+            handoff=False,
+        )
+
+        recovered_reply, recovered_order = await service._recover_colloquial_menu_reply(
+            reply,
+            repository=repository,
+            message_text="Quiero una limonada.",
+            customer=customer,
+            conversation_id=conversation.id,
+            current_order=None,
+            delay=None,
+            store=store,
+            turn_policy=TurnPolicy(allow_order_mutations=True, allow_order_confirmation=False),
+        )
+
+        assert recovered_reply == reply
+        assert recovered_order is None
+
+    await runtime.engine.dispose()
+
+
 async def test_guide_reply_with_current_order_keeps_informational_delivery_answer_when_it_is_already_useful(
     tmp_path: Path,
 ):
@@ -2749,6 +2905,51 @@ async def test_closed_store_text_helpers_cover_recent_notice_branches(tmp_path: 
 
     assert "cerrad" in decorated_reply.reply_text.lower()
     assert recent_notice == "Seguimos con el pedido"
+
+    await runtime.engine.dispose()
+
+
+async def test_strip_redundant_closed_store_notice_removes_leading_repeat(tmp_path: Path):
+    """Redundant closed-store prefixes from the model should be stripped after the first notice."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+
+    stripped = service._strip_redundant_closed_store_notice(
+        "Ahora estamos cerrados 😴 Abrimos mañana a las 11:00. Dale, tengo una pizza napolitana.",
+        latest_assistant_text="Justo ahora el local está cerrado 😴 Abrimos mañana a las 11:00. ¿Qué querés pedir?",
+    )
+
+    assert stripped == "Dale, tengo una pizza napolitana."
+
+    await runtime.engine.dispose()
+
+
+async def test_strip_redundant_closed_store_notice_handles_sentence_fallback(tmp_path: Path):
+    """Closed-store stripping should fall back to removing the first sentence when needed."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+
+    stripped = service._strip_redundant_closed_store_notice(
+        "Recordá: estamos cerrados y abrimos mañana a las 11:00. Tenemos wraps y ensaladas.",
+        latest_assistant_text="Ahora estamos cerrados 😴 Abrimos mañana a las 11:00. ¿Qué querés pedir?",
+    )
+
+    assert stripped == "Tenemos wraps y ensaladas."
+
+    await runtime.engine.dispose()
+
+
+async def test_strip_redundant_closed_store_notice_keeps_original_without_safe_split(tmp_path: Path):
+    """Closed-store stripping should keep the original reply when no safe cleanup applies."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+
+    stripped = service._strip_redundant_closed_store_notice(
+        "Recordá que estamos cerrados y abrimos mañana a las 11:00",
+        latest_assistant_text="Ahora estamos cerrados 😴 Abrimos mañana a las 11:00. ¿Qué querés pedir?",
+    )
+
+    assert stripped == "Recordá que estamos cerrados y abrimos mañana a las 11:00"
 
     await runtime.engine.dispose()
 
@@ -3432,6 +3633,188 @@ async def test_order_review_reply_includes_schedule_and_transfer_alias(tmp_path:
     assert "**Horario**" in review
     assert "Pedido programado" in review
     assert "`demo.rotiseria`" in review
+
+    await runtime.engine.dispose()
+
+
+async def test_stabilize_customization_reply_rejects_unpersisted_variants(tmp_path: Path):
+    """The assistant should not promise extra variants that were never stored in the order."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    order = OrderSnapshot(
+        id=22,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=None,
+        delivery_address=None,
+        payment_method=None,
+        total_amount_cents=1210000,
+        total_amount_display="$ 12.100",
+        items=[
+            OrderItemSnapshot(
+                menu_item_id=1,
+                name="Hamburguesa picante",
+                quantity=1,
+                unit_price_cents=1210000,
+                unit_price_display="$ 12.100",
+                notes=None,
+            )
+        ],
+    )
+
+    reply = service._stabilize_customization_reply(
+        AssistantReply(
+            reply_text="Sí, ya anotamos tu hamburguesa con doble picante y triple cheddar.",
+            next_step=AssistantNextStep.CHOOSE_ITEMS,
+            handoff=False,
+        ),
+        message_text="¿Eso se puede?",
+        previous_user_message="Quiero la hamburguesa picante pero con doble picante y triple cheddar.",
+        current_order=order,
+    )
+
+    assert "no tengo cargadas variantes" in reply.reply_text.lower()
+    assert "Hamburguesa picante" in reply.reply_text
+    assert reply.handoff is False
+
+    await runtime.engine.dispose()
+
+
+async def test_stabilize_customization_reply_keeps_unrelated_checkout_prompt(tmp_path: Path):
+    """Customization stabilization should ignore unrelated checkout prompts."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    order = OrderSnapshot(
+        id=24,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=None,
+        delivery_address=None,
+        payment_method=None,
+        total_amount_cents=1210000,
+        total_amount_display="$ 12.100",
+        items=[
+            OrderItemSnapshot(
+                menu_item_id=1,
+                name="Hamburguesa picante",
+                quantity=1,
+                unit_price_cents=1210000,
+                unit_price_display="$ 12.100",
+                notes=None,
+            )
+        ],
+    )
+
+    reply = service._stabilize_customization_reply(
+        AssistantReply(
+            reply_text="¿Querés envío o retirás por el local?",
+            next_step=AssistantNextStep.CHOOSE_DELIVERY,
+            handoff=False,
+        ),
+        message_text="Quiero doble picante.",
+        previous_user_message="Quiero la hamburguesa picante.",
+        current_order=order,
+    )
+
+    assert reply.reply_text == "¿Querés envío o retirás por el local?"
+    assert reply.next_step == AssistantNextStep.CHOOSE_DELIVERY
+
+    await runtime.engine.dispose()
+
+
+async def test_stabilize_customization_reply_replaces_generic_checkout_when_customization_is_unresolved(tmp_path: Path):
+    """A vague feasibility question should not be redirected to checkout when the variant was never stored."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    order = OrderSnapshot(
+        id=23,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=None,
+        delivery_address=None,
+        payment_method=None,
+        total_amount_cents=1210000,
+        total_amount_display="$ 12.100",
+        items=[
+            OrderItemSnapshot(
+                menu_item_id=1,
+                name="Hamburguesa picante",
+                quantity=1,
+                unit_price_cents=1210000,
+                unit_price_display="$ 12.100",
+                notes=None,
+            )
+        ],
+    )
+
+    reply = service._stabilize_customization_reply(
+        AssistantReply(
+            reply_text="Anotado, Nico: hasta ahora va 1 x Hamburguesa picante por $ 12.100. ¿Querés envío o retirás?",
+            next_step=AssistantNextStep.CHOOSE_DELIVERY,
+            handoff=False,
+        ),
+        message_text="¿Eso se puede?",
+        previous_user_message="Quiero la hamburguesa picante pero con doble picante y triple cheddar.",
+        current_order=order,
+    )
+
+    assert "no tengo cargadas variantes" in reply.reply_text.lower()
+    assert reply.next_step == AssistantNextStep.CHOOSE_ITEMS
+
+    await runtime.engine.dispose()
+
+
+async def test_handle_customer_message_stabilizes_unresolved_customization_questions(tmp_path: Path):
+    """A follow-up feasibility question should not be pushed to checkout when the variant was not persisted."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        service,
+        channel=Channel.DEV,
+        external_user_id="customization-follow-up-user",
+        name="Nico",
+    )
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(
+            channel=Channel.DEV,
+            external_id="customization-follow-up-user",
+        )
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.DEV,
+            external_id="customization-follow-up-user",
+            customer_id=customer.id,
+        )
+        await repository.append_conversation_messages(
+            conversation.id,
+            [
+                ModelRequest(
+                    parts=[
+                        UserPromptPart(content="Quiero la hamburguesa picante pero con doble picante y triple cheddar.")
+                    ]
+                ),
+            ],
+        )
+        await repository.add_item_to_current_order(customer.id, conversation.id, sku="hamburguesa-picante", quantity=1)
+        await session.commit()
+
+    result = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="customization-follow-up-user",
+        message_text="¿Eso se puede?",
+        model=FunctionModel(unsupported_customization_checkout_model),
+    )
+
+    assert "no tengo cargadas variantes" in result.reply.reply_text.lower()
+    assert result.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
+    assert result.current_order is not None
+    assert [item.name for item in result.current_order.items] == ["Hamburguesa picante"]
 
     await runtime.engine.dispose()
 

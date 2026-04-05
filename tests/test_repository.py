@@ -542,7 +542,10 @@ async def test_order_snapshot_normalizes_sqlite_schedule_timestamps_to_utc(tmp_p
     await close_repository(repository, runtime)
 
 
-async def test_set_order_requested_ready_at_rejects_closed_or_too_soon_slots(tmp_path: Path):
+async def test_set_order_requested_ready_at_rejects_closed_or_too_soon_slots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     """Scheduling fails outside store hours or without enough preparation lead time."""
     repository, runtime = await build_repository(tmp_path)
     customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="schedule-invalid")
@@ -558,7 +561,10 @@ async def test_set_order_requested_ready_at_rejects_closed_or_too_soon_slots(tmp
         quantity=1,
     )
 
-    local_ready = datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(hours=2)
+    fixed_local_now = datetime(2026, 4, 4, 12, 0, tzinfo=ZoneInfo(STORE_TIMEZONE))
+    monkeypatch.setattr("ruperto.repository.utc_now", lambda: fixed_local_now.astimezone(UTC))
+
+    local_ready = fixed_local_now + timedelta(hours=2)
     await repository.replace_store_business_hours(
         hours=[
             StoreBusinessHoursSnapshot(
@@ -598,7 +604,7 @@ async def test_set_order_requested_ready_at_rejects_closed_or_too_soon_slots(tmp
             for weekday in range(7)
         ]
     )
-    too_soon = datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(minutes=5)
+    too_soon = fixed_local_now + timedelta(minutes=5)
     with pytest.raises(ValueError, match="necesito un poco más de tiempo"):
         await repository.set_order_requested_ready_at(
             customer.id,
@@ -818,6 +824,7 @@ async def test_schedule_validation_helpers_cover_past_missing_prep_and_relative_
     await repository._validate_requested_ready_at(order, timezone_name=STORE_TIMEZONE, store_id=1)
 
     local_now = datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0)
+    assert repository._describe_local_datetime(local_now, local_now).startswith("hoy")
     assert repository._describe_local_datetime(local_now + timedelta(days=1), local_now).startswith("mañana")
     assert repository._describe_local_datetime(local_now + timedelta(days=2), local_now).startswith("el ")
 
