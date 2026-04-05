@@ -1,4 +1,4 @@
-"""Database bootstrap helpers for the ordering MVP."""
+"""Database bootstrap helpers for the shared platform and demo verticals."""
 
 from __future__ import annotations
 
@@ -9,20 +9,26 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.engine.reflection import Inspector
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
-from ruperto.bootstrap import DEFAULT_BUSINESS_HOURS, DEMO_MENU_ITEMS
+from ruperto.bootstrap import (
+    DEFAULT_BUSINESS_HOURS,
+    DEMO_MENU_ITEMS,
+    DEMO_MUNICIPAL_AREAS,
+    DEMO_MUNICIPAL_CATEGORIES,
+)
 from ruperto.config import Settings
 from ruperto.models import (
     Base,
     Channel,
     ChannelProvider,
     MenuItem,
+    MunicipalArea,
     StaffRole,
     StoreBusinessHours,
     StoreProfile,
     StoreVertical,
 )
 from ruperto.repository import BusinessRepository
-from ruperto.schemas import StoreChannelConnectionUpdateRequest
+from ruperto.schemas import MunicipalCategoryCreateRequest, StoreChannelConnectionUpdateRequest
 
 
 @dataclass(slots=True)
@@ -54,91 +60,170 @@ async def init_database(*, settings: Settings, runtime: DatabaseRuntime | None =
 
     async with active_runtime.session_factory() as session:
         repository = BusinessRepository(session)
-        result = await session.execute(select(StoreProfile).where(StoreProfile.id == settings.default_store_id))
-        profile = result.scalar_one_or_none()
-        if profile is None:
-            session.add(
-                StoreProfile(
-                    id=settings.default_store_id,
-                    store_name=settings.store_name,
-                    bot_name=settings.bot_name,
-                    store_location=settings.store_location,
-                    store_description=settings.store_description,
-                    assistant_personality=settings.assistant_personality,
-                    vertical=settings.store_vertical,
-                    locale=settings.store_locale,
-                    transfer_alias=settings.store_transfer_alias,
-                )
-            )
-            await session.flush()
-        else:
-            if profile.transfer_alias is None and settings.store_transfer_alias is not None:
-                profile.transfer_alias = settings.store_transfer_alias
-            if profile.vertical == StoreVertical.ORDERING and settings.store_vertical != StoreVertical.ORDERING:
-                profile.vertical = settings.store_vertical
-        existing_skus = set((await session.scalars(select(MenuItem.sku))).all())
-        missing_menu_items = [item for item in DEMO_MENU_ITEMS if item.sku not in existing_skus]
-        if missing_menu_items:
-            session.add_all(
-                [
-                    MenuItem(
-                        sku=item.sku,
-                        name=item.name,
-                        description=item.description,
-                        category=item.category,
-                        price_cents=item.price_cents,
-                        image_url=item.image_url,
-                    )
-                    for item in missing_menu_items
-                ]
-            )
-        hours_count = await session.scalar(select(func.count(StoreBusinessHours.id)))
-        if hours_count == 0:
-            session.add_all(
-                [
-                    StoreBusinessHours(
-                        store_id=settings.default_store_id,
-                        weekday=row.weekday,
-                        slot_index=row.slot_index,
-                        opens_at=row.opens_at,
-                        closes_at=row.closes_at,
-                        closed=row.closed,
-                    )
-                    for row in DEFAULT_BUSINESS_HOURS
-                ]
-            )
-        if settings.dashboard_admin_email and settings.dashboard_admin_password is not None:
-            await repository.ensure_staff_user(
-                email=settings.dashboard_admin_email,
-                full_name=settings.dashboard_admin_name,
-                password=settings.dashboard_admin_password.get_secret_value(),
-                store_id=settings.default_store_id,
-                role=StaffRole.OWNER,
-            )
-        if settings.kapso_api_key is not None and settings.kapso_phone_number_id is not None:
-            existing_channel = await repository.get_store_channel_connection(
-                store_id=settings.default_store_id,
-                channel=Channel.WHATSAPP,
-                provider=ChannelProvider.KAPSO,
-            )
-            if existing_channel.id is None:
-                await repository.update_store_channel_connection(
-                    store_id=settings.default_store_id,
-                    channel=Channel.WHATSAPP,
-                    provider=ChannelProvider.KAPSO,
-                    payload=StoreChannelConnectionUpdateRequest(
-                        phone_number_id=settings.kapso_phone_number_id,
-                        api_key=settings.kapso_api_key.get_secret_value(),
-                        webhook_secret=(
-                            settings.kapso_webhook_secret.get_secret_value()
-                            if settings.kapso_webhook_secret is not None
-                            else None
-                        ),
-                        is_active=True,
-                    ),
-                )
+        profile = await _ensure_default_store_profile(session=session, settings=settings)
+        await _seed_demo_menu_if_needed(session=session)
+        await _seed_default_business_hours_if_needed(session=session, settings=settings)
+        await _seed_municipal_catalog_if_needed(session=session, repository=repository, store=profile)
+        await _seed_dashboard_admin_if_needed(repository=repository, settings=settings)
+        await _seed_default_channel_connection_if_needed(repository=repository, settings=settings)
         await session.commit()
     return active_runtime
+
+
+async def _ensure_default_store_profile(*, session: AsyncSession, settings: Settings) -> StoreProfile:
+    """Create or refresh the default tenant profile for local development."""
+    result = await session.execute(select(StoreProfile).where(StoreProfile.id == settings.default_store_id))
+    profile = result.scalar_one_or_none()
+    if profile is None:
+        profile = StoreProfile(
+            id=settings.default_store_id,
+            store_name=settings.store_name,
+            bot_name=settings.bot_name,
+            store_location=settings.store_location,
+            store_description=settings.store_description,
+            assistant_personality=settings.assistant_personality,
+            vertical=settings.store_vertical,
+            locale=settings.store_locale,
+            transfer_alias=settings.store_transfer_alias,
+        )
+        session.add(profile)
+        await session.flush()
+        return profile
+
+    if profile.transfer_alias is None and settings.store_transfer_alias is not None:
+        profile.transfer_alias = settings.store_transfer_alias
+    if profile.vertical == StoreVertical.ORDERING and settings.store_vertical != StoreVertical.ORDERING:
+        profile.vertical = settings.store_vertical
+    return profile
+
+
+async def _seed_demo_menu_if_needed(*, session: AsyncSession) -> None:
+    """Insert demo menu items only when they are still missing."""
+    existing_skus = set((await session.scalars(select(MenuItem.sku))).all())
+    missing_menu_items = [item for item in DEMO_MENU_ITEMS if item.sku not in existing_skus]
+    if not missing_menu_items:
+        return
+
+    session.add_all(
+        [
+            MenuItem(
+                sku=item.sku,
+                name=item.name,
+                description=item.description,
+                category=item.category,
+                price_cents=item.price_cents,
+                image_url=item.image_url,
+            )
+            for item in missing_menu_items
+        ]
+    )
+
+
+async def _seed_default_business_hours_if_needed(*, session: AsyncSession, settings: Settings) -> None:
+    """Insert the default weekly schedule when the table is still empty."""
+    hours_count = await session.scalar(select(func.count(StoreBusinessHours.id)))
+    if hours_count != 0:
+        return
+
+    session.add_all(
+        [
+            StoreBusinessHours(
+                store_id=settings.default_store_id,
+                weekday=row.weekday,
+                slot_index=row.slot_index,
+                opens_at=row.opens_at,
+                closes_at=row.closes_at,
+                closed=row.closed,
+            )
+            for row in DEFAULT_BUSINESS_HOURS
+        ]
+    )
+
+
+async def _seed_municipal_catalog_if_needed(
+    *,
+    session: AsyncSession,
+    repository: BusinessRepository,
+    store: StoreProfile,
+) -> None:
+    """Insert a demo municipal catalog for municipal tenants with an empty catalog."""
+    if store.vertical != StoreVertical.MUNICIPAL:
+        return
+
+    areas_count = await session.scalar(select(func.count(MunicipalArea.id)).where(MunicipalArea.store_id == store.id))
+    if areas_count != 0:
+        return
+
+    area_rows_by_key: dict[str, MunicipalArea] = {}
+    for area_seed in DEMO_MUNICIPAL_AREAS:
+        area_row = MunicipalArea(
+            store_id=store.id,
+            name=area_seed.name,
+            description=area_seed.description,
+            display_order=area_seed.display_order,
+        )
+        session.add(area_row)
+        await session.flush()
+        area_rows_by_key[area_seed.key] = area_row
+
+    for category_seed in DEMO_MUNICIPAL_CATEGORIES:
+        area_row = area_rows_by_key[category_seed.area_key]
+        await repository.create_municipal_category(
+            area_id=area_row.id,
+            payload=MunicipalCategoryCreateRequest(
+                name=category_seed.name,
+                description=category_seed.description,
+                requires_precise_location=category_seed.requires_precise_location,
+                is_fallback=category_seed.is_fallback,
+                display_order=category_seed.display_order,
+            ),
+        )
+
+
+async def _seed_dashboard_admin_if_needed(*, repository: BusinessRepository, settings: Settings) -> None:
+    """Create the bootstrap dashboard owner when env-based credentials are present."""
+    if not settings.dashboard_admin_email or settings.dashboard_admin_password is None:
+        return
+
+    await repository.ensure_staff_user(
+        email=settings.dashboard_admin_email,
+        full_name=settings.dashboard_admin_name,
+        password=settings.dashboard_admin_password.get_secret_value(),
+        store_id=settings.default_store_id,
+        role=StaffRole.OWNER,
+    )
+
+
+async def _seed_default_channel_connection_if_needed(
+    *,
+    repository: BusinessRepository,
+    settings: Settings,
+) -> None:
+    """Create the default Kapso connection from env vars when provided."""
+    if settings.kapso_api_key is None or settings.kapso_phone_number_id is None:
+        return
+
+    existing_channel = await repository.get_store_channel_connection(
+        store_id=settings.default_store_id,
+        channel=Channel.WHATSAPP,
+        provider=ChannelProvider.KAPSO,
+    )
+    if existing_channel.id is not None:
+        return
+
+    await repository.update_store_channel_connection(
+        store_id=settings.default_store_id,
+        channel=Channel.WHATSAPP,
+        provider=ChannelProvider.KAPSO,
+        payload=StoreChannelConnectionUpdateRequest(
+            phone_number_id=settings.kapso_phone_number_id,
+            api_key=settings.kapso_api_key.get_secret_value(),
+            webhook_secret=(
+                settings.kapso_webhook_secret.get_secret_value() if settings.kapso_webhook_secret is not None else None
+            ),
+            is_active=True,
+        ),
+    )
 
 
 async def ping_database(runtime: DatabaseRuntime) -> None:

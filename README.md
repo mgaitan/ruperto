@@ -143,6 +143,11 @@ route the shared channel/core infrastructure to different assistant domains.
 Today the municipal vertical is still a scaffold, but the dashboard can
 already switch the active tenant between `ordering` and `municipal` without
 changing the rotisería behavior.
+Municipal tenants now also have a first domain model of their own: service
+areas, optional categories, and cases with status, assignment, and precise
+location fields. Local development bootstraps a demo municipal catalog with
+areas such as public lighting, street maintenance, water requests, and urban
+hygiene so the next agent iteration has realistic data to work with.
 There is now also a first production-shaped WhatsApp integration path through
 Kapso: the backend can receive inbound text messages from the
 `/webhooks/whatsapp/kapso` endpoint, answer through the Kapso proxy, and send
