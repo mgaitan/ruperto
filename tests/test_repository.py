@@ -876,6 +876,48 @@ async def test_order_creation_and_failures_have_explicit_messages(tmp_path: Path
     await close_repository(repository, runtime)
 
 
+async def test_discard_empty_draft_order_keeps_non_empty_drafts(tmp_path: Path):
+    """Empty-draft cleanup should not delete a draft that already has line items."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="non-empty-draft")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="non-empty-draft",
+        customer_id=customer.id,
+    )
+
+    await repository.add_item_to_current_order(
+        customer.id,
+        conversation.id,
+        sku="hamburguesa-completa",
+        quantity=1,
+    )
+
+    assert await repository.discard_empty_draft_order(customer.id, conversation.id) is False
+    assert await repository.get_latest_order(customer.id, conversation.id) is not None
+
+    await close_repository(repository, runtime)
+
+
+async def test_discard_empty_draft_order_removes_empty_drafts(tmp_path: Path):
+    """Empty-draft cleanup should delete a draft that has no line items yet."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="empty-draft-delete")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="empty-draft-delete",
+        customer_id=customer.id,
+    )
+
+    created = await repository.get_current_order(customer.id, conversation.id)
+    assert created is not None
+
+    assert await repository.discard_empty_draft_order(customer.id, conversation.id) is True
+    assert await repository.get_latest_order(customer.id, conversation.id) is None
+
+    await close_repository(repository, runtime)
+
+
 async def test_confirm_current_order_requires_delivery_choice_address_and_payment(tmp_path: Path):
     """Draft confirmation requires the core checkout fields before closing the order."""
     repository, runtime = await build_repository(tmp_path)

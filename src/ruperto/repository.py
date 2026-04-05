@@ -676,6 +676,18 @@ class BusinessRepository:
             return None
         return await self._build_order_snapshot(order)
 
+    async def discard_empty_draft_order(self, customer_id: int, conversation_id: int) -> bool:
+        """Delete the current draft if it exists but has no line items."""
+        order = await self._get_draft_order(customer_id, conversation_id)
+        if order is None:
+            return False
+        item_count = await self.session.scalar(select(func.count(OrderItem.id)).where(OrderItem.order_id == order.id))
+        if item_count:
+            return False
+        await self.session.delete(order)
+        await self.session.flush()
+        return True
+
     async def list_orders(
         self,
         *,

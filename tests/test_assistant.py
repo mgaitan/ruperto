@@ -350,6 +350,18 @@ def delivery_info_handoff_model(messages: list[ModelMessage], info: AgentInfo) -
     )
 
 
+def empty_draft_failure_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Create an empty draft via the tool and then crash to exercise cleanup."""
+    tool_returns = collect_tool_returns(messages)
+    if "get_current_order" not in tool_returns:
+        return ModelResponse(
+            parts=[ToolCallPart("get_current_order", {})],
+            model_name="function:test-empty-draft-failure",
+        )
+    failure = RuntimeError("synthetic model failure after creating an empty draft")
+    raise failure
+
+
 async def test_build_google_model(tmp_path: Path):
     """The production Gemini model can be constructed from settings."""
     model = build_google_model(build_settings(tmp_path))
@@ -440,6 +452,45 @@ async def test_assistant_returns_handoff_when_model_errors(tmp_path: Path):
     assert result.reply.next_step == AssistantNextStep.HANDOFF
     assert result.reply.handoff is True
     assert result.current_order is None
+
+    await runtime.engine.dispose()
+
+
+async def test_model_failure_recovers_parseable_orders_instead_of_leaving_empty_drafts(tmp_path: Path):
+    """A failed turn should recover a parseable order instead of leaving an empty draft behind."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        service,
+        channel=Channel.DEV,
+        external_user_id="empty-draft-failure-user",
+        name="Martina",
+    )
+
+    result = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="empty-draft-failure-user",
+        message_text="Quiero una hamburguesa doble cheddar para retirar.",
+        model=FunctionModel(empty_draft_failure_model),
+    )
+
+    assert "Hamburguesa doble cheddar" in result.reply.reply_text
+    assert result.current_order is not None
+    assert [item.name for item in result.current_order.items] == ["Hamburguesa doble cheddar"]
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="empty-draft-failure-user")
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.DEV,
+            external_id="empty-draft-failure-user",
+            customer_id=customer.id,
+        )
+        latest_order = await repository.get_latest_order(customer.id, conversation.id)
+        assert latest_order is not None
+        assert [item.name for item in latest_order.items] == ["Hamburguesa doble cheddar"]
 
     await runtime.engine.dispose()
 
@@ -888,6 +939,55 @@ async def test_assistant_allows_informational_first_turns_without_asking_for_nam
     await runtime.engine.dispose()
 
 
+async def test_assistant_strips_unsolicited_open_store_greeting(tmp_path: Path):
+    """Generic greetings should not volunteer the current open-store notice."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    open_availability = StoreAvailabilitySnapshot(is_open=True, message_text="Estamos abiertos", next_open_text=None)
+
+    async def fake_open_availability(self, *, store_id: int = 1, timezone_name: str | None = None):
+        return open_availability
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(BusinessRepository, "get_store_availability", fake_open_availability)
+
+    try:
+        reply = await service.handle_customer_message(
+            channel=Channel.DEV,
+            external_user_id="cliente-saludo-generico",
+            message_text="buenas noches",
+            model=FunctionModel(open_greeting_model),
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert "abiertos ahora" not in reply.reply.reply_text.lower()
+    assert "¿en qué puedo ayudarte hoy?" in reply.reply.reply_text.lower()
+
+    await runtime.engine.dispose()
+
+
+async def test_assistant_keeps_open_store_status_when_the_user_asks_for_it(tmp_path: Path):
+    """Open-store status should remain when the customer explicitly asked about it."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+
+    reply = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-pregunta-horario",
+        message_text="¿Están abiertos ahora?",
+        model=FunctionModel(open_greeting_model),
+    )
+
+    assert "abiertos ahora" in reply.reply.reply_text.lower()
+
+    await runtime.engine.dispose()
+
+
 async def test_assistant_does_not_ask_for_name_mid_conversation_when_order_starts_later(tmp_path: Path):
     """A nameless conversation that already started should not be reset by onboarding mid-flow."""
     settings = build_settings(tmp_path)
@@ -960,6 +1060,32 @@ def informational_delivery_model(messages: list[ModelMessage], info: AgentInfo) 
             )
         ],
         model_name="function:test-informational-delivery",
+    )
+
+
+def open_greeting_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Return a greeting that over-eagerly mentions the store is open."""
+    tool_returns = collect_tool_returns(messages)
+    if "get_store_availability" not in tool_returns:
+        return ModelResponse(
+            parts=[ToolCallPart("get_store_availability", {})],
+            model_name="function:test-open-greeting",
+        )
+
+    return ModelResponse(
+        parts=[
+            ToolCallPart(
+                info.output_tools[0].name,
+                {
+                    "reply_text": (
+                        "¡Hola! 👋 Buenas noches. Estamos abiertos ahora 🍽️ hasta las 23:00. ¿En qué puedo ayudarte hoy?"
+                    ),
+                    "next_step": "choose_items",
+                    "handoff": False,
+                },
+            )
+        ],
+        model_name="function:test-open-greeting",
     )
 
 
@@ -2576,7 +2702,8 @@ async def test_handle_customer_message_stabilizes_delivery_info_questions_withou
 
     assert result.reply.handoff is False
     assert result.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
-    assert "zona" in result.reply.reply_text.lower() or "dirección" in result.reply.reply_text.lower()
+    assert "hacemos envíos por la zona" in result.reply.reply_text.lower()
+    assert "alcance puntual" in result.reply.reply_text.lower()
     assert result.current_order is None
 
     await runtime.engine.dispose()
@@ -3189,7 +3316,24 @@ async def test_delivery_information_helpers_cover_checkout_prompt_and_zone_copy(
     assert service._reply_is_checkout_prompt(
         AssistantReply(reply_text="¿Querés envío o retirás por el local?", next_step=AssistantNextStep.CHOOSE_ITEMS)
     )
-    assert service._build_delivery_information_reply("¿Llegan a barrio centro?").startswith("Hacemos envíos.")
+    reply_text = service._build_delivery_information_reply("¿Llegan a barrio centro?")
+    assert reply_text.startswith("Hacemos envíos por la zona.")
+    assert "barrio o dirección" in reply_text
+
+    await runtime.engine.dispose()
+
+
+async def test_greeting_and_open_notice_helpers_cover_edge_cases(tmp_path: Path):
+    """Greeting and open-notice helpers should handle empty text and fully stripped replies."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+
+    assert service._message_is_generic_greeting("") is False
+    assert service._message_is_generic_greeting("hola che") is True
+    assert (
+        service._strip_unsolicited_open_store_notice("Estamos abiertos ahora 🍽️ hasta las 23:00.")
+        == "¡Hola! 👋 ¿Qué te gustaría pedir hoy?"
+    )
 
     await runtime.engine.dispose()
 
@@ -3969,8 +4113,8 @@ async def test_apply_checkout_hints_can_fill_payment_from_the_message(tmp_path: 
     await runtime.engine.dispose()
 
 
-async def test_recover_large_order_after_model_failure_returns_none_when_not_enough_lines_parse(tmp_path: Path):
-    """Large-order recovery should refuse ambiguous parses with fewer than two solid lines."""
+async def test_recover_large_order_after_model_failure_returns_none_when_no_menu_lines_parse(tmp_path: Path):
+    """Model-failure recovery should stop when the message mentions no recognizable menu items."""
     settings = build_settings(tmp_path)
     runtime = create_database_runtime(settings)
     await init_database(settings=settings, runtime=runtime)
@@ -3998,11 +4142,23 @@ async def test_recover_large_order_after_model_failure_returns_none_when_not_eno
         conversation_id=conversation.id,
         customer_id=customer.id,
         customer=customer,
-        user_text="Quiero una hamburguesa completa y sorpresa.",
+        user_text="Quiero algo rico y sorpresa.",
         store_id=settings.default_store_id,
     )
 
     assert result is None
+
+    await runtime.engine.dispose()
+
+
+async def test_large_order_detection_helper_covers_positive_and_negative_cases(tmp_path: Path):
+    """The dense-order detector should distinguish large multi-line asks from simple messages."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+
+    assert service._looks_like_large_order_attempt("Quiero 2 pizzas muzza, 1 docena de empanadas y 2 gaseosas.")
+    assert service._looks_like_large_order_attempt("Quiero una hamburguesa completa.") is False
+    assert service._looks_like_large_order_attempt("Buenas noches") is False
 
     await runtime.engine.dispose()
 

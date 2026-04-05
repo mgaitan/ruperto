@@ -649,6 +649,7 @@ class OrderingAssistantService:
         )
         async with self.session_factory() as session:
             repository = BusinessRepository(session)
+            await repository.discard_empty_draft_order(customer_id, conversation_id)
             await self._persist_direct_reply(
                 repository=repository,
                 conversation_id=conversation_id,
@@ -672,15 +673,15 @@ class OrderingAssistantService:
         user_text: str,
         store_id: int,
     ) -> AssistantTurnResult | None:
-        """Try a deterministic recovery for large multi-item orders after a model failure."""
-        if not self._looks_like_large_order_attempt(user_text):
+        """Try a deterministic recovery for parseable order attempts after a model failure."""
+        if not any(hint in self._normalize_menu_text(user_text) for hint in ORDER_INTENT_HINTS):
             return None
 
         async with self.session_factory() as session:
             repository = BusinessRepository(session)
             menu_items = await repository.list_menu_items()
             parsed_lines = self._parse_menu_lines_from_message(user_text, menu_items=menu_items)
-            if len(parsed_lines) < MIN_PARSED_FALLBACK_LINES:
+            if not parsed_lines:
                 return None
 
             current_order = await repository.get_current_order(customer_id, conversation_id, create_if_missing=False)
@@ -1167,6 +1168,15 @@ class OrderingAssistantService:
             delivery_info_request = self._message_requests_delivery_information(message_text)
             if delivery_info_request:
                 reply = self._stabilize_delivery_information_reply(reply, message_text=message_text)
+            if (
+                availability.is_open
+                and current_order is None
+                and self._message_is_generic_greeting(message_text)
+                and not self._message_requests_store_availability(message_text)
+            ):
+                reply = reply.model_copy(
+                    update={"reply_text": self._strip_unsolicited_open_store_notice(reply.reply_text)}
+                )
             if not turn_policy.allow_order_mutations and not (
                 delivery_info_request and current_order is not None and current_order.items
             ):
@@ -1903,6 +1913,37 @@ class OrderingAssistantService:
         lowered = self._normalize_menu_text(message_text)
         return "eso se puede" in lowered or lowered.startswith("se puede")
 
+    def _message_is_generic_greeting(self, message_text: str) -> bool:
+        """Return whether the user is only greeting without asking for anything else yet."""
+        lowered = self._normalize_menu_text(message_text)
+        if not lowered:
+            return False
+        max_greeting_words = 3
+        if lowered in {"hola", "buenas", "buen dia", "buen día", "buenas tardes", "buenas noches", "hey", "holi"}:
+            return True
+        return lowered.startswith("hola ") and len(lowered.split()) <= max_greeting_words
+
+    def _message_requests_store_availability(self, message_text: str) -> bool:
+        """Return whether the user explicitly asked whether the store is open or for opening hours."""
+        lowered = self._normalize_menu_text(message_text)
+        return any(
+            phrase in lowered
+            for phrase in (
+                "estan abiertos",
+                "están abiertos",
+                "esta abierto",
+                "está abierto",
+                "abren hoy",
+                "abren ahora",
+                "hasta que hora",
+                "hasta qué hora",
+                "horario",
+                "a que hora abren",
+                "a qué hora abren",
+                "siguen abiertos",
+            )
+        )
+
     def _message_requests_delivery_information(self, message_text: str) -> bool:
         """Return whether the user is asking for delivery coverage or delivery pricing."""
         lowered = message_text.casefold()
@@ -1934,6 +1975,20 @@ class OrderingAssistantService:
                 "hasta donde",
             )
         )
+
+    def _strip_unsolicited_open_store_notice(self, reply_text: str) -> str:
+        """Remove open-now chatter from generic greetings when it was not requested."""
+        sentences = re.split(r"(?<=[.!?])\s+", reply_text.strip())
+        kept_sentences = []
+        for sentence in sentences:
+            lowered = sentence.casefold()
+            if "abiert" in lowered and ("ahora" in lowered or "hasta las" in lowered):
+                continue
+            kept_sentences.append(sentence)
+        cleaned = " ".join(sentence for sentence in kept_sentences if sentence).strip()
+        if cleaned:
+            return cleaned
+        return "¡Hola! 👋 ¿Qué te gustaría pedir hoy?"
 
     def _detect_menu_information_constraints(
         self,
@@ -2510,6 +2565,24 @@ class OrderingAssistantService:
             return (
                 "Hacemos envíos, pero desde acá no tengo cargado un costo fijo para decírtelo automáticamente. "
                 "Si querés, pasame la dirección o la zona y lo revisamos antes de cerrar el pedido."
+            )
+        if any(
+            phrase in lowered
+            for phrase in (
+                "por qué zona",
+                "por que zona",
+                "qué zona",
+                "que zona",
+                "llegan",
+                "alcance del envío",
+                "alcance del envio",
+                "hasta dónde",
+                "hasta donde",
+            )
+        ):
+            return (
+                "Hacemos envíos por la zona. Si querés, después te confirmo el alcance puntual "
+                "con tu barrio o dirección antes de cerrar el pedido."
             )
         return (
             "Hacemos envíos. Para decirte si llegamos a tu zona necesito la dirección "
