@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from ruperto.assistant import OrderingAssistantService
+from ruperto.assistant_router import handle_customer_message_for_store
 from ruperto.channels.base import InboundCustomerMessage, OutboundCustomerMessage
 from ruperto.channels.kapso_whatsapp import KapsoWhatsAppGateway
 from ruperto.config import Settings
@@ -110,13 +110,14 @@ async def handle_inbound_customer_message(
     inbound_message: InboundCustomerMessage,
     store_id: int | None = None,
 ) -> AssistantTurnResult:
-    """Process one inbound text message through the ordering assistant."""
+    """Process one inbound text message through the tenant-selected assistant."""
     await seed_customer_name_from_inbound_message(
         session_factory=session_factory,
         inbound_message=inbound_message,
     )
-    service = OrderingAssistantService(session_factory=session_factory, settings=settings)
-    return await service.handle_customer_message(
+    return await handle_customer_message_for_store(
+        session_factory=session_factory,
+        settings=settings,
         channel=inbound_message.channel,
         external_user_id=inbound_message.external_user_id,
         message_text=inbound_message.message_text,

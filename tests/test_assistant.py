@@ -39,7 +39,7 @@ from ruperto.assistant import (
 )
 from ruperto.config import Settings
 from ruperto.db import create_database_runtime, init_database
-from ruperto.models import Channel, DeliveryType, OrderStatus, PaymentMethod
+from ruperto.models import Channel, DeliveryType, OrderStatus, PaymentMethod, StoreVertical
 from ruperto.repository import BusinessRepository, IncompleteOrderError
 from ruperto.schemas import (
     AssistantNextStep,
@@ -86,6 +86,7 @@ def build_store_profile() -> StoreProfileSnapshot:
         store_location="Córdoba",
         store_description="Comida casera",
         assistant_personality="Amable",
+        vertical=StoreVertical.ORDERING,
         locale="es_AR",
         currency_code="ARS",
         transfer_alias="rotiseria.test",

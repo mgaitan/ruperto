@@ -52,6 +52,10 @@ If you plan to send transactional email from the same backend, the SMTP
 settings are now also recognized through `RUPERTO_SMTP_SERVER`,
 `RUPERTO_SMTP_PORT`, `RUPERTO_SMTP_USER`, and `RUPERTO_SMTP_PASSWORD`.
 
+The bootstrap store can also start on another business vertical through
+`RUPERTO_STORE_VERTICAL`. The current accepted values are `ordering`
+and `municipal`, with `ordering` as the default.
+
 For Kapso-backed WhatsApp, configure:
 
 - `RUPERTO_KAPSO_API_KEY`
@@ -134,6 +138,11 @@ today as one configurable store by default. Dashboard users can already belong
 to more than one store and switch the active store for profile and opening-hour
 management, while orders, customers, and the catalog still use the shared MVP
 data model for now.
+That store profile now also carries a `vertical`, so different tenants can
+route the shared channel/core infrastructure to different assistant domains.
+Today the municipal vertical is still a scaffold, but the dashboard can
+already switch the active tenant between `ordering` and `municipal` without
+changing the rotisería behavior.
 There is now also a first production-shaped WhatsApp integration path through
 Kapso: the backend can receive inbound text messages from the
 `/webhooks/whatsapp/kapso` endpoint, answer through the Kapso proxy, and send

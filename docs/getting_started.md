@@ -66,6 +66,9 @@ customer and staff-facing interactions in Spanish (Argentina) from the start.
 It also respects {term}`RUPERTO_DEFAULT_STORE_ID`, which is the first step
 toward a future logical multi-tenant deployment while keeping a single store
 active by default today.
+If you want to bootstrap a different tenant domain from the start, you can
+also set {term}`RUPERTO_STORE_VERTICAL` to `municipal`. Otherwise the default
+remains `ordering`.
 
 ## 3. Run the API locally
 
@@ -196,6 +199,9 @@ signed session cookie. The current version is intentionally small: it shows
 an operational home page with recent orders and metrics, a dedicated customers
 screen with search, and separate settings pages for the menu, store profile,
 agent behavior, flexible weekly opening hours, and user roles.
+The store profile page now also exposes the tenant vertical selector, so the
+same installation can switch the active tenant between the ordering flow and
+the municipal scaffold without changing the shared channel or auth layers.
 
 If one dashboard user belongs to more than one store, the header lets staff
 switch the active store. That switch already scopes the editable store profile

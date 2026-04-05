@@ -47,6 +47,12 @@ RUPERTO_DEFAULT_STORE_ID
   This keeps today's single-store MVP configurable while preparing for future
   logical multi-tenancy.
 
+RUPERTO_STORE_VERTICAL
+  Bootstrap business vertical for the default tenant.
+  Accepted values are `ordering` and `municipal`.
+  The dashboard store profile remains the normal per-tenant place to change
+  the active vertical after initialization.
+
 RUPERTO_DASHBOARD_SESSION_SECRET
   Secret used to sign the dashboard session cookie.
   Change it in shared or production environments so staff sessions cannot be
@@ -55,10 +61,13 @@ RUPERTO_DASHBOARD_SESSION_SECRET
 RUPERTO_DASHBOARD_ADMIN_EMAIL
   Email address of the bootstrap dashboard user created during database
   initialization when paired with {term}`RUPERTO_DASHBOARD_ADMIN_PASSWORD`.
+  Prefer `uv run ruperto create-admin` for day-to-day setup instead of keeping
+  long-lived user credentials in environment variables.
 
 RUPERTO_DASHBOARD_ADMIN_PASSWORD
   Password of the bootstrap dashboard user.
   The password is hashed before it is stored in the database.
+  This is meant as a bootstrap path for non-interactive environments.
 
 RUPERTO_DASHBOARD_ADMIN_NAME
   Full name shown in the dashboard header for the bootstrap dashboard user.

@@ -19,12 +19,18 @@ from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, Tool
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from sqlalchemy import select
 
-from ruperto.app import create_app, extract_kapso_phone_number_id, format_dashboard_datetime, parse_store_hours_form
+from ruperto.app import (
+    create_app,
+    extract_kapso_phone_number_id,
+    format_dashboard_datetime,
+    parse_store_hours_form,
+    serialize_store_hours_for_dashboard,
+)
 from ruperto.config import Settings
 from ruperto.db import create_database_runtime, init_database
-from ruperto.models import Channel, DeliveryType, OrderStatus, PaymentMethod, StaffRole, StoreMembership
+from ruperto.models import Channel, DeliveryType, OrderStatus, PaymentMethod, StaffRole, StoreMembership, StoreVertical
 from ruperto.repository import BusinessRepository
-from ruperto.schemas import AssistantTurnResult
+from ruperto.schemas import AssistantTurnResult, StoreBusinessHoursSnapshot, StoreProfileUpdateRequest
 
 HTTP_OK = 200
 HTTP_NOT_FOUND = 404
@@ -137,6 +143,29 @@ async def add_staff_user_to_default_store(settings: Settings):
             password="team-secret",
             store_id=1,
             role=StaffRole.STAFF,
+        )
+        await session.commit()
+    await runtime.engine.dispose()
+
+
+async def set_default_store_vertical(settings: Settings, vertical: StoreVertical):
+    """Switch the default tenant to the requested business vertical."""
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        current_store = await repository.get_store_profile(store_id=1)
+        await repository.update_store_profile(
+            payload=StoreProfileUpdateRequest(
+                store_name=current_store.store_name,
+                bot_name=current_store.bot_name,
+                store_location=current_store.store_location,
+                store_description=current_store.store_description,
+                assistant_personality=current_store.assistant_personality,
+                vertical=vertical,
+                transfer_alias=current_store.transfer_alias,
+            ),
+            store_id=1,
         )
         await session.commit()
     await runtime.engine.dispose()
@@ -762,7 +791,7 @@ def test_dashboard_renders_sections_with_tailwind(tmp_path: Path):
     assert login_response.status_code == HTTP_OK
     assert "Cerrar sesión" in login_response.text
     assert response.status_code == HTTP_OK
-    assert "Ruperto dashboard" in response.text
+    assert "Rotisería" in response.text
     assert "tailwindcss.com" in response.text
     assert "Inicio" in response.text
     assert "Clientes" in response.text
@@ -797,6 +826,49 @@ def test_parse_store_hours_form_supports_multiple_slots_and_ignores_unrelated_ke
     assert sunday_row.closed is True
 
 
+def test_serialize_store_hours_for_dashboard_skips_closed_and_incomplete_rows():
+    """Dashboard schedule serialization only exposes usable slots."""
+    serialized = serialize_store_hours_for_dashboard(
+        [
+            StoreBusinessHoursSnapshot(
+                id=1,
+                store_id=1,
+                weekday=0,
+                slot_index=0,
+                opens_at=None,
+                closes_at=None,
+                closed=True,
+            ),
+            StoreBusinessHoursSnapshot(
+                id=2,
+                store_id=1,
+                weekday=1,
+                slot_index=0,
+                opens_at="11:30",
+                closes_at="15:00",
+                closed=False,
+            ),
+            StoreBusinessHoursSnapshot(
+                id=3,
+                store_id=1,
+                weekday=1,
+                slot_index=1,
+                opens_at="19:00",
+                closes_at=None,
+                closed=False,
+            ),
+        ]
+    )
+
+    monday = next(day for day in serialized if day["weekday"] == 0)
+    tuesday = next(day for day in serialized if day["weekday"] == 1)
+
+    assert monday["closed"] is True
+    assert monday["slots"] == []
+    assert tuesday["closed"] is False
+    assert tuesday["slots"] == [{"slot_index": 0, "opens_at": "11:30", "closes_at": "15:00"}]
+
+
 def test_dashboard_forms_can_update_profile_agent_and_hours(tmp_path: Path):
     """The split dashboard forms persist profile, agent, and schedule settings."""
     app = create_app(build_settings(tmp_path))
@@ -807,6 +879,7 @@ def test_dashboard_forms_can_update_profile_agent_and_hours(tmp_path: Path):
             "/dashboard/settings/profile",
             data={
                 "store_name": "Panel Rotisería",
+                "vertical": "municipal",
                 "store_location": "Anisacate",
                 "store_description": "Simple dashboard edits.",
                 "transfer_alias": "panel.rotiseria",
@@ -857,6 +930,7 @@ def test_dashboard_forms_can_update_profile_agent_and_hours(tmp_path: Path):
     assert store_response.json()["store_name"] == "Panel Rotisería"
     assert store_response.json()["bot_name"] == "Panel Bot"
     assert store_response.json()["transfer_alias"] == "panel.rotiseria"
+    assert store_response.json()["vertical"] == "municipal"
     assert store_hours_response.json()[0]["closed"] is True
     assert store_hours_response.json()[1]["opens_at"] == "11:30"
     assert store_hours_response.json()[2]["opens_at"] == "19:00"
@@ -1113,6 +1187,7 @@ def test_dashboard_settings_pages_render_menu_filters_and_profile_data(tmp_path:
     assert "Pizza muzzarella" not in menu_response.text
     assert profile_response.status_code == HTTP_OK
     assert "Alias de transferencia" in profile_response.text
+    assert 'name="vertical"' in profile_response.text
     assert agent_response.status_code == HTTP_OK
     assert "Modelo" in agent_response.text
     assert "WhatsApp vía Kapso" in agent_response.text
@@ -1120,6 +1195,59 @@ def test_dashboard_settings_pages_render_menu_filters_and_profile_data(tmp_path:
     assert "Guardar agenda semanal" in hours_response.text
     assert users_response.status_code == HTTP_OK
     assert "Usuarios del local" in users_response.text
+
+
+def test_dashboard_switches_navigation_and_placeholders_for_municipal_vertical(tmp_path: Path):
+    """Municipal tenants reuse the shell but show municipal navigation and placeholder content."""
+    settings = build_settings(tmp_path)
+    anyio.run(set_default_store_vertical, settings, StoreVertical.MUNICIPAL)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        home_response = client.get("/dashboard")
+        customers_response = client.get("/dashboard/customers")
+        menu_response = client.get("/dashboard/settings/menu")
+        hours_response = client.get("/dashboard/settings/hours")
+        profile_response = client.get("/dashboard/settings/profile")
+
+    assert home_response.status_code == HTTP_OK
+    assert "Municipio" in home_response.text
+    assert "Vecinos" in home_response.text
+    assert "Áreas y categorías" in home_response.text
+    assert "El tenant ya enruta conversaciones al vertical municipal." in home_response.text
+    assert customers_response.status_code == HTTP_OK
+    assert "Vecinos" in customers_response.text
+    assert "Buscar cliente" in customers_response.text
+    assert menu_response.status_code == HTTP_OK
+    assert (
+        "La configuración de áreas, categorías y subcategorías se habilita en la próxima etapa." in menu_response.text
+    )
+    assert hours_response.status_code == HTTP_OK
+    assert "La agenda comercial queda desactivada para tenants municipales." in hours_response.text
+    assert profile_response.status_code == HTTP_OK
+    assert "Nombre del municipio" in profile_response.text
+
+
+def test_dev_messages_route_switches_to_municipal_vertical_without_creating_orders(tmp_path: Path):
+    """The shared chat API routes municipal tenants away from the ordering flow."""
+    settings = build_settings(tmp_path)
+    anyio.run(set_default_store_vertical, settings, StoreVertical.MUNICIPAL)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/dev/messages",
+            json={"external_user_id": "municipal-user", "message_text": "Hola, quiero hacer un reclamo"},
+        )
+        orders_response = client.get("/api/orders", params={"limit": 10})
+
+    payload = response.json()
+    assert response.status_code == HTTP_OK
+    assert payload["reply"]["next_step"] == "handoff"
+    assert "asistente municipal" in payload["reply"]["reply_text"]
+    assert payload["current_order"] is None
+    assert orders_response.json() == []
 
 
 def test_dashboard_can_update_store_membership_role(tmp_path: Path):

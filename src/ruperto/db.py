@@ -19,6 +19,7 @@ from ruperto.models import (
     StaffRole,
     StoreBusinessHours,
     StoreProfile,
+    StoreVertical,
 )
 from ruperto.repository import BusinessRepository
 from ruperto.schemas import StoreChannelConnectionUpdateRequest
@@ -64,13 +65,17 @@ async def init_database(*, settings: Settings, runtime: DatabaseRuntime | None =
                     store_location=settings.store_location,
                     store_description=settings.store_description,
                     assistant_personality=settings.assistant_personality,
+                    vertical=settings.store_vertical,
                     locale=settings.store_locale,
                     transfer_alias=settings.store_transfer_alias,
                 )
             )
             await session.flush()
-        elif profile.transfer_alias is None and settings.store_transfer_alias is not None:
-            profile.transfer_alias = settings.store_transfer_alias
+        else:
+            if profile.transfer_alias is None and settings.store_transfer_alias is not None:
+                profile.transfer_alias = settings.store_transfer_alias
+            if profile.vertical == StoreVertical.ORDERING and settings.store_vertical != StoreVertical.ORDERING:
+                profile.vertical = settings.store_vertical
         existing_skus = set((await session.scalars(select(MenuItem.sku))).all())
         missing_menu_items = [item for item in DEMO_MENU_ITEMS if item.sku not in existing_skus]
         if missing_menu_items:
@@ -159,6 +164,10 @@ def _ensure_store_profile_columns(connection: Connection, *, inspector: Inspecto
         store_profile_columns = {column["name"] for column in inspector.get_columns("store_profile")}
         if "transfer_alias" not in store_profile_columns:
             connection.execute(text("ALTER TABLE store_profile ADD COLUMN transfer_alias VARCHAR(120)"))
+        if "vertical" not in store_profile_columns:
+            connection.execute(
+                text("ALTER TABLE store_profile ADD COLUMN vertical VARCHAR(32) NOT NULL DEFAULT 'ordering'")
+            )
 
 
 def _ensure_customer_order_columns(connection: Connection, *, inspector: Inspector) -> None:

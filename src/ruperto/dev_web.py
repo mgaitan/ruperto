@@ -30,7 +30,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 
-from ruperto.assistant import OrderingAssistantService
+from ruperto.assistant_router import handle_customer_message_for_store
 from ruperto.config import Settings
 from ruperto.models import Channel
 
@@ -140,11 +140,9 @@ web_chat_agent = Agent(
 @web_chat_agent.tool
 async def submit_customer_message(ctx: RunContext[WebChatDeps], message_text: str) -> str:
     """Forward the user's message to the real ordering assistant service."""
-    service = OrderingAssistantService(
+    result = await handle_customer_message_for_store(
         session_factory=ctx.deps.session_factory,
         settings=ctx.deps.settings,
-    )
-    result = await service.handle_customer_message(
         channel=Channel.DEV,
         external_user_id=ctx.deps.external_user_id,
         message_text=message_text,

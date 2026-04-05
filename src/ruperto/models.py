@@ -32,6 +32,18 @@ class ChannelProvider(StrEnum):
     KAPSO = "kapso"
 
 
+class StoreVertical(StrEnum):
+    """Business verticals supported by the platform."""
+
+    ORDERING = "ordering"
+    MUNICIPAL = "municipal"
+
+
+def enum_values(enum_type: type[StrEnum]) -> list[str]:
+    """Return the persisted values for one string enum."""
+    return [item.value for item in enum_type]
+
+
 class OrderStatus(StrEnum):
     """Lifecycle states for customer orders."""
 
@@ -79,6 +91,10 @@ class StoreProfile(Base):
     store_location: Mapped[str | None] = mapped_column(String(length=255), nullable=True)
     store_description: Mapped[str] = mapped_column(String(length=500))
     assistant_personality: Mapped[str] = mapped_column(String(length=255))
+    vertical: Mapped[StoreVertical] = mapped_column(
+        SqlEnum(StoreVertical, native_enum=False, length=32, values_callable=enum_values),
+        default=StoreVertical.ORDERING,
+    )
     locale: Mapped[str] = mapped_column(String(length=32), default="es-AR")
     currency_code: Mapped[str] = mapped_column(String(length=8), default="ARS")
     transfer_alias: Mapped[str | None] = mapped_column(String(length=120), nullable=True)

@@ -36,6 +36,7 @@ from ruperto.models import (
     StoreChannelConnection,
     StoreMembership,
     StoreProfile,
+    StoreVertical,
     utc_now,
 )
 from ruperto.schemas import (
@@ -227,6 +228,7 @@ class BusinessRepository:
         bot_name: str,
         store_description: str,
         assistant_personality: str,
+        vertical: StoreVertical = StoreVertical.ORDERING,
         store_location: str | None = None,
         locale: str = "es-AR",
         transfer_alias: str | None = None,
@@ -238,6 +240,7 @@ class BusinessRepository:
             store_location=self._normalize_optional_text(store_location),
             store_description=store_description.strip(),
             assistant_personality=assistant_personality.strip(),
+            vertical=vertical,
             locale=locale,
             transfer_alias=self._normalize_optional_text(transfer_alias),
         )
@@ -259,6 +262,7 @@ class BusinessRepository:
         row.store_location = self._normalize_optional_text(payload.store_location)
         row.store_description = payload.store_description.strip()
         row.assistant_personality = payload.assistant_personality.strip()
+        row.vertical = payload.vertical
         row.transfer_alias = self._normalize_optional_text(payload.transfer_alias)
         row.updated_at = utc_now()
         await self.session.flush()
