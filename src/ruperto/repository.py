@@ -1079,6 +1079,9 @@ class BusinessRepository:
         if order.requested_ready_at is None:
             order.preparation_starts_at = None
             return
+        requested_ready_at = self._as_utc_datetime(order.requested_ready_at)
+        assert requested_ready_at is not None
+        order.requested_ready_at = requested_ready_at
 
         items = await self._load_order_items(order.id)
         order_snapshot = OrderSnapshot(
@@ -1107,7 +1110,7 @@ class BusinessRepository:
             ],
         )
         preparation_minutes = self._estimate_preparation_minutes(order_snapshot)
-        order.preparation_starts_at = order.requested_ready_at - timedelta(minutes=preparation_minutes)
+        order.preparation_starts_at = requested_ready_at - timedelta(minutes=preparation_minutes)
 
     async def _validate_requested_ready_at(
         self,
@@ -1119,10 +1122,16 @@ class BusinessRepository:
         """Ensure a scheduled order can be fulfilled during business hours."""
         if order.requested_ready_at is None:
             return
+        requested_ready_at = self._as_utc_datetime(order.requested_ready_at)
+        assert requested_ready_at is not None
+        order.requested_ready_at = requested_ready_at
+
+        preparation_starts_at = self._as_utc_datetime(order.preparation_starts_at)
+        order.preparation_starts_at = preparation_starts_at
 
         zone = ZoneInfo(timezone_name)
         local_now = utc_now().astimezone(zone)
-        local_ready = order.requested_ready_at.astimezone(zone)
+        local_ready = requested_ready_at.astimezone(zone)
         if local_ready <= local_now:
             raise RequestedReadyTimeError.past_time()
 
@@ -1132,14 +1141,14 @@ class BusinessRepository:
             next_open_text = self._find_next_opening_text(schedule, local_now)
             raise RequestedReadyTimeError.outside_business_hours(next_open_text)
 
-        if order.preparation_starts_at is None:
+        if preparation_starts_at is None:
             return
 
         local_open = self._opening_datetime_for_row(schedule_row, local_ready)
-        local_preparation_start = order.preparation_starts_at.astimezone(zone)
+        local_preparation_start = preparation_starts_at.astimezone(zone)
         earliest_start = max(local_now, local_open)
         if local_preparation_start < earliest_start:
-            preparation_minutes = int((order.requested_ready_at - order.preparation_starts_at).total_seconds() // 60)
+            preparation_minutes = int((requested_ready_at - preparation_starts_at).total_seconds() // 60)
             earliest_ready = earliest_start + timedelta(minutes=preparation_minutes)
             raise RequestedReadyTimeError.insufficient_lead_time(
                 self._describe_local_datetime(earliest_ready, local_now)
@@ -1157,8 +1166,8 @@ class BusinessRepository:
             delivery_address=order.delivery_address,
             payment_method=order.payment_method,
             notify_when_ready=order.notify_when_ready,
-            requested_ready_at=order.requested_ready_at,
-            preparation_starts_at=order.preparation_starts_at,
+            requested_ready_at=self._as_utc_datetime(order.requested_ready_at),
+            preparation_starts_at=self._as_utc_datetime(order.preparation_starts_at),
             total_amount_cents=order.total_amount_cents,
             total_amount_display=format_price_ars(order.total_amount_cents),
             items=[
@@ -1203,6 +1212,14 @@ class BusinessRepository:
             )
         )
         await self.session.flush()
+
+    def _as_utc_datetime(self, value: datetime | None) -> datetime | None:
+        """Normalize SQLite-loaded timestamps into aware UTC datetimes."""
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
 
     def _build_status_notification_text(self, order: Order) -> str:
         """Build the outbound message shown when an order reaches a relevant status."""

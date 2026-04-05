@@ -252,6 +252,23 @@ def add_item_only_model(messages: list[ModelMessage], info: AgentInfo) -> ModelR
     )
 
 
+def delivery_info_handoff_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Return a poor delivery-info handoff so the service can stabilize it."""
+    return ModelResponse(
+        parts=[
+            ToolCallPart(
+                info.output_tools[0].name,
+                {
+                    "reply_text": "Te paso con una persona.",
+                    "next_step": "handoff",
+                    "handoff": True,
+                },
+            )
+        ],
+        model_name="function:test-delivery-info-handoff",
+    )
+
+
 async def test_build_google_model(tmp_path: Path):
     """The production Gemini model can be constructed from settings."""
     model = build_google_model(build_settings(tmp_path))
@@ -2206,6 +2223,79 @@ async def test_guide_reply_with_current_order_answers_delivery_questions_without
     assert reply.next_step == AssistantNextStep.CHOOSE_ITEMS
     assert "costo fijo" in reply.reply_text.lower()
     assert "dirección o la zona" in reply.reply_text.lower()
+
+    await runtime.engine.dispose()
+
+
+async def test_delivery_information_reply_recovers_from_handoff(tmp_path: Path):
+    """Delivery-info stabilization should replace an unnecessary handoff with a useful answer."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+
+    reply = service._stabilize_delivery_information_reply(
+        AssistantReply(
+            reply_text="Te paso con una persona.",
+            next_step=AssistantNextStep.HANDOFF,
+            handoff=True,
+        ),
+        message_text="¿El envío tiene costo?",
+    )
+
+    assert reply.handoff is False
+    assert reply.next_step == AssistantNextStep.CHOOSE_ITEMS
+    assert "costo fijo" in reply.reply_text.lower()
+
+    await runtime.engine.dispose()
+
+
+async def test_delivery_information_reply_keeps_useful_non_checkout_reply(tmp_path: Path):
+    """Delivery-info stabilization should preserve already-useful answers."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+
+    original = AssistantReply(
+        reply_text="Hacemos envíos. Si me decís la zona, te confirmo cobertura.",
+        next_step=AssistantNextStep.CHOOSE_ITEMS,
+        handoff=False,
+    )
+    reply = service._stabilize_delivery_information_reply(original, message_text="¿Llegan hasta Alta Córdoba?")
+
+    assert reply is original
+
+    await runtime.engine.dispose()
+
+
+async def test_handle_customer_message_stabilizes_delivery_info_questions_over_draft_orders(tmp_path: Path):
+    """Informational delivery questions should stay helpful even when the model falls back to handoff."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(service, channel=Channel.DEV, external_user_id="delivery-info-user", name="Martina")
+
+    async with service.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="delivery-info-user")
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.DEV,
+            external_id="delivery-info-user",
+            customer_id=customer.id,
+        )
+        await repository.add_item_to_current_order(customer.id, conversation.id, sku="hamburguesa-completa", quantity=1)
+        await session.commit()
+
+    result = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="delivery-info-user",
+        message_text="¿El envío tiene costo?",
+        model=FunctionModel(delivery_info_handoff_model),
+    )
+
+    assert result.reply.handoff is False
+    assert result.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
+    assert "costo fijo" in result.reply.reply_text.lower()
+    assert result.current_order is not None
+    assert result.current_order.items
 
     await runtime.engine.dispose()
 

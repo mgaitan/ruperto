@@ -900,7 +900,12 @@ class OrderingAssistantService:
                     latest_assistant_text=latest_assistant_text,
                     current_order=current_order,
                 )
-            if not turn_policy.allow_order_mutations:
+            delivery_info_request = self._message_requests_delivery_information(message_text)
+            if delivery_info_request and current_order is not None and current_order.items:
+                reply = self._stabilize_delivery_information_reply(reply, message_text=message_text)
+            if not turn_policy.allow_order_mutations and not (
+                delivery_info_request and current_order is not None and current_order.items
+            ):
                 current_order = None
             await session.commit()
             return AssistantTurnResult(
@@ -1832,6 +1837,23 @@ class OrderingAssistantService:
             "Hacemos envíos. Para decirte si llegamos a tu zona necesito la dirección "
             "o al menos la referencia del barrio. "
             "Si me la pasás, lo revisamos antes de cerrar el pedido."
+        )
+
+    def _stabilize_delivery_information_reply(
+        self,
+        reply: AssistantReply,
+        *,
+        message_text: str,
+    ) -> AssistantReply:
+        """Keep delivery-info questions in a helpful informational mode."""
+        if not reply.handoff and not self._reply_is_checkout_prompt(reply):
+            return reply
+        return reply.model_copy(
+            update={
+                "reply_text": self._build_delivery_information_reply(message_text),
+                "next_step": AssistantNextStep.CHOOSE_ITEMS,
+                "handoff": False,
+            }
         )
 
     def _build_order_review_reply(

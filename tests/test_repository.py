@@ -507,9 +507,37 @@ async def test_set_order_requested_ready_at_persists_schedule_and_updates_prep_s
     delivery_scheduled = await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.DELIVERY)
 
     assert delivery_scheduled.preparation_starts_at is not None
-    assert scheduled.requested_ready_at.replace(tzinfo=None) - delivery_scheduled.preparation_starts_at == timedelta(
-        minutes=20
+    assert scheduled.requested_ready_at - delivery_scheduled.preparation_starts_at == timedelta(minutes=20)
+
+    await close_repository(repository, runtime)
+
+
+async def test_order_snapshot_normalizes_sqlite_schedule_timestamps_to_utc(tmp_path: Path):
+    """Order snapshots should reattach UTC tzinfo when SQLite returns naive datetimes."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="schedule-naive")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="schedule-naive",
+        customer_id=customer.id,
     )
+    ready_at = datetime(2026, 4, 5, 15, 0)
+    prep_at = datetime(2026, 4, 5, 14, 40)
+    order = Order(
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        status=OrderStatus.DRAFT,
+        total_amount_cents=0,
+        requested_ready_at=ready_at,
+        preparation_starts_at=prep_at,
+    )
+    repository.session.add(order)
+    await repository.session.flush()
+
+    snapshot = await repository._build_order_snapshot(order)
+
+    assert snapshot.requested_ready_at == ready_at.replace(tzinfo=UTC)
+    assert snapshot.preparation_starts_at == prep_at.replace(tzinfo=UTC)
 
     await close_repository(repository, runtime)
 
