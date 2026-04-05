@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ruperto.config import Settings
 from ruperto.models import Channel, DeliveryType, PaymentMethod
-from ruperto.repository import BusinessRepository
+from ruperto.repository import BusinessRepository, IncompleteOrderError
 from ruperto.schemas import (
     AssistantNextStep,
     AssistantReply,
@@ -238,11 +238,14 @@ DELIVERY_PROMPT_VARIANTS = (
     "Bien, {name}: tengo {items} por {total}.{timing_text} ¿Querés envío o retirás por el local?",
 )
 ADD_ON_PROMPT_VARIANTS = (
-    "{lead}, {name}: tengo {items} por {total}. Si querés, podés sumar {suggestion}. ¿Te tienta algo más?",
-    "Anotado, {name}: va {items} por {total}. Si te copa, le podés agregar {suggestion}. ¿Querés sumar algo más?",
+    "{lead}, {name}: tengo {items} por {total}.{timing_text} Si querés, podés sumar {suggestion}. ¿Te tienta algo más?",
+    (
+        "Anotado, {name}: va {items} por {total}.{timing_text} "
+        "Si te copa, le podés agregar {suggestion}. ¿Querés sumar algo más?"
+    ),
     (
         "Buenísimo, {name}: llevo {items} por {total}. "
-        "Si querés completar el pedido, podés sumar {suggestion}. ¿Te sirve algo más?"
+        "{timing_text} Si querés completar el pedido, podés sumar {suggestion}. ¿Te sirve algo más?"
     ),
 )
 ADDRESS_PROMPT_VARIANTS = (
@@ -697,7 +700,7 @@ class OrderingAssistantService:
         store_id: int,
         user_text: str,
     ) -> AssistantTurnResult:
-        """Recover gracefully when the model jumps to confirmation too early."""
+        """Recover gracefully when checkout confirmation happens before the draft is complete."""
         async with self.session_factory() as session:
             repository = BusinessRepository(session)
             current_order = await repository.get_latest_order(customer_id, conversation_id)
@@ -718,7 +721,18 @@ class OrderingAssistantService:
                 message_text=user_text,
             )
             delay = await repository.get_estimated_delay(customer_id, conversation_id)
-            if current_order.payment_method is None:
+            next_step = self._next_step_for_current_order(current_order)
+            if next_step is AssistantNextStep.CONFIRM_ORDER:
+                reply = AssistantReply(
+                    reply_text=self._build_order_review_reply(
+                        customer=customer,
+                        current_order=current_order,
+                        store=store,
+                    ),
+                    next_step=AssistantNextStep.CONFIRM_ORDER,
+                    handoff=False,
+                )
+            else:
                 reply = self._guide_reply_with_current_order(
                     AssistantReply(
                         reply_text="Seguimos con el pedido.",
@@ -732,16 +746,6 @@ class OrderingAssistantService:
                     store=store,
                     order_changed_during_turn=True,
                     item_lines_changed_during_turn=False,
-                )
-            else:
-                reply = AssistantReply(
-                    reply_text=self._build_order_review_reply(
-                        customer=customer,
-                        current_order=current_order,
-                        store=store,
-                    ),
-                    next_step=AssistantNextStep.CONFIRM_ORDER,
-                    handoff=False,
                 )
             await self._persist_direct_reply(
                 repository=repository,
@@ -869,7 +873,7 @@ class OrderingAssistantService:
         assert last_error is not None
         raise last_error
 
-    async def handle_customer_message(  # noqa: C901, PLR0915
+    async def handle_customer_message(  # noqa: C901, PLR0911, PLR0912, PLR0915
         self,
         *,
         channel: Channel,
@@ -979,6 +983,14 @@ class OrderingAssistantService:
         except MissingConfirmationSignalError:
             if current_order_before_run is None:
                 raise
+            return await self._recover_missing_confirmation_result(
+                conversation_id=conversation_id,
+                customer_id=customer_id,
+                customer=customer,
+                store_id=resolved_store_id,
+                user_text=message_text,
+            )
+        except IncompleteOrderError:
             return await self._recover_missing_confirmation_result(
                 conversation_id=conversation_id,
                 customer_id=customer_id,
@@ -1616,17 +1628,6 @@ class OrderingAssistantService:
             return reply
 
         timing_text = self._build_timing_prompt_fragment(current_order=current_order, delay=delay)
-        if current_order.payment_method is not None and order_changed_during_turn:
-            return reply.model_copy(
-                update={
-                    "reply_text": self._build_order_review_reply(
-                        customer=customer,
-                        current_order=current_order,
-                        store=store,
-                    ),
-                    "next_step": AssistantNextStep.CONFIRM_ORDER,
-                }
-            )
         if item_lines_changed_during_turn and self._should_offer_add_on(current_order):
             item_summary = ", ".join(f"{item.quantity} x {item.name}" for item in current_order.items)
             template = self._pick_variant(ADD_ON_PROMPT_VARIANTS, seed=current_order.id)
@@ -1637,6 +1638,7 @@ class OrderingAssistantService:
                         name=customer.name or "che",
                         items=item_summary,
                         total=current_order.total_amount_display,
+                        timing_text=timing_text,
                         suggestion=self._pick_add_on_suggestion(current_order),
                     ),
                     "next_step": AssistantNextStep.CHOOSE_ITEMS,
@@ -1669,6 +1671,18 @@ class OrderingAssistantService:
                 update={
                     "reply_text": reply_text,
                     "next_step": AssistantNextStep.ASK_ADDRESS,
+                }
+            )
+
+        if current_order.payment_method is not None and order_changed_during_turn:
+            return reply.model_copy(
+                update={
+                    "reply_text": self._build_order_review_reply(
+                        customer=customer,
+                        current_order=current_order,
+                        store=store,
+                    ),
+                    "next_step": AssistantNextStep.CONFIRM_ORDER,
                 }
             )
 

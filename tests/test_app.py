@@ -355,8 +355,9 @@ def test_mvp_api_surface_exposes_dev_chat_and_read_models(tmp_path: Path, monkey
     assert chat_response.status_code == HTTP_OK
     chat_payload = chat_response.json()
     assert chat_payload["customer"]["name"] == "Martina"
-    assert chat_payload["reply"]["next_step"] == "confirm_order"
+    assert chat_payload["reply"]["next_step"] == "choose_items"
     assert chat_payload["current_order"]["status"] == "draft"
+    assert "bebida o un postre" in chat_payload["reply"]["reply_text"].lower()
 
     assert confirm_response.status_code == HTTP_OK
     assert confirm_response.json()["reply"]["next_step"] == "complete"

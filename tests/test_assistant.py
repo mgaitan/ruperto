@@ -32,7 +32,7 @@ from ruperto.assistant import (
 from ruperto.config import Settings
 from ruperto.db import create_database_runtime, init_database
 from ruperto.models import Channel, DeliveryType, OrderStatus, PaymentMethod
-from ruperto.repository import BusinessRepository
+from ruperto.repository import BusinessRepository, IncompleteOrderError
 from ruperto.schemas import (
     AssistantNextStep,
     AssistantReply,
@@ -567,9 +567,10 @@ async def test_assistant_handles_order_flow_in_spanish(tmp_path: Path):
 
     assert draft_result.customer.name == "Martina"
     assert draft_result.customer.phone_number == "+543515557788"
-    assert draft_result.reply.next_step == AssistantNextStep.CONFIRM_ORDER
+    assert draft_result.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
     assert draft_result.current_order is not None
     assert draft_result.current_order.status.value == "draft"
+    assert "bebida o un postre" in draft_result.reply.reply_text.lower()
     assert result.customer.phone_number == "+543515557788"
     assert result.reply.next_step == AssistantNextStep.COMPLETE
     assert "**Pedido**" in result.reply.reply_text
@@ -585,7 +586,7 @@ async def test_assistant_handles_order_flow_in_spanish(tmp_path: Path):
 
 
 async def test_assistant_schedules_a_closed_store_order_for_a_future_time(tmp_path: Path):
-    """A requested ready time becomes a scheduled confirmation with transfer details."""
+    """A requested ready time should stay visible even if the assistant still offers an add-on."""
     settings = build_settings(tmp_path)
     runtime = create_database_runtime(settings)
     await init_database(settings=settings, runtime=runtime)
@@ -627,9 +628,9 @@ async def test_assistant_schedules_a_closed_store_order_for_a_future_time(tmp_pa
     assert reply.current_order is not None
     assert reply.current_order.requested_ready_at is not None
     assert reply.current_order.preparation_starts_at is not None
-    assert "**Horario**" in reply.reply.reply_text
-    assert "Pedido programado" in reply.reply.reply_text
-    assert "`demo.rotiseria`" in reply.reply.reply_text
+    assert reply.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
+    assert "programado" in reply.reply.reply_text.lower()
+    assert "12:00" in reply.reply.reply_text
 
     await runtime.engine.dispose()
 
@@ -3240,6 +3241,197 @@ async def test_recover_missing_confirmation_falls_back_when_no_draft_exists(tmp_
 
     assert result.reply.next_step == AssistantNextStep.HANDOFF
     assert result.current_order is None
+
+    await runtime.engine.dispose()
+
+
+async def test_incomplete_checkout_recovery_guides_to_delivery_choice(tmp_path: Path):
+    """Repository-level incomplete confirmations should recover into delivery guidance."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    baseline_service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        baseline_service,
+        channel=Channel.DEV,
+        external_user_id="incomplete-delivery-type-user",
+        name="Martina",
+    )
+
+    class IncompleteCheckoutAgent:
+        async def run(self, *args: Any, **kwargs: Any):
+            raise IncompleteOrderError.missing_delivery_type()
+
+    service = OrderingAssistantService(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        agent=cast(Any, IncompleteCheckoutAgent()),
+    )
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(
+            channel=Channel.DEV,
+            external_id="incomplete-delivery-type-user",
+        )
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.DEV,
+            external_id="incomplete-delivery-type-user",
+            customer_id=customer.id,
+        )
+        await repository.add_item_to_current_order(customer.id, conversation.id, sku="pizza-rucula-crudo", quantity=1)
+        await session.commit()
+
+    result = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="incomplete-delivery-type-user",
+        message_text="pago en efectivo",
+    )
+
+    assert result.reply.next_step == AssistantNextStep.CHOOSE_DELIVERY
+    assert "envío o retirás" in result.reply.reply_text.lower()
+    assert result.current_order is not None
+    assert result.current_order.payment_method is PaymentMethod.CASH
+    assert result.current_order.delivery_type is None
+
+    await runtime.engine.dispose()
+
+
+async def test_incomplete_checkout_recovery_guides_to_address(tmp_path: Path):
+    """Repository-level incomplete confirmations should recover into address guidance."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    baseline_service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        baseline_service,
+        channel=Channel.DEV,
+        external_user_id="incomplete-address-user",
+        name="Martina",
+    )
+
+    class IncompleteCheckoutAgent:
+        async def run(self, *args: Any, **kwargs: Any):
+            raise IncompleteOrderError.missing_delivery_address()
+
+    service = OrderingAssistantService(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        agent=cast(Any, IncompleteCheckoutAgent()),
+    )
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="incomplete-address-user")
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.DEV,
+            external_id="incomplete-address-user",
+            customer_id=customer.id,
+        )
+        await repository.add_item_to_current_order(customer.id, conversation.id, sku="hamburguesa-completa", quantity=1)
+        await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.DELIVERY)
+        await session.commit()
+
+    result = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="incomplete-address-user",
+        message_text="confirmalo",
+    )
+
+    assert result.reply.next_step == AssistantNextStep.ASK_ADDRESS
+    assert "dirección" in result.reply.reply_text.lower()
+    assert result.current_order is not None
+    assert result.current_order.delivery_type is DeliveryType.DELIVERY
+    assert result.current_order.delivery_address is None
+
+    await runtime.engine.dispose()
+
+
+async def test_incomplete_checkout_recovery_guides_to_payment(tmp_path: Path):
+    """Repository-level incomplete confirmations should recover into payment guidance."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    baseline_service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        baseline_service,
+        channel=Channel.DEV,
+        external_user_id="incomplete-payment-user",
+        name="Martina",
+    )
+
+    class IncompleteCheckoutAgent:
+        async def run(self, *args: Any, **kwargs: Any):
+            raise IncompleteOrderError.missing_payment_method()
+
+    service = OrderingAssistantService(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        agent=cast(Any, IncompleteCheckoutAgent()),
+    )
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="incomplete-payment-user")
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.DEV,
+            external_id="incomplete-payment-user",
+            customer_id=customer.id,
+        )
+        await repository.add_item_to_current_order(customer.id, conversation.id, sku="lomito-especial", quantity=1)
+        await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.PICKUP)
+        await session.commit()
+
+    result = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="incomplete-payment-user",
+        message_text="confirmalo",
+    )
+
+    assert result.reply.next_step == AssistantNextStep.CHOOSE_PAYMENT
+    assert "efectivo, transferencia o link de pago" in result.reply.reply_text.lower()
+    assert result.current_order is not None
+    assert result.current_order.payment_method is None
+    assert result.current_order.delivery_type is DeliveryType.PICKUP
+
+    await runtime.engine.dispose()
+
+
+async def test_order_review_reply_includes_schedule_and_transfer_alias(tmp_path: Path):
+    """Draft reviews should include transfer alias and scheduled-ready information when available."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    customer = CustomerSnapshot(id=1, name="Martina", phone_number=None, default_address=None)
+    store = build_store_profile().model_copy(update={"transfer_alias": "demo.rotiseria"})
+    scheduled_time = datetime(2026, 4, 5, 12, 0, tzinfo=ZoneInfo(STORE_TIMEZONE))
+    order = OrderSnapshot(
+        id=11,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=DeliveryType.PICKUP,
+        delivery_address=None,
+        payment_method=PaymentMethod.TRANSFER,
+        total_amount_cents=950000,
+        total_amount_display="$ 9.500",
+        requested_ready_at=scheduled_time,
+        items=[
+            OrderItemSnapshot(
+                menu_item_id=1,
+                name="Hamburguesa completa",
+                quantity=1,
+                unit_price_cents=950000,
+                unit_price_display="$ 9.500",
+                notes=None,
+            )
+        ],
+    )
+
+    review = service._build_order_review_reply(customer=customer, current_order=order, store=store)
+
+    assert "**Horario**" in review
+    assert "Pedido programado" in review
+    assert "`demo.rotiseria`" in review
 
     await runtime.engine.dispose()
 
