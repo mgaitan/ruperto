@@ -244,6 +244,7 @@
         <script type="application/json" id="demo-chat-config">
             {
                 "apiPath": "{{ api_path }}",
+                "notificationsApiPath": "{{ notifications_api_path }}",
                 "profiles": {{ demo_profiles | tojson }}
             }
         </script>
@@ -456,6 +457,32 @@
                     saveHistory(profileId, history);
                 };
 
+                const fetchPendingNotifications = async () => {
+                    const activeProfile = getActiveProfile();
+                    if (!activeProfile) return;
+
+                    const response = await fetch(
+                        `${config.notificationsApiPath}?external_user_id=${encodeURIComponent(`demo-phone:${activeProfile.id}`)}`,
+                    );
+                    if (!response.ok) return;
+                    const notifications = await response.json();
+                    if (
+                        !Array.isArray(notifications) ||
+                        notifications.length === 0
+                    ) {
+                        return;
+                    }
+                    notifications.forEach((notification) => {
+                        appendHistory(activeProfile.id, {
+                            role: "assistant",
+                            text: notification.message_text,
+                        });
+                    });
+                    statusText.textContent =
+                        "Llegó una notificación del pedido.";
+                    renderProfiles();
+                };
+
                 profileForm.addEventListener("submit", (event) => {
                     event.preventDefault();
                     const formData = new FormData(profileForm);
@@ -622,6 +649,9 @@
                 });
 
                 renderProfiles();
+                window.setInterval(() => {
+                    void fetchPendingNotifications();
+                }, 4000);
             })();
         </script>
     </body>

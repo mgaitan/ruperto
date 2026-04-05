@@ -176,6 +176,7 @@ def test_demo_chat_page_renders_the_browser_harness(tmp_path: Path):
     assert "Demo online" in response.text
     assert "Clientes demo" in response.text
     assert "/api/dev/messages" in response.text
+    assert "/api/dev/notifications" in response.text
     assert "Martín" in response.text
     assert "Crear cliente aleatorio" in response.text
     assert "marked.min.js" in response.text
@@ -332,6 +333,30 @@ def test_staff_can_update_order_status(tmp_path: Path, monkeypatch: pytest.Monke
 
     assert status_response.status_code == HTTP_OK
     assert status_response.json()["status"] == OrderStatus.ALMOST_READY.value
+
+
+def test_dev_notifications_endpoint_returns_pending_messages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The browser harness can poll queued status notifications for one demo client."""
+    monkeypatch.setattr("ruperto.assistant.build_google_model", lambda settings: FunctionModel(dev_message_model))
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Hola, quiero pedir"})
+        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Martina"})
+        order_response = client.post(
+            "/api/dev/messages",
+            json={"external_user_id": "cli-user", "message_text": "Quiero una hamburguesa"},
+        )
+        order_id = order_response.json()["current_order"]["id"]
+        client.patch(f"/api/orders/{order_id}/status", json={"status": OrderStatus.ALMOST_READY.value})
+        client.patch(f"/api/orders/{order_id}/status", json={"status": OrderStatus.READY_FOR_PICKUP.value})
+        first_poll = client.get("/api/dev/notifications", params={"external_user_id": "cli-user"})
+        second_poll = client.get("/api/dev/notifications", params={"external_user_id": "cli-user"})
+
+    assert first_poll.status_code == HTTP_OK
+    assert [notification["event_type"] for notification in first_poll.json()] == ["order_almost_ready", "order_ready"]
+    assert second_poll.status_code == HTTP_OK
+    assert second_poll.json() == []
 
 
 def test_staff_update_order_status_returns_not_found_for_unknown_order(tmp_path: Path):
@@ -620,6 +645,19 @@ def test_dashboard_login_page_redirects_when_already_authenticated(tmp_path: Pat
     assert "Ingresá al panel" in login_page.text
     assert redirect_response.status_code == HTTP_FOUND
     assert redirect_response.headers["location"] == "/dashboard"
+
+
+def test_dashboard_shell_links_to_demo_chat(tmp_path: Path):
+    """The staff dashboard exposes a direct link to the browser demo chat."""
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        response = client.get("/dashboard")
+
+    assert response.status_code == HTTP_OK
+    assert "Abrir demo del chat" in response.text
+    assert 'href="/demo/chat"' in response.text
 
 
 def test_dashboard_logout_clears_the_session(tmp_path: Path):

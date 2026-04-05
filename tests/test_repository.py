@@ -11,11 +11,21 @@ from zoneinfo import ZoneInfo
 import pytest
 from pydantic import SecretStr
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import create_engine, func, select, text
 
 from ruperto.config import Settings
 from ruperto.db import DatabaseRuntime, _ensure_schema_columns, create_database_runtime, init_database
-from ruperto.models import Channel, DeliveryType, MenuItem, OrderStatus, PaymentMethod, StaffRole, StaffUser
+from ruperto.models import (
+    Channel,
+    DeliveryType,
+    MenuItem,
+    Order,
+    OrderStatus,
+    OutboundNotification,
+    PaymentMethod,
+    StaffRole,
+    StaffUser,
+)
 from ruperto.repository import (
     STORE_HOURS_SLOT_ORDER_MESSAGE,
     STORE_HOURS_SLOT_REQUIRES_BOTH_TIMES_MESSAGE,
@@ -1009,6 +1019,136 @@ async def test_update_order_status_requires_an_existing_order(tmp_path: Path):
 
     with pytest.raises(ValueError, match=re.escape("No se encontró el pedido solicitado.")):
         await repository.update_order_status(999, OrderStatus.ALMOST_READY)
+
+    await close_repository(repository, runtime)
+
+
+async def test_update_order_status_queues_automatic_notifications(tmp_path: Path):
+    """Relevant status transitions queue one outbound message for the conversation."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="notify-user")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="notify-user",
+        customer_id=customer.id,
+    )
+    await repository.add_item_to_current_order(
+        customer.id,
+        conversation.id,
+        sku="hamburguesa-completa",
+        quantity=1,
+    )
+    await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.PICKUP)
+    await repository.set_order_payment_method(customer.id, conversation.id, PaymentMethod.CASH)
+    confirmed = await repository.confirm_current_order(customer.id, conversation.id)
+
+    almost_ready = await repository.update_order_status(confirmed.id, OrderStatus.ALMOST_READY)
+    ready = await repository.update_order_status(confirmed.id, OrderStatus.READY_FOR_PICKUP)
+    first_poll = await repository.list_pending_notifications(channel=Channel.DEV, external_id="notify-user")
+    second_poll = await repository.list_pending_notifications(channel=Channel.DEV, external_id="notify-user")
+
+    assert almost_ready.notify_when_ready is True
+    assert ready.status == OrderStatus.READY_FOR_PICKUP
+    assert [notification.event_type for notification in first_poll] == ["order_almost_ready", "order_ready"]
+    assert [notification.message_text for notification in first_poll] == [
+        "Tu pedido ya casi está 👀",
+        "Tu pedido ya está listo para retirar 🙌",
+    ]
+    assert second_poll == []
+
+    await close_repository(repository, runtime)
+
+
+async def test_set_order_notify_when_ready_handles_new_draft_and_latest_order(tmp_path: Path):
+    """The notification preference can be set before ordering, on a draft, or on the latest confirmed order."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="notify-setup-user")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="notify-setup-user",
+        customer_id=customer.id,
+    )
+
+    created = await repository.set_order_notify_when_ready(customer.id, conversation.id, enabled=False)
+    assert created.notify_when_ready is False
+    assert created.items == []
+
+    await repository.add_item_to_current_order(
+        customer.id,
+        conversation.id,
+        sku="hamburguesa-completa",
+        quantity=1,
+    )
+    updated_draft = await repository.set_order_notify_when_ready(customer.id, conversation.id, enabled=True)
+    assert updated_draft.notify_when_ready is True
+
+    await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.PICKUP)
+    await repository.set_order_payment_method(customer.id, conversation.id, PaymentMethod.CASH)
+    await repository.confirm_current_order(customer.id, conversation.id)
+
+    updated_latest = await repository.set_order_notify_when_ready(customer.id, conversation.id, enabled=False)
+    assert updated_latest.notify_when_ready is False
+    assert updated_latest.status == OrderStatus.CONFIRMED
+
+    await close_repository(repository, runtime)
+
+
+async def test_notification_queue_helper_covers_early_return_branches(tmp_path: Path):
+    """Notification queueing skips disabled, unchanged, duplicate, unmapped, and orphaned cases."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="notify-helper-user")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="notify-helper-user",
+        customer_id=customer.id,
+    )
+
+    disabled_order = Order(
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        status=OrderStatus.ALMOST_READY,
+        notify_when_ready=False,
+    )
+    unchanged_order = Order(
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        status=OrderStatus.READY_FOR_PICKUP,
+        notify_when_ready=True,
+    )
+    unmapped_order = Order(
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        status=OrderStatus.CONFIRMED,
+        notify_when_ready=True,
+    )
+    duplicate_order = Order(
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        status=OrderStatus.ALMOST_READY,
+        notify_when_ready=True,
+    )
+    orphaned_order = Order(
+        customer_id=customer.id,
+        conversation_id=99999,
+        status=OrderStatus.OUT_FOR_DELIVERY,
+        notify_when_ready=True,
+    )
+    repository.session.add_all([disabled_order, unchanged_order, unmapped_order, duplicate_order, orphaned_order])
+    await repository.session.flush()
+
+    await repository._queue_status_notification_if_needed(disabled_order, previous_status=OrderStatus.CONFIRMED)
+    await repository._queue_status_notification_if_needed(unchanged_order, previous_status=OrderStatus.READY_FOR_PICKUP)
+    await repository._queue_status_notification_if_needed(unmapped_order, previous_status=OrderStatus.DRAFT)
+    await repository._queue_status_notification_if_needed(duplicate_order, previous_status=OrderStatus.CONFIRMED)
+    await repository._queue_status_notification_if_needed(duplicate_order, previous_status=OrderStatus.CONFIRMED)
+    await repository._queue_status_notification_if_needed(orphaned_order, previous_status=OrderStatus.READY_FOR_PICKUP)
+
+    assert repository._build_status_notification_text(orphaned_order) == "Tu pedido ya salió y va en camino 🚚"
+    assert repository._build_status_notification_text(disabled_order) == "Tu pedido ya casi está 👀"
+    notifications_in_db = await repository.session.scalar(select(func.count(OutboundNotification.id)))
+    notifications = await repository.list_pending_notifications(channel=Channel.DEV, external_id="notify-helper-user")
+    assert notifications_in_db == 1
+    assert [notification.event_type for notification in notifications] == ["order_almost_ready"]
 
     await close_repository(repository, runtime)
 

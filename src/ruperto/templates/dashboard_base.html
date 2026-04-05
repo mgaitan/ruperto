@@ -46,6 +46,12 @@
                             <p class="text-sm text-slate-300">{{ current_user.email }}</p>
                         </div>
                         <div class="mt-4 space-y-3">
+                            <a
+                                href="/demo/chat"
+                                class="flex w-full items-center justify-center rounded-full border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-700 transition hover:border-ember hover:text-ember"
+                            >
+                                Abrir demo del chat
+                            </a>
                             {% if memberships|length > 1 %}
                             <form action="/dashboard/active-store" method="post" class="space-y-2">
                                 <label class="block text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">

@@ -27,6 +27,7 @@ from ruperto.models import (
     Order,
     OrderItem,
     OrderStatus,
+    OutboundNotification,
     PaymentMethod,
     StaffRole,
     StaffUser,
@@ -42,6 +43,7 @@ from ruperto.schemas import (
     MenuItemSnapshot,
     OrderItemSnapshot,
     OrderSnapshot,
+    OutboundNotificationSnapshot,
     StaffUserSnapshot,
     StoreAvailabilitySnapshot,
     StoreBusinessHoursSnapshot,
@@ -81,6 +83,11 @@ ACTIVE_ORDER_STATUSES = {
     OrderStatus.ALMOST_READY,
     OrderStatus.READY_FOR_PICKUP,
     OrderStatus.OUT_FOR_DELIVERY,
+}
+READY_NOTIFICATION_EVENT_BY_STATUS = {
+    OrderStatus.ALMOST_READY: "order_almost_ready",
+    OrderStatus.READY_FOR_PICKUP: "order_ready",
+    OrderStatus.OUT_FOR_DELIVERY: "order_out_for_delivery",
 }
 STORE_MEMBERSHIP_NOT_FOUND_MESSAGE = "Store membership not found."
 STORE_HOURS_SLOT_REQUIRES_BOTH_TIMES_MESSAGE = "Each business-hours slot requires both open and close times."
@@ -687,10 +694,75 @@ class BusinessRepository:
         order = await self.session.get(Order, order_id)
         if order is None:
             raise OrderNotFoundError
+        previous_status = order.status
         order.status = status
         order.updated_at = utc_now()
         await self.session.flush()
+        await self._queue_status_notification_if_needed(order, previous_status=previous_status)
         return await self._build_order_snapshot(order)
+
+    async def set_order_notify_when_ready(
+        self,
+        customer_id: int,
+        conversation_id: int,
+        *,
+        enabled: bool = True,
+    ) -> OrderSnapshot:
+        """Persist whether the customer wants a proactive ready notification."""
+        order = await self._get_draft_order(customer_id, conversation_id)
+        if order is None:
+            order = await self.session.scalar(
+                select(Order)
+                .where(
+                    Order.customer_id == customer_id,
+                    Order.conversation_id == conversation_id,
+                )
+                .order_by(Order.updated_at.desc(), Order.id.desc())
+            )
+        if order is None:
+            order = Order(customer_id=customer_id, conversation_id=conversation_id, notify_when_ready=enabled)
+            self.session.add(order)
+            await self.session.flush()
+        order.notify_when_ready = enabled
+        order.updated_at = utc_now()
+        await self.session.flush()
+        return await self._build_order_snapshot(order)
+
+    async def list_pending_notifications(
+        self,
+        *,
+        channel: Channel,
+        external_id: str,
+    ) -> list[OutboundNotificationSnapshot]:
+        """Return undelivered notifications for one conversation and mark them as delivered."""
+        rows = (
+            await self.session.scalars(
+                select(OutboundNotification)
+                .join(Conversation, Conversation.id == OutboundNotification.conversation_id)
+                .where(
+                    Conversation.channel == channel,
+                    Conversation.external_id == external_id,
+                    OutboundNotification.delivered_at.is_(None),
+                )
+                .order_by(OutboundNotification.id.asc())
+            )
+        ).all()
+        delivered_at = utc_now()
+        snapshots: list[OutboundNotificationSnapshot] = []
+        for row in rows:
+            row.delivered_at = delivered_at
+            snapshots.append(
+                OutboundNotificationSnapshot(
+                    id=row.id,
+                    order_id=row.order_id,
+                    conversation_id=row.conversation_id,
+                    event_type=row.event_type,
+                    message_text=row.message_text,
+                    created_at=row.created_at,
+                )
+            )
+        await self.session.flush()
+        return snapshots
 
     async def add_item_to_current_order(
         self,
@@ -1017,6 +1089,7 @@ class BusinessRepository:
             delivery_type=order.delivery_type,
             delivery_address=order.delivery_address,
             payment_method=order.payment_method,
+            notify_when_ready=order.notify_when_ready,
             requested_ready_at=order.requested_ready_at,
             preparation_starts_at=order.preparation_starts_at,
             total_amount_cents=order.total_amount_cents,
@@ -1083,6 +1156,7 @@ class BusinessRepository:
             delivery_type=order.delivery_type,
             delivery_address=order.delivery_address,
             payment_method=order.payment_method,
+            notify_when_ready=order.notify_when_ready,
             requested_ready_at=order.requested_ready_at,
             preparation_starts_at=order.preparation_starts_at,
             total_amount_cents=order.total_amount_cents,
@@ -1099,6 +1173,44 @@ class BusinessRepository:
                 for item in items
             ],
         )
+
+    async def _queue_status_notification_if_needed(self, order: Order, *, previous_status: OrderStatus) -> None:
+        """Queue one outbound notification when an order reaches a ready state."""
+        if not order.notify_when_ready:
+            return
+        if previous_status == order.status:
+            return
+        event_type = READY_NOTIFICATION_EVENT_BY_STATUS.get(order.status)
+        if event_type is None:
+            return
+        existing = await self.session.scalar(
+            select(OutboundNotification).where(
+                OutboundNotification.order_id == order.id,
+                OutboundNotification.event_type == event_type,
+            )
+        )
+        if existing is not None:
+            return
+        conversation = await self.session.get(Conversation, order.conversation_id)
+        if conversation is None:
+            return
+        self.session.add(
+            OutboundNotification(
+                order_id=order.id,
+                conversation_id=conversation.id,
+                event_type=event_type,
+                message_text=self._build_status_notification_text(order),
+            )
+        )
+        await self.session.flush()
+
+    def _build_status_notification_text(self, order: Order) -> str:
+        """Build the outbound message shown when an order reaches a relevant status."""
+        if order.status == OrderStatus.ALMOST_READY:
+            return "Tu pedido ya casi está 👀"
+        if order.status == OrderStatus.OUT_FOR_DELIVERY:
+            return "Tu pedido ya salió y va en camino 🚚"
+        return "Tu pedido ya está listo para retirar 🙌"
 
     def _estimate_delay_from_snapshot(
         self,

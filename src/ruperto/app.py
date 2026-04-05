@@ -29,9 +29,11 @@ from ruperto.schemas import (
     AssistantTurnResult,
     CustomerSnapshot,
     DevMessageRequest,
+    DevNotificationPollRequest,
     MenuItemSnapshot,
     OrderSnapshot,
     OrderStatusUpdateRequest,
+    OutboundNotificationSnapshot,
     StaffUserSnapshot,
     StoreBusinessHoursSnapshot,
     StoreBusinessHoursUpdateEntry,
@@ -336,6 +338,7 @@ def demo_chat_page_context(*, request: Request, settings: Settings) -> dict[str,
         "bot_name": settings.bot_name,
         "store_location": settings.store_location or "Local sin ubicación configurada",
         "api_path": "/api/dev/messages",
+        "notifications_api_path": "/api/dev/notifications",
         "demo_profiles": [
             {"label": "Martín", "phone": "+54 351 555 7788"},
             {"label": "Ana", "phone": "+54 9 11 3344 5566"},
@@ -1071,6 +1074,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
             external_user_id=payload.external_user_id,
             message_text=payload.message_text,
         )
+
+    @app.get("/api/dev/notifications", response_model=list[OutboundNotificationSnapshot])
+    async def get_dev_notifications(
+        request: Request,
+        external_user_id: str,
+    ) -> list[OutboundNotificationSnapshot]:
+        runtime = get_runtime(request)
+        payload = DevNotificationPollRequest.model_validate({"external_user_id": external_user_id})
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            notifications = await repository.list_pending_notifications(
+                channel=Channel.DEV,
+                external_id=payload.external_user_id,
+            )
+            await session.commit()
+            return notifications
 
     return app
 

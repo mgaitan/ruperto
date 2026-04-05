@@ -131,6 +131,7 @@ class OrderSnapshot(BaseModel):
     delivery_type: DeliveryType | None
     delivery_address: str | None
     payment_method: PaymentMethod | None
+    notify_when_ready: bool = False
     requested_ready_at: datetime | None = None
     preparation_starts_at: datetime | None = None
     total_amount_cents: int
@@ -189,6 +190,23 @@ class DevMessageRequest(BaseModel):
 
     external_user_id: str = Field(min_length=1)
     message_text: str = Field(min_length=1)
+
+
+class OutboundNotificationSnapshot(BaseModel):
+    """One queued outbound notification ready to be delivered to a client."""
+
+    id: int
+    order_id: int
+    conversation_id: int
+    event_type: str
+    message_text: str
+    created_at: datetime
+
+
+class DevNotificationPollRequest(BaseModel):
+    """Query payload used to fetch pending demo notifications."""
+
+    external_user_id: str = Field(min_length=1)
 
 
 class OrderStatusUpdateRequest(BaseModel):

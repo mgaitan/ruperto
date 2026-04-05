@@ -120,10 +120,34 @@ def _ensure_schema_columns(connection: Connection) -> None:
 
     if "customer_order" in inspector.get_table_names():
         order_columns = {column["name"] for column in inspector.get_columns("customer_order")}
+        if "notify_when_ready" not in order_columns:
+            connection.execute(
+                text("ALTER TABLE customer_order ADD COLUMN notify_when_ready BOOLEAN NOT NULL DEFAULT 1")
+            )
         if "requested_ready_at" not in order_columns:
             connection.execute(text("ALTER TABLE customer_order ADD COLUMN requested_ready_at DATETIME"))
         if "preparation_starts_at" not in order_columns:
             connection.execute(text("ALTER TABLE customer_order ADD COLUMN preparation_starts_at DATETIME"))
+
+    if "outbound_notification" not in inspector.get_table_names():
+        connection.execute(
+            text(
+                """
+                CREATE TABLE outbound_notification (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    order_id INTEGER NOT NULL,
+                    conversation_id INTEGER NOT NULL,
+                    event_type VARCHAR(64) NOT NULL,
+                    message_text TEXT NOT NULL,
+                    delivered_at DATETIME,
+                    created_at DATETIME NOT NULL,
+                    FOREIGN KEY(order_id) REFERENCES customer_order (id) ON DELETE CASCADE,
+                    FOREIGN KEY(conversation_id) REFERENCES conversation (id) ON DELETE CASCADE,
+                    CONSTRAINT uq_outbound_notification_order_event UNIQUE (order_id, event_type)
+                )
+                """
+            )
+        )
 
     if "store_business_hours" in inspector.get_table_names():
         hours_columns = {column["name"] for column in inspector.get_columns("store_business_hours")}
