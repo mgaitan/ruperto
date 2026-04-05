@@ -7,7 +7,16 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ruperto.models import Channel, ChannelProvider, DeliveryType, OrderStatus, PaymentMethod, StaffRole, StoreVertical
+from ruperto.models import (
+    Channel,
+    ChannelProvider,
+    DeliveryType,
+    MunicipalCaseStatus,
+    OrderStatus,
+    PaymentMethod,
+    StaffRole,
+    StoreVertical,
+)
 
 
 def format_price_ars(amount_cents: int) -> str:
@@ -100,6 +109,54 @@ class StaffUserSnapshot(BaseSchema):
     email: str
     full_name: str
     is_active: bool
+
+
+class MunicipalAreaSnapshot(BaseSchema):
+    """One municipal area configured for a tenant."""
+
+    id: int
+    store_id: int
+    name: str
+    description: str | None
+    manager_staff_user_id: int | None
+    display_order: int
+    is_active: bool
+
+
+class MunicipalCategorySnapshot(BaseSchema):
+    """One municipal category nested under an area."""
+
+    id: int
+    area_id: int
+    name: str
+    description: str | None
+    requires_precise_location: bool
+    is_fallback: bool
+    display_order: int
+    is_active: bool
+
+
+class MunicipalCaseSnapshot(BaseSchema):
+    """One municipal service-request case."""
+
+    id: int
+    store_id: int
+    area_id: int
+    category_id: int | None
+    customer_id: int | None
+    conversation_id: int | None
+    assignee_staff_user_id: int | None
+    title: str
+    description: str
+    reporter_name: str | None
+    reporter_phone_number: str | None
+    location_text: str | None
+    location_reference: str | None
+    latitude: float | None
+    longitude: float | None
+    status: MunicipalCaseStatus
+    created_at: datetime
+    updated_at: datetime
 
 
 class StoreMembershipSnapshot(BaseModel):
@@ -286,3 +343,48 @@ class StoreChannelConnectionUpdateRequest(BaseModel):
     api_key: str | None = None
     webhook_secret: str | None = None
     is_active: bool = False
+
+
+class MunicipalAreaCreateRequest(BaseModel):
+    """Payload used to create one municipal area."""
+
+    name: str = Field(min_length=1)
+    description: str | None = None
+    manager_staff_user_id: int | None = None
+    display_order: int = Field(default=0, ge=0)
+    is_active: bool = True
+
+
+class MunicipalCategoryCreateRequest(BaseModel):
+    """Payload used to create one municipal category."""
+
+    name: str = Field(min_length=1)
+    description: str | None = None
+    requires_precise_location: bool = False
+    is_fallback: bool = False
+    display_order: int = Field(default=0, ge=0)
+    is_active: bool = True
+
+
+class MunicipalCaseCreateRequest(BaseModel):
+    """Payload used to create one municipal service request."""
+
+    area_id: int
+    category_id: int | None = None
+    customer_id: int | None = None
+    conversation_id: int | None = None
+    assignee_staff_user_id: int | None = None
+    title: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    reporter_name: str | None = None
+    reporter_phone_number: str | None = None
+    location_text: str | None = None
+    location_reference: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+
+
+class MunicipalCaseStatusUpdateRequest(BaseModel):
+    """Payload used to change one municipal case status."""
+
+    status: MunicipalCaseStatus

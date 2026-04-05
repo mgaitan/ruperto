@@ -1,11 +1,11 @@
-"""ORM models for the food-ordering MVP."""
+"""ORM models shared by the platform and its vertical domains."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, time
 from enum import StrEnum
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, Time, UniqueConstraint
+from sqlalchemy import DateTime, Float, ForeignKey, String, Text, Time, UniqueConstraint
 from sqlalchemy import Enum as SqlEnum
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -78,6 +78,18 @@ class StaffRole(StrEnum):
     OWNER = "owner"
     MANAGER = "manager"
     STAFF = "staff"
+
+
+class MunicipalCaseStatus(StrEnum):
+    """Lifecycle states for municipal service requests."""
+
+    NEW = "new"
+    TRIAGED = "triaged"
+    IN_PROGRESS = "in_progress"
+    BLOCKED = "blocked"
+    RESOLVED = "resolved"
+    CLOSED = "closed"
+    CANCELLED = "cancelled"
 
 
 class StoreProfile(Base):
@@ -249,6 +261,84 @@ class ConversationState(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     conversation_id: Mapped[int] = mapped_column(ForeignKey("conversation.id", ondelete="CASCADE"))
     pending_customer_message: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(default=utc_now, onupdate=utc_now)
+
+
+class MunicipalArea(Base):
+    """One configurable municipal service area owned by a tenant."""
+
+    __tablename__ = "municipal_area"
+    __table_args__ = (UniqueConstraint("store_id", "name", name="uq_municipal_area_store_name"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("store_profile.id", ondelete="CASCADE"))
+    name: Mapped[str] = mapped_column(String(length=120))
+    description: Mapped[str | None] = mapped_column(String(length=300), nullable=True)
+    manager_staff_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("staff_user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    display_order: Mapped[int] = mapped_column(default=0)
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(default=utc_now, onupdate=utc_now)
+
+
+class MunicipalCategory(Base):
+    """One optional subcategory within a municipal area."""
+
+    __tablename__ = "municipal_category"
+    __table_args__ = (UniqueConstraint("area_id", "name", name="uq_municipal_category_area_name"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    area_id: Mapped[int] = mapped_column(ForeignKey("municipal_area.id", ondelete="CASCADE"))
+    name: Mapped[str] = mapped_column(String(length=120))
+    description: Mapped[str | None] = mapped_column(String(length=300), nullable=True)
+    requires_precise_location: Mapped[bool] = mapped_column(default=False)
+    is_fallback: Mapped[bool] = mapped_column(default=False)
+    display_order: Mapped[int] = mapped_column(default=0)
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(default=utc_now, onupdate=utc_now)
+
+
+class MunicipalCase(Base):
+    """One municipal service request tracked from intake to closure."""
+
+    __tablename__ = "municipal_case"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("store_profile.id", ondelete="CASCADE"))
+    area_id: Mapped[int] = mapped_column(ForeignKey("municipal_area.id", ondelete="RESTRICT"))
+    category_id: Mapped[int | None] = mapped_column(
+        ForeignKey("municipal_category.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    customer_id: Mapped[int | None] = mapped_column(
+        ForeignKey("customer.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    conversation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("conversation.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    assignee_staff_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("staff_user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    title: Mapped[str] = mapped_column(String(length=160))
+    description: Mapped[str] = mapped_column(Text())
+    reporter_name: Mapped[str | None] = mapped_column(String(length=120), nullable=True)
+    reporter_phone_number: Mapped[str | None] = mapped_column(String(length=32), nullable=True)
+    location_text: Mapped[str | None] = mapped_column(String(length=255), nullable=True)
+    location_reference: Mapped[str | None] = mapped_column(String(length=255), nullable=True)
+    latitude: Mapped[float | None] = mapped_column(Float(), nullable=True)
+    longitude: Mapped[float | None] = mapped_column(Float(), nullable=True)
+    status: Mapped[MunicipalCaseStatus] = mapped_column(
+        SqlEnum(MunicipalCaseStatus, native_enum=False, length=32, values_callable=enum_values),
+        default=MunicipalCaseStatus.NEW,
+    )
     created_at: Mapped[datetime] = mapped_column(default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(default=utc_now, onupdate=utc_now)
 

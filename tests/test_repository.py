@@ -14,12 +14,13 @@ from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserProm
 from sqlalchemy import create_engine, func, select, text
 
 from ruperto.config import Settings
-from ruperto.db import DatabaseRuntime, _ensure_schema_columns, create_database_runtime, init_database
+from ruperto.db import DatabaseRuntime, _ensure_schema_columns, create_database_runtime, init_database, ping_database
 from ruperto.models import (
     Channel,
     ChannelProvider,
     DeliveryType,
     MenuItem,
+    MunicipalCaseStatus,
     Order,
     OrderStatus,
     OutboundNotification,
@@ -32,10 +33,18 @@ from ruperto.repository import (
     STORE_HOURS_SLOT_ORDER_MESSAGE,
     STORE_HOURS_SLOT_REQUIRES_BOTH_TIMES_MESSAGE,
     BusinessRepository,
+    MunicipalAreaNotFoundError,
+    MunicipalCaseNotFoundError,
+    MunicipalCategoryMismatchError,
+    MunicipalCategoryNotFoundError,
     normalize_phone_number,
     round_delay_minutes,
 )
 from ruperto.schemas import (
+    MunicipalAreaCreateRequest,
+    MunicipalCaseCreateRequest,
+    MunicipalCaseStatusUpdateRequest,
+    MunicipalCategoryCreateRequest,
     StoreBusinessHoursSnapshot,
     StoreChannelConnectionUpdateRequest,
     StoreProfileUpdateRequest,
@@ -69,6 +78,22 @@ async def build_repository(tmp_path: Path) -> tuple[BusinessRepository, Database
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'repo.db'}",
         store_name="Rotisería Test",
         bot_name="Ruperto Test",
+    )
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    session = runtime.session_factory()
+    repository = BusinessRepository(session)
+    return repository, runtime
+
+
+async def build_municipal_repository(tmp_path: Path) -> tuple[BusinessRepository, DatabaseRuntime]:
+    """Create an initialized repository for the municipal vertical."""
+    settings = Settings(
+        environment="test",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'municipal.db'}",
+        store_name="Municipio Test",
+        bot_name="Moony Test",
+        store_vertical=StoreVertical.MUNICIPAL,
     )
     runtime = create_database_runtime(settings)
     await init_database(settings=settings, runtime=runtime)
@@ -1715,3 +1740,433 @@ async def test_store_business_hours_reject_inverted_slots(tmp_path: Path):
         )
 
     await close_repository(repository, runtime)
+
+
+async def test_municipal_bootstrap_seeds_demo_areas_and_categories(tmp_path: Path):
+    """Municipal tenants start with a useful service catalog for the PoC."""
+    repository, runtime = await build_municipal_repository(tmp_path)
+
+    store = await repository.get_store_profile()
+    areas = await repository.list_municipal_areas(store_id=store.id)
+    categories = await repository.list_municipal_categories(store_id=store.id)
+
+    assert store.vertical == StoreVertical.MUNICIPAL
+    assert {area.name for area in areas} >= {
+        "Alumbrado público",
+        "Mantenimiento de calles",
+        "Solicitud de agua",
+    }
+    assert any(category.is_fallback for category in categories)
+    assert any(category.requires_precise_location for category in categories)
+
+    await close_repository(repository, runtime)
+
+
+async def test_municipal_cases_default_to_the_area_fallback_category(tmp_path: Path):
+    """Creating a case without subcategory should pick the area's fallback when available."""
+    repository, runtime = await build_municipal_repository(tmp_path)
+    store = await repository.get_store_profile()
+    customer = await repository.get_or_create_customer(
+        channel=Channel.DEV,
+        external_id="municipal-neighbor",
+        phone_number="+54 351 111 2233",
+    )
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="municipal-neighbor",
+        customer_id=customer.id,
+        store_id=store.id,
+    )
+    area = next(
+        area
+        for area in await repository.list_municipal_areas(store_id=store.id)
+        if area.name == "Mantenimiento de calles"
+    )
+    categories = await repository.list_municipal_categories(store_id=store.id, area_id=area.id)
+    fallback_category = next(category for category in categories if category.is_fallback)
+
+    created = await repository.create_municipal_case(
+        store_id=store.id,
+        payload=MunicipalCaseCreateRequest(
+            area_id=area.id,
+            customer_id=customer.id,
+            conversation_id=conversation.id,
+            title="Necesitamos revisar una calle",
+            description="La calle del barrio está muy rota y hace falta mantenimiento.",
+            reporter_name="Elena",
+            reporter_phone_number="+54 351 111 2233",
+            location_text="Pasaje Los Aromos 1200",
+        ),
+    )
+
+    assert created.category_id == fallback_category.id
+    assert created.reporter_phone_number == "+543511112233"
+    assert created.status == MunicipalCaseStatus.NEW
+
+    await close_repository(repository, runtime)
+
+
+async def test_municipal_cases_reject_categories_from_another_area(tmp_path: Path):
+    """A case cannot mix one area with a category that belongs elsewhere."""
+    repository, runtime = await build_municipal_repository(tmp_path)
+    store = await repository.get_store_profile()
+    areas = await repository.list_municipal_areas(store_id=store.id)
+    lighting_area = next(area for area in areas if area.name == "Alumbrado público")
+    streets_area = next(area for area in areas if area.name == "Mantenimiento de calles")
+    lighting_category = next(
+        category
+        for category in await repository.list_municipal_categories(store_id=store.id, area_id=lighting_area.id)
+        if category.name == "Lámpara apagada"
+    )
+
+    with pytest.raises(MunicipalCategoryMismatchError):
+        await repository.create_municipal_case(
+            store_id=store.id,
+            payload=MunicipalCaseCreateRequest(
+                area_id=streets_area.id,
+                category_id=lighting_category.id,
+                title="Cruce oscuro",
+                description="No funciona la lámpara en la esquina.",
+            ),
+        )
+
+    await close_repository(repository, runtime)
+
+
+async def test_municipal_case_status_and_assignment_can_be_updated(tmp_path: Path):
+    """Municipal cases support assignee changes and kanban-friendly statuses."""
+    repository, runtime = await build_municipal_repository(tmp_path)
+    store = await repository.get_store_profile()
+    owner = await repository.ensure_staff_user(
+        email="municipal-owner@example.com",
+        full_name="Municipal Owner",
+        password="super-secret",
+        store_id=store.id,
+        role=StaffRole.OWNER,
+    )
+    area = next(
+        area for area in await repository.list_municipal_areas(store_id=store.id) if area.name == "Solicitud de agua"
+    )
+    created = await repository.create_municipal_case(
+        store_id=store.id,
+        payload=MunicipalCaseCreateRequest(
+            area_id=area.id,
+            title="Falta de agua en barrio centro",
+            description="Desde anoche no sale agua en toda la cuadra.",
+            reporter_name="Nora",
+        ),
+    )
+
+    assigned = await repository.assign_municipal_case(created.id, staff_user_id=owner.id)
+    updated = await repository.update_municipal_case_status(
+        created.id,
+        MunicipalCaseStatusUpdateRequest(status=MunicipalCaseStatus.IN_PROGRESS),
+    )
+    filtered = await repository.list_municipal_cases(
+        store_id=store.id,
+        status=MunicipalCaseStatus.IN_PROGRESS,
+        assignee_staff_user_id=owner.id,
+    )
+
+    assert assigned.assignee_staff_user_id == owner.id
+    assert updated.status == MunicipalCaseStatus.IN_PROGRESS
+    assert [case.id for case in filtered] == [created.id]
+
+    await close_repository(repository, runtime)
+
+
+async def test_municipal_areas_and_categories_can_be_created_manually(tmp_path: Path):
+    """Stores can extend the demo municipal catalog with tenant-specific entries."""
+    repository, runtime = await build_municipal_repository(tmp_path)
+    store = await repository.get_store_profile()
+
+    area = await repository.create_municipal_area(
+        store_id=store.id,
+        payload=MunicipalAreaCreateRequest(
+            name="Espacios verdes",
+            description="Plazas, juegos y arbolado.",
+            display_order=10,
+        ),
+    )
+    category = await repository.create_municipal_category(
+        area_id=area.id,
+        payload=MunicipalCategoryCreateRequest(
+            name="Juegos rotos",
+            description="Mantenimiento de hamacas y juegos infantiles.",
+            requires_precise_location=True,
+            display_order=0,
+        ),
+    )
+
+    assert area.name == "Espacios verdes"
+    assert category.area_id == area.id
+    assert category.requires_precise_location is True
+
+    await close_repository(repository, runtime)
+
+
+async def test_municipal_categories_require_a_valid_area(tmp_path: Path):
+    """Categories must always belong to an existing municipal area."""
+    repository, runtime = await build_municipal_repository(tmp_path)
+
+    with pytest.raises(MunicipalAreaNotFoundError):
+        await repository.create_municipal_category(
+            area_id=999,
+            payload=MunicipalCategoryCreateRequest(name="Imposible"),
+        )
+
+    await close_repository(repository, runtime)
+
+
+async def test_municipal_category_listing_can_filter_only_active_rows(tmp_path: Path):
+    """Inactive municipal areas and categories disappear from active-only listings."""
+    repository, runtime = await build_municipal_repository(tmp_path)
+    store = await repository.get_store_profile()
+
+    inactive_area = await repository.create_municipal_area(
+        store_id=store.id,
+        payload=MunicipalAreaCreateRequest(name="Área inactiva", is_active=False),
+    )
+    await repository.create_municipal_category(
+        area_id=inactive_area.id,
+        payload=MunicipalCategoryCreateRequest(name="Categoría inactiva", is_active=False),
+    )
+
+    active_areas = await repository.list_municipal_areas(store_id=store.id, only_active=True)
+    active_categories = await repository.list_municipal_categories(store_id=store.id, only_active=True)
+
+    assert all(area.is_active for area in active_areas)
+    assert "Área inactiva" not in {area.name for area in active_areas}
+    assert all(category.is_active for category in active_categories)
+
+    await close_repository(repository, runtime)
+
+
+async def test_municipal_case_creation_validates_missing_area_and_category(tmp_path: Path):
+    """Municipal cases fail fast when the selected area or category is missing."""
+    repository, runtime = await build_municipal_repository(tmp_path)
+    store = await repository.get_store_profile()
+    area = next(
+        area for area in await repository.list_municipal_areas(store_id=store.id) if area.name == "Solicitud de agua"
+    )
+
+    with pytest.raises(MunicipalAreaNotFoundError):
+        await repository.create_municipal_case(
+            store_id=store.id,
+            payload=MunicipalCaseCreateRequest(
+                area_id=999,
+                title="Sin área",
+                description="No debería crearse.",
+            ),
+        )
+
+    with pytest.raises(MunicipalCategoryNotFoundError):
+        await repository.create_municipal_case(
+            store_id=store.id,
+            payload=MunicipalCaseCreateRequest(
+                area_id=area.id,
+                category_id=999,
+                title="Sin categoría",
+                description="No debería crearse.",
+            ),
+        )
+
+    await close_repository(repository, runtime)
+
+
+async def test_municipal_case_missing_rows_raise_not_found_errors(tmp_path: Path):
+    """Reading or mutating unknown municipal cases should raise domain-specific errors."""
+    repository, runtime = await build_municipal_repository(tmp_path)
+
+    with pytest.raises(MunicipalCaseNotFoundError):
+        await repository.get_municipal_case(999)
+    with pytest.raises(MunicipalCaseNotFoundError):
+        await repository.update_municipal_case_status(
+            999,
+            MunicipalCaseStatusUpdateRequest(status=MunicipalCaseStatus.TRIAGED),
+        )
+    with pytest.raises(MunicipalCaseNotFoundError):
+        await repository.assign_municipal_case(999, staff_user_id=None)
+
+    await close_repository(repository, runtime)
+
+
+async def test_municipal_case_listing_can_filter_by_area(tmp_path: Path):
+    """Area filtering keeps the municipal kanban scoped to one service area."""
+    repository, runtime = await build_municipal_repository(tmp_path)
+    store = await repository.get_store_profile()
+    areas = await repository.list_municipal_areas(store_id=store.id)
+    lighting_area = next(area for area in areas if area.name == "Alumbrado público")
+    streets_area = next(area for area in areas if area.name == "Mantenimiento de calles")
+
+    await repository.create_municipal_case(
+        store_id=store.id,
+        payload=MunicipalCaseCreateRequest(
+            area_id=lighting_area.id,
+            title="Farola apagada",
+            description="No enciende desde anoche.",
+        ),
+    )
+    street_case = await repository.create_municipal_case(
+        store_id=store.id,
+        payload=MunicipalCaseCreateRequest(
+            area_id=streets_area.id,
+            title="Bache grande",
+            description="Se agrandó después de la lluvia.",
+        ),
+    )
+
+    filtered = await repository.list_municipal_cases(store_id=store.id, area_id=streets_area.id)
+
+    assert [case.id for case in filtered] == [street_case.id]
+
+    await close_repository(repository, runtime)
+
+
+async def test_get_municipal_case_returns_the_persisted_snapshot(tmp_path: Path):
+    """Municipal cases can be loaded back explicitly by primary key."""
+    repository, runtime = await build_municipal_repository(tmp_path)
+    store = await repository.get_store_profile()
+    area = next(
+        area for area in await repository.list_municipal_areas(store_id=store.id) if area.name == "Alumbrado público"
+    )
+    created = await repository.create_municipal_case(
+        store_id=store.id,
+        payload=MunicipalCaseCreateRequest(
+            area_id=area.id,
+            title="Semáforo sin luz",
+            description="Hace falta revisar la luminaria del cruce.",
+        ),
+    )
+
+    loaded = await repository.get_municipal_case(created.id)
+
+    assert loaded.id == created.id
+    assert loaded.title == "Semáforo sin luz"
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_channel_runtime_returns_none_for_incomplete_connections(tmp_path: Path):
+    """Inactive or incomplete channel rows should not be treated as runtime-ready."""
+    repository, runtime = await build_repository(tmp_path)
+
+    await repository.update_store_channel_connection(
+        store_id=1,
+        channel=Channel.WHATSAPP,
+        provider=ChannelProvider.KAPSO,
+        payload=StoreChannelConnectionUpdateRequest(
+            phone_number_id="only-phone-id",
+            api_key=None,
+            webhook_secret=None,
+            is_active=True,
+        ),
+    )
+
+    assert (
+        await repository.get_store_channel_runtime_config(
+            store_id=1,
+            channel=Channel.WHATSAPP,
+            provider=ChannelProvider.KAPSO,
+        )
+        is None
+    )
+    assert (
+        await repository.get_channel_runtime_config_by_phone_number(
+            channel=Channel.WHATSAPP,
+            provider=ChannelProvider.KAPSO,
+            phone_number_id="only-phone-id",
+        )
+        is None
+    )
+
+    await close_repository(repository, runtime)
+
+
+async def test_staff_user_refresh_rehashes_password_and_updates_role(tmp_path: Path):
+    """Refreshing an existing staff user updates both credentials and membership role."""
+    repository, runtime = await build_repository(tmp_path)
+
+    created = await repository.ensure_staff_user(
+        email="staff@example.com",
+        full_name="Staff One",
+        password="first-secret",
+        store_id=1,
+        role=StaffRole.STAFF,
+    )
+    refreshed = await repository.ensure_staff_user(
+        email="staff@example.com",
+        full_name="Staff Updated",
+        password="second-secret",
+        store_id=1,
+        role=StaffRole.MANAGER,
+    )
+    by_id = await repository.get_staff_user_by_id(created.id)
+    invalid_login = await repository.authenticate_staff_user(email="staff@example.com", password="first-secret")
+    memberships = await repository.list_store_memberships_for_staff_user(created.id)
+
+    assert refreshed.full_name == "Staff Updated"
+    assert by_id is not None
+    assert by_id.full_name == "Staff Updated"
+    assert invalid_login is None
+    assert memberships[0].role == StaffRole.MANAGER
+
+    await close_repository(repository, runtime)
+
+
+async def test_get_customer_and_list_customers_roundtrip(tmp_path: Path):
+    """Customers can be loaded explicitly and listed by recent activity."""
+    repository, runtime = await build_repository(tmp_path)
+    first = await repository.get_or_create_customer(channel=Channel.DEV, external_id="cust-1", phone_number="3511")
+    second = await repository.get_or_create_customer(channel=Channel.DEV, external_id="cust-2", phone_number="3512")
+
+    loaded = await repository.get_customer(first.id)
+    customers = await repository.list_customers(limit=10)
+
+    assert loaded.id == first.id
+    assert {customer.id for customer in customers} >= {first.id, second.id}
+
+    await close_repository(repository, runtime)
+
+
+async def test_ping_database_and_municipal_bootstrap_are_idempotent(tmp_path: Path):
+    """Re-running init_database should keep municipal seeds and connectivity healthy."""
+    settings = Settings(
+        environment="test",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'municipal-idempotent.db'}",
+        store_name="Municipio Test",
+        bot_name="Moony Test",
+        store_vertical=StoreVertical.MUNICIPAL,
+        kapso_api_key=SecretStr("kapso-seeded"),
+        kapso_phone_number_id="phone-id-seeded",
+    )
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    await ping_database(runtime)
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        initial_areas = await repository.list_municipal_areas(store_id=settings.default_store_id)
+        initial_connection = await repository.get_store_channel_connection(
+            store_id=settings.default_store_id,
+            channel=Channel.WHATSAPP,
+            provider=ChannelProvider.KAPSO,
+        )
+        await session.commit()
+
+    await init_database(settings=settings, runtime=runtime)
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        rerun_areas = await repository.list_municipal_areas(store_id=settings.default_store_id)
+        rerun_connection = await repository.get_store_channel_connection(
+            store_id=settings.default_store_id,
+            channel=Channel.WHATSAPP,
+            provider=ChannelProvider.KAPSO,
+        )
+        await session.commit()
+
+    assert len(rerun_areas) == len(initial_areas)
+    assert rerun_connection.id == initial_connection.id
+
+    await runtime.engine.dispose()

@@ -1,4 +1,4 @@
-"""Persistence helpers for the ordering MVP."""
+"""Persistence helpers shared by the platform and its vertical domains."""
 
 from __future__ import annotations
 
@@ -25,6 +25,10 @@ from ruperto.models import (
     CustomerIdentity,
     DeliveryType,
     MenuItem,
+    MunicipalArea,
+    MunicipalCase,
+    MunicipalCaseStatus,
+    MunicipalCategory,
     Order,
     OrderItem,
     OrderStatus,
@@ -45,6 +49,13 @@ from ruperto.schemas import (
     CustomerSnapshot,
     DelayEstimateSnapshot,
     MenuItemSnapshot,
+    MunicipalAreaCreateRequest,
+    MunicipalAreaSnapshot,
+    MunicipalCaseCreateRequest,
+    MunicipalCaseSnapshot,
+    MunicipalCaseStatusUpdateRequest,
+    MunicipalCategoryCreateRequest,
+    MunicipalCategorySnapshot,
     OrderItemSnapshot,
     OrderSnapshot,
     OutboundNotificationSnapshot,
@@ -158,6 +169,34 @@ class OrderNotFoundError(ValueError):
 
     def __init__(self) -> None:
         super().__init__("No se encontró el pedido solicitado.")
+
+
+class MunicipalAreaNotFoundError(ValueError):
+    """Raised when the requested municipal area does not exist."""
+
+    def __init__(self) -> None:
+        super().__init__("No se encontró el área municipal.")
+
+
+class MunicipalCategoryNotFoundError(ValueError):
+    """Raised when the requested municipal category does not exist."""
+
+    def __init__(self) -> None:
+        super().__init__("No se encontró la categoría municipal.")
+
+
+class MunicipalCaseNotFoundError(ValueError):
+    """Raised when the requested municipal case does not exist."""
+
+    def __init__(self) -> None:
+        super().__init__("No se encontró el caso municipal.")
+
+
+class MunicipalCategoryMismatchError(ValueError):
+    """Raised when a category does not belong to the selected area."""
+
+    def __init__(self) -> None:
+        super().__init__("La categoría no pertenece al área municipal indicada.")
 
 
 class IncompleteOrderError(ValueError):
@@ -777,6 +816,201 @@ class BusinessRepository:
         conversation.updated_at = utc_now()
         await self.session.flush()
 
+    async def create_municipal_area(
+        self,
+        *,
+        store_id: int,
+        payload: MunicipalAreaCreateRequest,
+    ) -> MunicipalAreaSnapshot:
+        """Create one municipal area for a tenant."""
+        row = MunicipalArea(
+            store_id=store_id,
+            name=payload.name.strip(),
+            description=self._normalize_optional_text(payload.description),
+            manager_staff_user_id=payload.manager_staff_user_id,
+            display_order=payload.display_order,
+            is_active=payload.is_active,
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return self._municipal_area_snapshot(row)
+
+    async def list_municipal_areas(
+        self,
+        *,
+        store_id: int,
+        only_active: bool = False,
+    ) -> list[MunicipalAreaSnapshot]:
+        """List municipal areas configured for one tenant."""
+        statement = (
+            select(MunicipalArea)
+            .where(MunicipalArea.store_id == store_id)
+            .order_by(MunicipalArea.display_order.asc(), MunicipalArea.name.asc(), MunicipalArea.id.asc())
+        )
+        if only_active:
+            statement = statement.where(MunicipalArea.is_active.is_(True))
+        rows = (await self.session.scalars(statement)).all()
+        return [self._municipal_area_snapshot(row) for row in rows]
+
+    async def create_municipal_category(
+        self,
+        *,
+        area_id: int,
+        payload: MunicipalCategoryCreateRequest,
+    ) -> MunicipalCategorySnapshot:
+        """Create one municipal category under a concrete area."""
+        area = await self.session.get(MunicipalArea, area_id)
+        if area is None:
+            raise MunicipalAreaNotFoundError
+        row = MunicipalCategory(
+            area_id=area_id,
+            name=payload.name.strip(),
+            description=self._normalize_optional_text(payload.description),
+            requires_precise_location=payload.requires_precise_location,
+            is_fallback=payload.is_fallback,
+            display_order=payload.display_order,
+            is_active=payload.is_active,
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return self._municipal_category_snapshot(row)
+
+    async def list_municipal_categories(
+        self,
+        *,
+        store_id: int,
+        area_id: int | None = None,
+        only_active: bool = False,
+    ) -> list[MunicipalCategorySnapshot]:
+        """List municipal categories for one tenant, optionally scoped to one area."""
+        statement = (
+            select(MunicipalCategory)
+            .join(MunicipalArea, MunicipalArea.id == MunicipalCategory.area_id)
+            .where(MunicipalArea.store_id == store_id)
+            .order_by(
+                MunicipalArea.display_order.asc(),
+                MunicipalCategory.display_order.asc(),
+                MunicipalCategory.name.asc(),
+                MunicipalCategory.id.asc(),
+            )
+        )
+        if area_id is not None:
+            statement = statement.where(MunicipalCategory.area_id == area_id)
+        if only_active:
+            statement = statement.where(MunicipalCategory.is_active.is_(True), MunicipalArea.is_active.is_(True))
+        rows = (await self.session.scalars(statement)).all()
+        return [self._municipal_category_snapshot(row) for row in rows]
+
+    async def create_municipal_case(
+        self,
+        *,
+        store_id: int,
+        payload: MunicipalCaseCreateRequest,
+    ) -> MunicipalCaseSnapshot:
+        """Create one municipal service request tied to a tenant area."""
+        area = await self.session.get(MunicipalArea, payload.area_id)
+        if area is None or area.store_id != store_id:
+            raise MunicipalAreaNotFoundError
+
+        category_id = payload.category_id
+        if category_id is not None:
+            category = await self.session.get(MunicipalCategory, category_id)
+            if category is None:
+                raise MunicipalCategoryNotFoundError
+            if category.area_id != area.id:
+                raise MunicipalCategoryMismatchError
+        else:
+            category = await self.session.scalar(
+                select(MunicipalCategory)
+                .where(
+                    MunicipalCategory.area_id == area.id,
+                    MunicipalCategory.is_fallback.is_(True),
+                )
+                .order_by(MunicipalCategory.display_order.asc(), MunicipalCategory.id.asc())
+            )
+            category_id = category.id if category is not None else None
+
+        row = MunicipalCase(
+            store_id=store_id,
+            area_id=area.id,
+            category_id=category_id,
+            customer_id=payload.customer_id,
+            conversation_id=payload.conversation_id,
+            assignee_staff_user_id=payload.assignee_staff_user_id,
+            title=payload.title.strip(),
+            description=payload.description.strip(),
+            reporter_name=self._normalize_optional_text(payload.reporter_name),
+            reporter_phone_number=normalize_phone_number(payload.reporter_phone_number),
+            location_text=self._normalize_optional_text(payload.location_text),
+            location_reference=self._normalize_optional_text(payload.location_reference),
+            latitude=payload.latitude,
+            longitude=payload.longitude,
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return self._municipal_case_snapshot(row)
+
+    async def get_municipal_case(self, case_id: int) -> MunicipalCaseSnapshot:
+        """Return one municipal case snapshot by identifier."""
+        row = await self.session.get(MunicipalCase, case_id)
+        if row is None:
+            raise MunicipalCaseNotFoundError
+        return self._municipal_case_snapshot(row)
+
+    async def list_municipal_cases(
+        self,
+        *,
+        store_id: int,
+        area_id: int | None = None,
+        status: MunicipalCaseStatus | None = None,
+        assignee_staff_user_id: int | None = None,
+        limit: int = 50,
+    ) -> list[MunicipalCaseSnapshot]:
+        """List municipal cases filtered by tenant, area, status, or assignee."""
+        statement = (
+            select(MunicipalCase)
+            .where(MunicipalCase.store_id == store_id)
+            .order_by(MunicipalCase.updated_at.desc(), MunicipalCase.id.desc())
+            .limit(limit)
+        )
+        if area_id is not None:
+            statement = statement.where(MunicipalCase.area_id == area_id)
+        if status is not None:
+            statement = statement.where(MunicipalCase.status == status)
+        if assignee_staff_user_id is not None:
+            statement = statement.where(MunicipalCase.assignee_staff_user_id == assignee_staff_user_id)
+        rows = (await self.session.scalars(statement)).all()
+        return [self._municipal_case_snapshot(row) for row in rows]
+
+    async def update_municipal_case_status(
+        self,
+        case_id: int,
+        payload: MunicipalCaseStatusUpdateRequest,
+    ) -> MunicipalCaseSnapshot:
+        """Update the lifecycle status of one municipal case."""
+        row = await self.session.get(MunicipalCase, case_id)
+        if row is None:
+            raise MunicipalCaseNotFoundError
+        row.status = payload.status
+        row.updated_at = utc_now()
+        await self.session.flush()
+        return self._municipal_case_snapshot(row)
+
+    async def assign_municipal_case(
+        self,
+        case_id: int,
+        *,
+        staff_user_id: int | None,
+    ) -> MunicipalCaseSnapshot:
+        """Assign or clear the current assignee of one municipal case."""
+        row = await self.session.get(MunicipalCase, case_id)
+        if row is None:
+            raise MunicipalCaseNotFoundError
+        row.assignee_staff_user_id = staff_user_id
+        row.updated_at = utc_now()
+        await self.session.flush()
+        return self._municipal_case_snapshot(row)
+
     async def get_current_order(
         self,
         customer_id: int,
@@ -1211,6 +1445,54 @@ class BusinessRepository:
             price_cents=item.price_cents,
             image_url=item.image_url,
             price_display=format_price_ars(item.price_cents),
+        )
+
+    def _municipal_area_snapshot(self, area: MunicipalArea) -> MunicipalAreaSnapshot:
+        """Build a serializable municipal-area snapshot."""
+        return MunicipalAreaSnapshot(
+            id=area.id,
+            store_id=area.store_id,
+            name=area.name,
+            description=area.description,
+            manager_staff_user_id=area.manager_staff_user_id,
+            display_order=area.display_order,
+            is_active=area.is_active,
+        )
+
+    def _municipal_category_snapshot(self, category: MunicipalCategory) -> MunicipalCategorySnapshot:
+        """Build a serializable municipal-category snapshot."""
+        return MunicipalCategorySnapshot(
+            id=category.id,
+            area_id=category.area_id,
+            name=category.name,
+            description=category.description,
+            requires_precise_location=category.requires_precise_location,
+            is_fallback=category.is_fallback,
+            display_order=category.display_order,
+            is_active=category.is_active,
+        )
+
+    def _municipal_case_snapshot(self, case: MunicipalCase) -> MunicipalCaseSnapshot:
+        """Build a serializable municipal-case snapshot."""
+        return MunicipalCaseSnapshot(
+            id=case.id,
+            store_id=case.store_id,
+            area_id=case.area_id,
+            category_id=case.category_id,
+            customer_id=case.customer_id,
+            conversation_id=case.conversation_id,
+            assignee_staff_user_id=case.assignee_staff_user_id,
+            title=case.title,
+            description=case.description,
+            reporter_name=case.reporter_name,
+            reporter_phone_number=case.reporter_phone_number,
+            location_text=case.location_text,
+            location_reference=case.location_reference,
+            latitude=case.latitude,
+            longitude=case.longitude,
+            status=case.status,
+            created_at=self._as_utc_datetime(case.created_at) or case.created_at,
+            updated_at=self._as_utc_datetime(case.updated_at) or case.updated_at,
         )
 
     def _store_business_hours_snapshot(self, row: StoreBusinessHours) -> StoreBusinessHoursSnapshot:

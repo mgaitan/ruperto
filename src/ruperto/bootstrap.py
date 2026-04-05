@@ -29,6 +29,28 @@ class BusinessHoursSeed:
     closed: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class MunicipalAreaSeed:
+    """Static municipal area data used to bootstrap a demo tenant."""
+
+    key: str
+    name: str
+    description: str
+    display_order: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class MunicipalCategorySeed:
+    """Static municipal category data used to bootstrap a demo municipal catalog."""
+
+    area_key: str
+    name: str
+    description: str
+    display_order: int = 0
+    requires_precise_location: bool = False
+    is_fallback: bool = False
+
+
 DEMO_MENU_ITEMS: tuple[MenuSeed, ...] = (
     MenuSeed(
         sku="empanadas-carne",
@@ -377,4 +399,119 @@ DEFAULT_BUSINESS_HOURS: tuple[BusinessHoursSeed, ...] = (
     BusinessHoursSeed(weekday=4, opens_at=time(hour=11), closes_at=time(hour=23)),
     BusinessHoursSeed(weekday=5, opens_at=time(hour=11), closes_at=time(hour=23)),
     BusinessHoursSeed(weekday=6, opens_at=time(hour=19), closes_at=time(hour=23)),
+)
+
+
+DEMO_MUNICIPAL_AREAS: tuple[MunicipalAreaSeed, ...] = (
+    MunicipalAreaSeed(
+        key="public_lighting",
+        name="Alumbrado público",
+        description="Reclamos y solicitudes vinculados al alumbrado, luminarias y postes.",
+        display_order=0,
+    ),
+    MunicipalAreaSeed(
+        key="street_maintenance",
+        name="Mantenimiento de calles",
+        description="Baches, ripio, cordón cuneta y mejoras de calzada.",
+        display_order=1,
+    ),
+    MunicipalAreaSeed(
+        key="water_services",
+        name="Solicitud de agua",
+        description="Camión cisterna, faltante de agua y pérdidas en la vía pública.",
+        display_order=2,
+    ),
+    MunicipalAreaSeed(
+        key="urban_hygiene",
+        name="Higiene urbana",
+        description="Residuos, poda, microbasurales y limpieza de espacios públicos.",
+        display_order=3,
+    ),
+)
+
+
+DEMO_MUNICIPAL_CATEGORIES: tuple[MunicipalCategorySeed, ...] = (
+    MunicipalCategorySeed(
+        area_key="public_lighting",
+        name="Lámpara apagada",
+        description="Una luminaria no enciende o quedó fuera de servicio.",
+        display_order=0,
+        requires_precise_location=True,
+    ),
+    MunicipalCategorySeed(
+        area_key="public_lighting",
+        name="Poste en mal estado",
+        description="Poste inclinado, dañado o con riesgo eléctrico.",
+        display_order=1,
+        requires_precise_location=True,
+    ),
+    MunicipalCategorySeed(
+        area_key="public_lighting",
+        name="Otro",
+        description="Otro reclamo o consulta del área de alumbrado.",
+        display_order=99,
+        is_fallback=True,
+    ),
+    MunicipalCategorySeed(
+        area_key="street_maintenance",
+        name="Bache",
+        description="Pozo, rotura o hundimiento de calzada.",
+        display_order=0,
+        requires_precise_location=True,
+    ),
+    MunicipalCategorySeed(
+        area_key="street_maintenance",
+        name="Solicitud de lomo de burro",
+        description="Pedido de reductor de velocidad o señalización complementaria.",
+        display_order=1,
+        requires_precise_location=True,
+    ),
+    MunicipalCategorySeed(
+        area_key="street_maintenance",
+        name="Otro",
+        description="Otro reclamo o mejora vinculada a calles.",
+        display_order=99,
+        is_fallback=True,
+    ),
+    MunicipalCategorySeed(
+        area_key="water_services",
+        name="Falta de agua",
+        description="Pedido por faltante o baja presión de agua.",
+        display_order=0,
+    ),
+    MunicipalCategorySeed(
+        area_key="water_services",
+        name="Pérdida en la vía pública",
+        description="Pérdida visible de agua en calle o vereda.",
+        display_order=1,
+        requires_precise_location=True,
+    ),
+    MunicipalCategorySeed(
+        area_key="water_services",
+        name="Otro",
+        description="Otra solicitud o reclamo vinculada al servicio de agua.",
+        display_order=99,
+        is_fallback=True,
+    ),
+    MunicipalCategorySeed(
+        area_key="urban_hygiene",
+        name="Recolección de residuos",
+        description="Inconvenientes con la recolección o puntos de acopio.",
+        display_order=0,
+        requires_precise_location=True,
+    ),
+    MunicipalCategorySeed(
+        area_key="urban_hygiene",
+        name="Poda o ramas",
+        description="Pedido de poda, retiro de ramas o despeje de vereda.",
+        display_order=1,
+        requires_precise_location=True,
+    ),
+    MunicipalCategorySeed(
+        area_key="urban_hygiene",
+        name="Otro",
+        description="Otro reclamo o solicitud del área de higiene urbana.",
+        display_order=99,
+        is_fallback=True,
+    ),
 )

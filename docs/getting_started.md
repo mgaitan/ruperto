@@ -202,6 +202,9 @@ agent behavior, flexible weekly opening hours, and user roles.
 The store profile page now also exposes the tenant vertical selector, so the
 same installation can switch the active tenant between the ordering flow and
 the municipal scaffold without changing the shared channel or auth layers.
+If you bootstrap a municipal tenant, `init-db` now also seeds a first service
+catalog with municipal areas and categories so the PoC can evolve from a
+realistic dataset instead of an empty placeholder.
 
 If one dashboard user belongs to more than one store, the header lets staff
 switch the active store. That switch already scopes the editable store profile
