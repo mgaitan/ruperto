@@ -47,6 +47,14 @@ export RUPERTO_SMTP_USER="mailer@example.com"
 export RUPERTO_SMTP_PASSWORD="change-me"
 ```
 
+If you want to test the first Kapso-backed WhatsApp channel, also configure:
+
+```bash
+export RUPERTO_KAPSO_API_KEY="change-me"
+export RUPERTO_KAPSO_PHONE_NUMBER_ID="123456789012345"
+export RUPERTO_KAPSO_WEBHOOK_SECRET="change-me"
+```
+
 You can inspect the effective non-secret settings with:
 
 ```bash
@@ -75,6 +83,7 @@ Then open:
 - `http://127.0.0.1:8000/api/menu-items`
 - `http://127.0.0.1:8000/api/customers`
 - `http://127.0.0.1:8000/api/orders`
+- `http://127.0.0.1:8000/webhooks/whatsapp/kapso`
 
 When invoking modules directly from source, set {term}`PYTHONPATH` so imports resolve cleanly:
 
@@ -91,9 +100,9 @@ curl -X POST http://127.0.0.1:8000/api/dev/messages \
   -d '{"external_user_id":"cliente-demo","message_text":"Hola, quiero pedir"}'
 ```
 
-For a brand-new customer, the assistant first asks for the person's name before
-continuing with the order flow, unless the opening message already contains a
-self-introduction such as `Hola, soy Martín`. That name is then reused across
+For a brand-new customer, the assistant can answer purely informational menu or
+delivery questions without blocking on the person's name. Once a real order is
+being built, it still asks for the name if needed and then reuses it across
 later messages for the same development identity.
 If the first message already contained an order or menu question, that pending
 intent is remembered while the assistant asks for the name and then resumed as
@@ -106,12 +115,26 @@ If the customer asks for a later ready time such as `Quiero una hamburguesa
 para las 12`, the order can now stay scheduled for that slot instead of being
 treated as immediate. Confirmed summaries also include the configured transfer
 alias whenever the chosen payment method is `transferencia`.
+Once the checkout details are complete, the assistant now shows a deterministic
+review based on the persisted draft and waits for an explicit final
+confirmation before closing the order. Informational delivery questions such as
+shipping cost or area coverage also stay out of the checkout script instead of
+jumping straight to address or payment prompts.
 
 The seeded demo menu now includes a broader synthetic catalog with pizzas,
 hamburgers, lomitos, milanesas, wraps, empanadas, drinks, and desserts. That
 makes it easier to test more realistic conversations, including follow-up
 suggestions such as offering a beverage or a dessert after the customer
 chooses a main dish.
+Informational menu questions are also grounded more explicitly now, so prompts
+like `¿Tenés gaseosas?` should return concrete options and prices instead of a
+generic yes/no answer.
+Those informational answers also respect simple constraints such as `sin
+alcohol`, and correction messages like `uno de cada` are now treated more
+carefully when the previous assistant turn mixed variants from multiple
+product groups. If the model itself fails on a dense first-turn order, the
+backend can now recover some multi-item drafts deterministically instead of
+always falling back to a generic handoff.
 
 Or launch the built-in PydanticAI web client for development:
 
@@ -126,6 +149,21 @@ with a stable development identity derived from the web chat id:
 `web:<chat-id>`. If you continue in the same web chat, the stored customer,
 order, and conversation history are reused automatically.
 
+For WhatsApp testing through Kapso, the environment variables are now only the
+fastest bootstrap path. In the dashboard, open `Configuración del agente` and
+fill the Kapso WhatsApp section for the active store. That per-store
+configuration is the recommended setup when you want different locals to own
+different numbers.
+
+If you want a simpler browser harness that ships inside the main FastAPI app,
+open:
+
+- `http://127.0.0.1:8000/demo/chat`
+
+This demo page sends requests to `/api/dev/messages` and lets you switch
+between multiple phone numbers, which makes it handy for simulating known
+customers with existing conversation memory.
+
 Staff can also move an order through operational statuses from the API, for
 example to mark a pickup order as almost ready:
 
@@ -134,6 +172,11 @@ curl -X PATCH http://127.0.0.1:8000/api/orders/1/status \
   -H 'content-type: application/json' \
   -d '{"status":"almost_ready"}'
 ```
+
+When that order belongs to a WhatsApp conversation handled through Kapso, the
+backend now tries to deliver the matching proactive customer notification
+automatically through the same channel instead of waiting for the next inbound
+message.
 
 You can also replace the weekly opening-hours schedule. Each weekday accepts
 zero or more slots, so leaving a day without open ranges means the store stays

@@ -11,30 +11,50 @@ from zoneinfo import ZoneInfo
 import pytest
 from pydantic import SecretStr
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import create_engine, func, select, text
 
 from ruperto.config import Settings
 from ruperto.db import DatabaseRuntime, _ensure_schema_columns, create_database_runtime, init_database
-from ruperto.models import Channel, DeliveryType, MenuItem, OrderStatus, PaymentMethod, StaffRole, StaffUser
+from ruperto.models import (
+    Channel,
+    ChannelProvider,
+    DeliveryType,
+    MenuItem,
+    Order,
+    OrderStatus,
+    OutboundNotification,
+    PaymentMethod,
+    StaffRole,
+    StaffUser,
+)
 from ruperto.repository import (
     STORE_HOURS_SLOT_ORDER_MESSAGE,
     STORE_HOURS_SLOT_REQUIRES_BOTH_TIMES_MESSAGE,
     BusinessRepository,
     normalize_phone_number,
+    round_delay_minutes,
 )
-from ruperto.schemas import StoreBusinessHoursSnapshot, StoreProfileUpdateRequest
+from ruperto.schemas import (
+    StoreBusinessHoursSnapshot,
+    StoreChannelConnectionUpdateRequest,
+    StoreProfileUpdateRequest,
+)
 
 pytestmark = pytest.mark.anyio
 EXPECTED_HISTORY_MESSAGES = 2
 EXPECTED_ORDER_TOTAL = 1900000
 EXPECTED_SINGLE_BURGER_TOTAL = 950000
 EXPECTED_DELAY_MINUTES = 22
+ROUNDED_DELAY_MINUTES = 25
 DEFAULT_DELAY_MINUTES = 25
 DRAFT_DELAY_MINUTES = 15
 PICKUP_DELAY_MINUTES = 15
 LARGE_ORDER_DELAY_MINUTES = 31
+ROUNDED_LARGE_ORDER_DELAY_MINUTES = 35
 KITCHEN_LOAD_DELAY_MINUTES = 18
+ROUNDED_KITCHEN_LOAD_DELAY_MINUTES = 20
 EMPTY_DRAFT_DELAY_MINUTES = 15
+MIN_ROUNDED_DELAY_MINUTES = 5
 DEFAULT_WEEKLY_HOURS = 7
 MIN_MENU_ITEMS = 35
 TENANT_STORE_ID = 7
@@ -90,6 +110,12 @@ async def test_bootstrap_seeds_store_menu_and_empty_memory(tmp_path: Path):
     await close_repository(repository, runtime)
 
 
+async def test_round_delay_minutes_never_returns_less_than_five_minutes():
+    """Delay rounding keeps zero or negative estimates user-friendly."""
+    assert round_delay_minutes(0) == MIN_ROUNDED_DELAY_MINUTES
+    assert round_delay_minutes(-7) == MIN_ROUNDED_DELAY_MINUTES
+
+
 async def test_store_profile_can_be_updated_with_empty_optional_fields(tmp_path: Path):
     """Store customization trims optional empty fields down to null."""
     repository, runtime = await build_repository(tmp_path)
@@ -108,6 +134,130 @@ async def test_store_profile_can_be_updated_with_empty_optional_fields(tmp_path:
     assert updated.store_name == "Panel Rotisería"
     assert updated.store_location is None
     assert updated.transfer_alias is None
+
+    await close_repository(repository, runtime)
+
+
+async def test_store_channel_connection_can_be_created_and_loaded(tmp_path: Path):
+    """Store-scoped channel credentials are persisted separately from app settings."""
+    repository, runtime = await build_repository(tmp_path)
+
+    initial = await repository.get_store_channel_connection(
+        store_id=1,
+        channel=Channel.WHATSAPP,
+        provider=ChannelProvider.KAPSO,
+    )
+    updated = await repository.update_store_channel_connection(
+        store_id=1,
+        channel=Channel.WHATSAPP,
+        provider=ChannelProvider.KAPSO,
+        payload=StoreChannelConnectionUpdateRequest(
+            phone_number_id="phone-id-1",
+            api_key="kapso-key-1",
+            webhook_secret="kapso-secret-1",
+            is_active=True,
+        ),
+    )
+    runtime_config = await repository.get_store_channel_runtime_config(
+        store_id=1,
+        channel=Channel.WHATSAPP,
+        provider=ChannelProvider.KAPSO,
+    )
+    by_phone = await repository.get_channel_runtime_config_by_phone_number(
+        channel=Channel.WHATSAPP,
+        provider=ChannelProvider.KAPSO,
+        phone_number_id="phone-id-1",
+    )
+
+    assert initial.id is None
+    assert updated.is_active is True
+    assert updated.api_key_configured is True
+    assert updated.webhook_secret_configured is True
+    assert runtime_config is not None
+    assert runtime_config.phone_number_id == "phone-id-1"
+    assert by_phone is not None
+    assert by_phone.store_id == 1
+
+    await close_repository(repository, runtime)
+
+
+async def test_reset_current_order_rebuilds_a_draft_from_scratch(tmp_path: Path):
+    """Draft corrections can clear current items before the order is rebuilt."""
+    repository, runtime = await build_repository(tmp_path)
+
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="reset-draft-user")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="reset-draft-user",
+        customer_id=customer.id,
+    )
+    await repository.add_item_to_current_order(
+        customer.id,
+        conversation.id,
+        sku="lomito-especial",
+        quantity=2,
+    )
+
+    reset_order = await repository.reset_current_order(customer.id, conversation.id)
+
+    assert reset_order.items == []
+    assert reset_order.total_amount_cents == 0
+    assert reset_order.total_amount_display == "$ 0"
+
+    rebuilt_order = await repository.add_item_to_current_order(
+        customer.id,
+        conversation.id,
+        sku="lomito-completo",
+        quantity=1,
+    )
+    assert [item.name for item in rebuilt_order.items] == ["Lomito completo"]
+
+    await close_repository(repository, runtime)
+
+
+async def test_get_or_create_conversation_updates_store_scope(tmp_path: Path):
+    """Existing conversations can be reassigned to another store when the active local changes."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="tenant-switch-user")
+    second_store = await repository.create_store_profile(
+        store_name="Sucursal Dos",
+        bot_name="Ruperto Dos",
+        store_description="Segundo local para scope de conversación.",
+        assistant_personality="Calm and direct.",
+    )
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="tenant-switch-user",
+        customer_id=customer.id,
+        store_id=1,
+    )
+
+    reassigned = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="tenant-switch-user",
+        customer_id=customer.id,
+        store_id=second_store.id,
+    )
+
+    assert conversation.id == reassigned.id
+    assert reassigned.store_id == second_store.id
+
+    await close_repository(repository, runtime)
+
+
+async def test_discard_empty_draft_order_returns_false_without_existing_order(tmp_path: Path):
+    """Discarding an empty draft is a no-op when the customer has no draft yet."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="no-draft-user")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="no-draft-user",
+        customer_id=customer.id,
+    )
+
+    discarded = await repository.discard_empty_draft_order(customer.id, conversation.id)
+
+    assert discarded is False
 
     await close_repository(repository, runtime)
 
@@ -399,8 +549,8 @@ async def test_order_lifecycle_and_customer_memory(tmp_path: Path):
     assert confirmed.items[0].notes == "sin cebolla"
     assert delay.base_minutes == EXPECTED_DELAY_MINUTES
     assert delay.active_orders_ahead == 0
-    assert delay.estimated_minutes == EXPECTED_DELAY_MINUTES
-    assert delay.display_text == "22 minutos aproximadamente"
+    assert delay.estimated_minutes == ROUNDED_DELAY_MINUTES
+    assert delay.display_text == "25 minutos aproximadamente"
     assert memory.favorite_item_name == "Hamburguesa completa"
     assert memory.recent_items == ["Hamburguesa completa"]
 
@@ -452,14 +602,45 @@ async def test_set_order_requested_ready_at_persists_schedule_and_updates_prep_s
     delivery_scheduled = await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.DELIVERY)
 
     assert delivery_scheduled.preparation_starts_at is not None
-    assert scheduled.requested_ready_at.replace(tzinfo=None) - delivery_scheduled.preparation_starts_at == timedelta(
-        minutes=20
-    )
+    assert scheduled.requested_ready_at - delivery_scheduled.preparation_starts_at == timedelta(minutes=20)
 
     await close_repository(repository, runtime)
 
 
-async def test_set_order_requested_ready_at_rejects_closed_or_too_soon_slots(tmp_path: Path):
+async def test_order_snapshot_normalizes_sqlite_schedule_timestamps_to_utc(tmp_path: Path):
+    """Order snapshots should reattach UTC tzinfo when SQLite returns naive datetimes."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="schedule-naive")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="schedule-naive",
+        customer_id=customer.id,
+    )
+    ready_at = datetime(2026, 4, 5, 15, 0)
+    prep_at = datetime(2026, 4, 5, 14, 40)
+    order = Order(
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        status=OrderStatus.DRAFT,
+        total_amount_cents=0,
+        requested_ready_at=ready_at,
+        preparation_starts_at=prep_at,
+    )
+    repository.session.add(order)
+    await repository.session.flush()
+
+    snapshot = await repository._build_order_snapshot(order)
+
+    assert snapshot.requested_ready_at == ready_at.replace(tzinfo=UTC)
+    assert snapshot.preparation_starts_at == prep_at.replace(tzinfo=UTC)
+
+    await close_repository(repository, runtime)
+
+
+async def test_set_order_requested_ready_at_rejects_closed_or_too_soon_slots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     """Scheduling fails outside store hours or without enough preparation lead time."""
     repository, runtime = await build_repository(tmp_path)
     customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="schedule-invalid")
@@ -475,7 +656,10 @@ async def test_set_order_requested_ready_at_rejects_closed_or_too_soon_slots(tmp
         quantity=1,
     )
 
-    local_ready = datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(hours=2)
+    fixed_local_now = datetime(2026, 4, 4, 12, 0, tzinfo=ZoneInfo(STORE_TIMEZONE))
+    monkeypatch.setattr("ruperto.repository.utc_now", lambda: fixed_local_now.astimezone(UTC))
+
+    local_ready = fixed_local_now + timedelta(hours=2)
     await repository.replace_store_business_hours(
         hours=[
             StoreBusinessHoursSnapshot(
@@ -515,7 +699,7 @@ async def test_set_order_requested_ready_at_rejects_closed_or_too_soon_slots(tmp
             for weekday in range(7)
         ]
     )
-    too_soon = datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(minutes=5)
+    too_soon = fixed_local_now + timedelta(minutes=5)
     with pytest.raises(ValueError, match="necesito un poco más de tiempo"):
         await repository.set_order_requested_ready_at(
             customer.id,
@@ -690,6 +874,110 @@ async def test_legacy_business_hours_table_gains_slot_index_column(tmp_path: Pat
     assert migrated_row == (1, 0, "11:00", "15:00", 0)
 
 
+async def test_legacy_conversation_table_gains_store_id_column(tmp_path: Path):
+    """Legacy conversations are backfilled with the default store id during bootstrap."""
+    database_path = tmp_path / "legacy-conversation.db"
+    sync_engine = create_engine(f"sqlite:///{database_path}")
+    with sync_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE store_profile (
+                    id INTEGER PRIMARY KEY,
+                    store_name VARCHAR(120),
+                    bot_name VARCHAR(120),
+                    store_location VARCHAR(255),
+                    store_description VARCHAR(500),
+                    assistant_personality VARCHAR(255),
+                    locale VARCHAR(32),
+                    currency_code VARCHAR(8),
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO store_profile (
+                    id, store_name, bot_name, store_location, store_description,
+                    assistant_personality, locale, currency_code, created_at, updated_at
+                ) VALUES (
+                    1, 'Legacy Rotisería', 'Legacy Bot', NULL, 'Perfil viejo',
+                    'Amable', 'es-AR', 'ARS', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE customer (
+                    id INTEGER PRIMARY KEY,
+                    name VARCHAR(120),
+                    phone_number VARCHAR(32),
+                    default_address VARCHAR(255),
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO customer (
+                    id, name, phone_number, default_address, created_at, updated_at
+                ) VALUES (
+                    1, 'Cliente viejo', NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE conversation (
+                    id INTEGER PRIMARY KEY,
+                    channel VARCHAR(32),
+                    external_id VARCHAR(120),
+                    customer_id INTEGER,
+                    created_at DATETIME,
+                    updated_at DATETIME,
+                    CONSTRAINT uq_conversation_identity UNIQUE (channel, external_id)
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO conversation (
+                    id, channel, external_id, customer_id, created_at, updated_at
+                ) VALUES (
+                    1, 'dev', 'legacy-user', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        _ensure_schema_columns(connection)
+    sync_engine.dispose()
+
+    with sqlite3.connect(database_path) as sqlite_connection:
+        columns = {row[1] for row in sqlite_connection.execute("PRAGMA table_info(conversation)")}
+        migrated_row = sqlite_connection.execute(
+            """
+            SELECT store_id
+            FROM conversation
+            WHERE id = 1
+            """
+        ).fetchone()
+
+    assert "store_id" in columns
+    assert migrated_row == (1,)
+
+
 async def test_schedule_validation_helpers_cover_past_missing_prep_and_relative_day_text(tmp_path: Path):
     """Scheduling validation rejects past times and the local-text helper covers tomorrow and weekdays."""
     repository, runtime = await build_repository(tmp_path)
@@ -735,6 +1023,7 @@ async def test_schedule_validation_helpers_cover_past_missing_prep_and_relative_
     await repository._validate_requested_ready_at(order, timezone_name=STORE_TIMEZONE, store_id=1)
 
     local_now = datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0)
+    assert repository._describe_local_datetime(local_now, local_now).startswith("hoy")
     assert repository._describe_local_datetime(local_now + timedelta(days=1), local_now).startswith("mañana")
     assert repository._describe_local_datetime(local_now + timedelta(days=2), local_now).startswith("el ")
 
@@ -782,6 +1071,48 @@ async def test_order_creation_and_failures_have_explicit_messages(tmp_path: Path
             sku="producto-inexistente",
             quantity=1,
         )
+
+    await close_repository(repository, runtime)
+
+
+async def test_discard_empty_draft_order_keeps_non_empty_drafts(tmp_path: Path):
+    """Empty-draft cleanup should not delete a draft that already has line items."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="non-empty-draft")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="non-empty-draft",
+        customer_id=customer.id,
+    )
+
+    await repository.add_item_to_current_order(
+        customer.id,
+        conversation.id,
+        sku="hamburguesa-completa",
+        quantity=1,
+    )
+
+    assert await repository.discard_empty_draft_order(customer.id, conversation.id) is False
+    assert await repository.get_latest_order(customer.id, conversation.id) is not None
+
+    await close_repository(repository, runtime)
+
+
+async def test_discard_empty_draft_order_removes_empty_drafts(tmp_path: Path):
+    """Empty-draft cleanup should delete a draft that has no line items yet."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="empty-draft-delete")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="empty-draft-delete",
+        customer_id=customer.id,
+    )
+
+    created = await repository.get_current_order(customer.id, conversation.id)
+    assert created is not None
+
+    assert await repository.discard_empty_draft_order(customer.id, conversation.id) is True
+    assert await repository.get_latest_order(customer.id, conversation.id) is None
 
     await close_repository(repository, runtime)
 
@@ -909,8 +1240,8 @@ async def test_delay_estimate_adds_extra_time_for_large_orders(tmp_path: Path):
     delay = await repository.get_estimated_delay(customer.id, conversation.id)
 
     assert delay.base_minutes == LARGE_ORDER_DELAY_MINUTES
-    assert delay.estimated_minutes == LARGE_ORDER_DELAY_MINUTES
-    assert delay.display_text == "31 minutos aproximadamente"
+    assert delay.estimated_minutes == ROUNDED_LARGE_ORDER_DELAY_MINUTES
+    assert delay.display_text == "35 minutos aproximadamente"
 
     await close_repository(repository, runtime)
 
@@ -952,8 +1283,8 @@ async def test_delay_estimate_reflects_kitchen_load_from_previous_active_orders(
 
     assert delay.base_minutes == DRAFT_DELAY_MINUTES
     assert delay.active_orders_ahead == 1
-    assert delay.estimated_minutes == KITCHEN_LOAD_DELAY_MINUTES
-    assert delay.display_text == "18 minutos aproximadamente"
+    assert delay.estimated_minutes == ROUNDED_KITCHEN_LOAD_DELAY_MINUTES
+    assert delay.display_text == "20 minutos aproximadamente"
 
     await close_repository(repository, runtime)
 
@@ -964,6 +1295,136 @@ async def test_update_order_status_requires_an_existing_order(tmp_path: Path):
 
     with pytest.raises(ValueError, match=re.escape("No se encontró el pedido solicitado.")):
         await repository.update_order_status(999, OrderStatus.ALMOST_READY)
+
+    await close_repository(repository, runtime)
+
+
+async def test_update_order_status_queues_automatic_notifications(tmp_path: Path):
+    """Relevant status transitions queue one outbound message for the conversation."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="notify-user")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="notify-user",
+        customer_id=customer.id,
+    )
+    await repository.add_item_to_current_order(
+        customer.id,
+        conversation.id,
+        sku="hamburguesa-completa",
+        quantity=1,
+    )
+    await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.PICKUP)
+    await repository.set_order_payment_method(customer.id, conversation.id, PaymentMethod.CASH)
+    confirmed = await repository.confirm_current_order(customer.id, conversation.id)
+
+    almost_ready = await repository.update_order_status(confirmed.id, OrderStatus.ALMOST_READY)
+    ready = await repository.update_order_status(confirmed.id, OrderStatus.READY_FOR_PICKUP)
+    first_poll = await repository.list_pending_notifications(channel=Channel.DEV, external_id="notify-user")
+    second_poll = await repository.list_pending_notifications(channel=Channel.DEV, external_id="notify-user")
+
+    assert almost_ready.notify_when_ready is True
+    assert ready.status == OrderStatus.READY_FOR_PICKUP
+    assert [notification.event_type for notification in first_poll] == ["order_almost_ready", "order_ready"]
+    assert [notification.message_text for notification in first_poll] == [
+        "Tu pedido ya casi está 👀",
+        "Tu pedido ya está listo para retirar 🙌",
+    ]
+    assert second_poll == []
+
+    await close_repository(repository, runtime)
+
+
+async def test_set_order_notify_when_ready_handles_new_draft_and_latest_order(tmp_path: Path):
+    """The notification preference can be set before ordering, on a draft, or on the latest confirmed order."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="notify-setup-user")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="notify-setup-user",
+        customer_id=customer.id,
+    )
+
+    created = await repository.set_order_notify_when_ready(customer.id, conversation.id, enabled=False)
+    assert created.notify_when_ready is False
+    assert created.items == []
+
+    await repository.add_item_to_current_order(
+        customer.id,
+        conversation.id,
+        sku="hamburguesa-completa",
+        quantity=1,
+    )
+    updated_draft = await repository.set_order_notify_when_ready(customer.id, conversation.id, enabled=True)
+    assert updated_draft.notify_when_ready is True
+
+    await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.PICKUP)
+    await repository.set_order_payment_method(customer.id, conversation.id, PaymentMethod.CASH)
+    await repository.confirm_current_order(customer.id, conversation.id)
+
+    updated_latest = await repository.set_order_notify_when_ready(customer.id, conversation.id, enabled=False)
+    assert updated_latest.notify_when_ready is False
+    assert updated_latest.status == OrderStatus.CONFIRMED
+
+    await close_repository(repository, runtime)
+
+
+async def test_notification_queue_helper_covers_early_return_branches(tmp_path: Path):
+    """Notification queueing skips disabled, unchanged, duplicate, unmapped, and orphaned cases."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="notify-helper-user")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="notify-helper-user",
+        customer_id=customer.id,
+    )
+
+    disabled_order = Order(
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        status=OrderStatus.ALMOST_READY,
+        notify_when_ready=False,
+    )
+    unchanged_order = Order(
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        status=OrderStatus.READY_FOR_PICKUP,
+        notify_when_ready=True,
+    )
+    unmapped_order = Order(
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        status=OrderStatus.CONFIRMED,
+        notify_when_ready=True,
+    )
+    duplicate_order = Order(
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        status=OrderStatus.ALMOST_READY,
+        notify_when_ready=True,
+    )
+    orphaned_order = Order(
+        customer_id=customer.id,
+        conversation_id=99999,
+        status=OrderStatus.OUT_FOR_DELIVERY,
+        notify_when_ready=True,
+    )
+    repository.session.add_all([disabled_order, unchanged_order, unmapped_order, duplicate_order, orphaned_order])
+    await repository.session.flush()
+
+    await repository._queue_status_notification_if_needed(disabled_order, previous_status=OrderStatus.CONFIRMED)
+    await repository._queue_status_notification_if_needed(unchanged_order, previous_status=OrderStatus.READY_FOR_PICKUP)
+    await repository._queue_status_notification_if_needed(unmapped_order, previous_status=OrderStatus.DRAFT)
+    await repository._queue_status_notification_if_needed(duplicate_order, previous_status=OrderStatus.CONFIRMED)
+    await repository._queue_status_notification_if_needed(duplicate_order, previous_status=OrderStatus.CONFIRMED)
+    await repository._queue_status_notification_if_needed(orphaned_order, previous_status=OrderStatus.READY_FOR_PICKUP)
+
+    assert repository._build_status_notification_text(orphaned_order) == "Tu pedido ya salió y va en camino 🚚"
+    assert repository._build_status_notification_text(disabled_order) == "Tu pedido ya casi está 👀"
+    notifications_in_db = await repository.session.scalar(select(func.count(OutboundNotification.id)))
+    notifications = await repository.list_pending_notifications(channel=Channel.DEV, external_id="notify-helper-user")
+    assert notifications_in_db == 1
+    assert [notification.event_type for notification in notifications] == ["order_almost_ready"]
 
     await close_repository(repository, runtime)
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from pydantic import SecretStr
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -51,6 +51,40 @@ class Settings(BaseSettings):
     assistant_model_retry_attempts: int = 1
     kapso_api_key: SecretStr | None = None
     kapso_phone_number_id: str | None = None
+    kapso_webhook_secret: SecretStr | None = None
+
+    @field_validator(
+        "dashboard_admin_email",
+        "smtp_server",
+        "smtp_user",
+        "kapso_phone_number_id",
+        mode="before",
+    )
+    @classmethod
+    def blank_strings_to_none(cls, value: str | None) -> str | None:
+        """Treat blank optional strings from `.env` as missing values."""
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+    @field_validator(
+        "dashboard_admin_password",
+        "smtp_password",
+        "gemini_api_key",
+        "kapso_api_key",
+        "kapso_webhook_secret",
+        mode="before",
+    )
+    @classmethod
+    def blank_secrets_to_none(cls, value: str | SecretStr | None) -> str | SecretStr | None:
+        """Treat blank secret values from `.env` as missing values."""
+        if value is None:
+            return None
+        if isinstance(value, SecretStr):
+            return value if value.get_secret_value().strip() else None
+        stripped = value.strip()
+        return stripped or None
 
     def public_settings(self) -> dict[str, str | bool | float | None]:
         """Return a safe snapshot suitable for logs, docs, and diagnostics."""
@@ -89,6 +123,7 @@ class Settings(BaseSettings):
             "assistant_model_retry_attempts": self.assistant_model_retry_attempts,
             "kapso_api_key_configured": self.kapso_api_key is not None,
             "kapso_phone_number_id": self.kapso_phone_number_id,
+            "kapso_webhook_secret_configured": self.kapso_webhook_secret is not None,
         }
 
     def public_settings_json(self) -> str:

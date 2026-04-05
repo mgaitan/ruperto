@@ -26,6 +26,12 @@ class Channel(StrEnum):
     DEV = "dev"
 
 
+class ChannelProvider(StrEnum):
+    """Providers that can back one concrete channel connection."""
+
+    KAPSO = "kapso"
+
+
 class OrderStatus(StrEnum):
     """Lifecycle states for customer orders."""
 
@@ -176,7 +182,32 @@ class Conversation(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     channel: Mapped[Channel] = mapped_column(SqlEnum(Channel, native_enum=False, length=32))
     external_id: Mapped[str] = mapped_column(String(length=120))
+    store_id: Mapped[int] = mapped_column(ForeignKey("store_profile.id", ondelete="CASCADE"), default=1)
     customer_id: Mapped[int] = mapped_column(ForeignKey("customer.id", ondelete="CASCADE"))
+    created_at: Mapped[datetime] = mapped_column(default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(default=utc_now, onupdate=utc_now)
+
+
+class StoreChannelConnection(Base):
+    """One provider-backed channel connection owned by one store."""
+
+    __tablename__ = "store_channel_connection"
+    __table_args__ = (
+        UniqueConstraint("store_id", "channel", "provider", name="uq_store_channel_connection_store"),
+        UniqueConstraint("channel", "provider", "phone_number_id", name="uq_store_channel_connection_phone"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("store_profile.id", ondelete="CASCADE"))
+    channel: Mapped[Channel] = mapped_column(SqlEnum(Channel, native_enum=False, length=32))
+    provider: Mapped[ChannelProvider] = mapped_column(
+        SqlEnum(ChannelProvider, native_enum=False, length=32),
+        default=ChannelProvider.KAPSO,
+    )
+    phone_number_id: Mapped[str | None] = mapped_column(String(length=120), nullable=True)
+    api_key: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    webhook_secret: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    is_active: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(default=utc_now, onupdate=utc_now)
 
@@ -228,6 +259,7 @@ class Order(Base):
         SqlEnum(PaymentMethod, native_enum=False, length=32),
         nullable=True,
     )
+    notify_when_ready: Mapped[bool] = mapped_column(default=True)
     requested_ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     preparation_starts_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     total_amount_cents: Mapped[int] = mapped_column(default=0)
@@ -247,4 +279,19 @@ class OrderItem(Base):
     quantity: Mapped[int]
     unit_price_cents: Mapped[int]
     notes: Mapped[str | None] = mapped_column(String(length=255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=utc_now)
+
+
+class OutboundNotification(Base):
+    """One outbound notification queued for delivery on a conversation channel."""
+
+    __tablename__ = "outbound_notification"
+    __table_args__ = (UniqueConstraint("order_id", "event_type", name="uq_outbound_notification_order_event"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("customer_order.id", ondelete="CASCADE"))
+    conversation_id: Mapped[int] = mapped_column(ForeignKey("conversation.id", ondelete="CASCADE"))
+    event_type: Mapped[str] = mapped_column(String(length=64))
+    message_text: Mapped[str] = mapped_column(Text())
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=utc_now)

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import AsyncIterator, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Any, TypedDict
+from typing import Annotated, Any, TypedDict, cast
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
@@ -19,23 +20,31 @@ from pydantic import ValidationError
 from starlette.middleware.sessions import SessionMiddleware
 
 from ruperto import get_version
-from ruperto.assistant import OrderingAssistantService
 from ruperto.auth import normalize_email
+from ruperto.channels.base import ChannelDeliveryError, InboundCustomerMessage, OutboundCustomerMessage
+from ruperto.channels.service import (
+    build_whatsapp_gateway_for_phone_number,
+    deliver_order_notifications,
+    handle_inbound_customer_message,
+)
 from ruperto.config import Settings
 from ruperto.db import DatabaseRuntime, create_database_runtime, init_database, ping_database
-from ruperto.models import Channel, DeliveryType, OrderStatus, PaymentMethod, StaffRole
+from ruperto.models import Channel, ChannelProvider, DeliveryType, OrderStatus, PaymentMethod, StaffRole
 from ruperto.repository import BusinessRepository, OrderNotFoundError
 from ruperto.schemas import (
     AssistantTurnResult,
     CustomerSnapshot,
     DevMessageRequest,
+    DevNotificationPollRequest,
     MenuItemSnapshot,
     OrderSnapshot,
     OrderStatusUpdateRequest,
+    OutboundNotificationSnapshot,
     StaffUserSnapshot,
     StoreBusinessHoursSnapshot,
     StoreBusinessHoursUpdateEntry,
     StoreBusinessHoursUpdateRequest,
+    StoreChannelConnectionUpdateRequest,
     StoreMembershipSnapshot,
     StoreProfileSnapshot,
     StoreProfileUpdateRequest,
@@ -328,6 +337,46 @@ def dashboard_login_context(
     }
 
 
+def demo_chat_page_context(*, request: Request, settings: Settings) -> dict[str, Any]:
+    """Build the template context for the lightweight demo chat page."""
+    return {
+        "request": request,
+        "store_name": settings.store_name,
+        "bot_name": settings.bot_name,
+        "store_location": settings.store_location or "Local sin ubicación configurada",
+        "api_path": "/api/dev/messages",
+        "notifications_api_path": "/api/dev/notifications",
+        "demo_profiles": [
+            {"label": "Martín", "phone": "+54 351 555 7788"},
+            {"label": "Ana", "phone": "+54 9 11 3344 5566"},
+        ],
+        "demo_prompts": [
+            "Hola, quiero ver la carta",
+            "Soy Martín Gaitán",
+            "Una hamburguesa doble cheddar para retirar",
+            "¿Me lo podés preparar para las 12?",
+        ],
+    }
+
+
+def extract_kapso_phone_number_id(payload: object) -> str | None:
+    """Extract the WhatsApp phone-number identifier from a Kapso webhook payload."""
+    if not isinstance(payload, dict):
+        return None
+    payload_dict = cast(dict[str, object], payload)
+    direct_phone_number_id = payload_dict.get("phone_number_id")
+    if isinstance(direct_phone_number_id, str) and direct_phone_number_id.strip():
+        return direct_phone_number_id.strip()
+    conversation = payload_dict.get("conversation")
+    if not isinstance(conversation, dict):
+        return None
+    conversation_dict = cast(dict[str, object], conversation)
+    conversation_phone_number_id = conversation_dict.get("phone_number_id")
+    if isinstance(conversation_phone_number_id, str) and conversation_phone_number_id.strip():
+        return conversation_phone_number_id.strip()
+    return None
+
+
 def dashboard_store_scope_note(memberships: list[StoreMembershipSnapshot]) -> str | None:
     """Explain the current tenancy boundary of the MVP dashboard."""
     if len(memberships) <= 1:
@@ -490,6 +539,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
         await ping_database(runtime.database)
         return {"status": "ok", "database": "ok"}
 
+    @app.get("/demo/chat", response_class=HTMLResponse)
+    async def read_demo_chat(request: Request) -> Response:
+        runtime = get_runtime(request)
+        context = demo_chat_page_context(request=request, settings=runtime.settings)
+        return TEMPLATES.TemplateResponse(request=request, name="demo_chat.html", context=context)
+
     @app.get(DASHBOARD_LOGIN_PATH, response_class=HTMLResponse)
     async def get_dashboard_login(
         request: Request,
@@ -571,7 +626,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
         async with runtime.database.session_factory() as session:
             repository = BusinessRepository(session)
             store = await repository.get_store_profile(store_id=identity.active_store_id)
-            orders = await repository.list_orders(limit=limit)
+            orders = await repository.list_orders(limit=limit, store_id=identity.active_store_id)
             customers = await repository.list_customers(limit=50)
             menu_items = await repository.list_menu_items(only_available=False)
 
@@ -744,6 +799,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
         async with runtime.database.session_factory() as session:
             repository = BusinessRepository(session)
             store = await repository.get_store_profile(store_id=identity.active_store_id)
+            channel_connection = await repository.get_store_channel_connection(
+                store_id=identity.active_store_id,
+                channel=Channel.WHATSAPP,
+                provider=ChannelProvider.KAPSO,
+            )
 
         context = dashboard_page_context(
             request=request,
@@ -757,6 +817,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
             store=store,
         )
         context["settings_snapshot"] = runtime.settings.public_settings()
+        context["channel_connection"] = channel_connection
         return TEMPLATES.TemplateResponse(request=request, name="dashboard_settings_agent.html", context=context)
 
     @app.post("/dashboard/settings/agent")
@@ -782,6 +843,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
             except ValidationError as error:
                 raise HTTPException(status_code=422, detail=error.errors()) from error
             await repository.update_store_profile(payload, store_id=identity.active_store_id)
+            await session.commit()
+        return dashboard_redirect(path="/dashboard/settings/agent", flash="agent-updated")
+
+    @app.post("/dashboard/settings/agent/channel")
+    async def post_dashboard_agent_channel_settings(request: Request) -> RedirectResponse:
+        identity = await load_dashboard_identity(request)
+        if identity is None:
+            return dashboard_login_redirect(next_url="/dashboard/settings/agent", flash="login-required")
+
+        runtime = get_runtime(request)
+        form = await request.form()
+        payload = StoreChannelConnectionUpdateRequest(
+            phone_number_id=str(form.get("kapso_phone_number_id", "")) or None,
+            api_key=str(form.get("kapso_api_key", "")) or None,
+            webhook_secret=str(form.get("kapso_webhook_secret", "")) or None,
+            is_active=form.get("kapso_is_active") == "on",
+        )
+
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            await repository.update_store_channel_connection(
+                store_id=identity.active_store_id,
+                channel=Channel.WHATSAPP,
+                provider=ChannelProvider.KAPSO,
+                payload=payload,
+            )
             await session.commit()
         return dashboard_redirect(path="/dashboard/settings/agent", flash="agent-updated")
 
@@ -925,6 +1012,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
             except OrderNotFoundError as error:
                 raise HTTPException(status_code=404, detail="Order not found.") from error
             await session.commit()
+        with suppress(ChannelDeliveryError):
+            await deliver_order_notifications(
+                session_factory=runtime.database.session_factory,
+                settings=runtime.settings,
+                order_id=order_id,
+            )
         return dashboard_redirect(path="/dashboard", flash="order-updated")
 
     @app.get("/api/store-profile", response_model=StoreProfileSnapshot)
@@ -1014,7 +1107,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
         runtime = get_runtime(request)
         async with runtime.database.session_factory() as session:
             repository = BusinessRepository(session)
-            return await repository.list_orders(limit=limit, status=status)
+            return await repository.list_orders(
+                limit=limit,
+                status=status,
+                store_id=runtime.settings.default_store_id,
+            )
 
     @app.patch("/api/orders/{order_id}/status", response_model=OrderSnapshot)
     async def patch_order_status(
@@ -1026,24 +1123,90 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
         async with runtime.database.session_factory() as session:
             repository = BusinessRepository(session)
             try:
-                updated_order = await repository.update_order_status(order_id, payload.status)
+                await repository.update_order_status(order_id, payload.status)
             except OrderNotFoundError as error:
                 raise HTTPException(status_code=404, detail="Order not found.") from error
             await session.commit()
-            return updated_order
+        with suppress(ChannelDeliveryError):
+            await deliver_order_notifications(
+                session_factory=runtime.database.session_factory,
+                settings=runtime.settings,
+                order_id=order_id,
+            )
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            return await repository.get_order(order_id)
+
+    @app.post("/webhooks/whatsapp/kapso")
+    async def post_kapso_whatsapp_webhook(request: Request) -> dict[str, Any]:
+        runtime = get_runtime(request)
+        raw_payload = await request.body()
+        try:
+            payload = json.loads(raw_payload)
+        except json.JSONDecodeError as error:
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from error
+
+        phone_number_id = extract_kapso_phone_number_id(payload)
+        gateway, store_id = await build_whatsapp_gateway_for_phone_number(
+            session_factory=runtime.database.session_factory,
+            settings=runtime.settings,
+            phone_number_id=phone_number_id,
+        )
+        if gateway is None or store_id is None:
+            raise HTTPException(status_code=503, detail="Kapso WhatsApp is not configured.")
+
+        signature = request.headers.get("X-Webhook-Signature")
+        if not gateway.verify_webhook(raw_payload=raw_payload, signature=signature):
+            raise HTTPException(status_code=401, detail="Invalid Kapso webhook signature.")
+
+        inbound_messages = gateway.parse_inbound_messages(payload)
+        handled = 0
+        for inbound_message in inbound_messages:
+            result = await handle_inbound_customer_message(
+                session_factory=runtime.database.session_factory,
+                settings=runtime.settings,
+                inbound_message=inbound_message,
+                store_id=store_id,
+            )
+            await gateway.send_text(
+                OutboundCustomerMessage(
+                    channel=Channel.WHATSAPP,
+                    external_user_id=inbound_message.external_user_id,
+                    message_text=result.reply.reply_text,
+                )
+            )
+            handled += 1
+
+        return {"status": "ok", "processed": handled}
 
     @app.post("/api/dev/messages", response_model=AssistantTurnResult)
     async def post_dev_message(request: Request, payload: DevMessageRequest) -> AssistantTurnResult:
         runtime = get_runtime(request)
-        service = OrderingAssistantService(
+        return await handle_inbound_customer_message(
             session_factory=runtime.database.session_factory,
             settings=runtime.settings,
+            inbound_message=InboundCustomerMessage(
+                channel=Channel.DEV,
+                external_user_id=payload.external_user_id,
+                message_text=payload.message_text,
+            ),
         )
-        return await service.handle_customer_message(
-            channel=Channel.DEV,
-            external_user_id=payload.external_user_id,
-            message_text=payload.message_text,
-        )
+
+    @app.get("/api/dev/notifications", response_model=list[OutboundNotificationSnapshot])
+    async def get_dev_notifications(
+        request: Request,
+        external_user_id: str,
+    ) -> list[OutboundNotificationSnapshot]:
+        runtime = get_runtime(request)
+        payload = DevNotificationPollRequest.model_validate({"external_user_id": external_user_id})
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            notifications = await repository.list_pending_notifications(
+                channel=Channel.DEV,
+                external_id=payload.external_user_id,
+            )
+            await session.commit()
+            return notifications
 
     return app
 

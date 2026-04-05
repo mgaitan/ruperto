@@ -17,6 +17,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from ruperto.auth import hash_password, normalize_email, verify_password
 from ruperto.models import (
     Channel,
+    ChannelProvider,
     Conversation,
     ConversationMessage,
     ConversationState,
@@ -27,24 +28,31 @@ from ruperto.models import (
     Order,
     OrderItem,
     OrderStatus,
+    OutboundNotification,
     PaymentMethod,
     StaffRole,
     StaffUser,
     StoreBusinessHours,
+    StoreChannelConnection,
     StoreMembership,
     StoreProfile,
     utc_now,
 )
 from ruperto.schemas import (
+    ConversationTargetSnapshot,
     CustomerMemorySnapshot,
     CustomerSnapshot,
     DelayEstimateSnapshot,
     MenuItemSnapshot,
     OrderItemSnapshot,
     OrderSnapshot,
+    OutboundNotificationSnapshot,
     StaffUserSnapshot,
     StoreAvailabilitySnapshot,
     StoreBusinessHoursSnapshot,
+    StoreChannelConnectionRuntimeConfig,
+    StoreChannelConnectionSnapshot,
+    StoreChannelConnectionUpdateRequest,
     StoreMembershipSnapshot,
     StoreProfileSnapshot,
     StoreProfileUpdateRequest,
@@ -82,6 +90,11 @@ ACTIVE_ORDER_STATUSES = {
     OrderStatus.READY_FOR_PICKUP,
     OrderStatus.OUT_FOR_DELIVERY,
 }
+READY_NOTIFICATION_EVENT_BY_STATUS = {
+    OrderStatus.ALMOST_READY: "order_almost_ready",
+    OrderStatus.READY_FOR_PICKUP: "order_ready",
+    OrderStatus.OUT_FOR_DELIVERY: "order_out_for_delivery",
+}
 STORE_MEMBERSHIP_NOT_FOUND_MESSAGE = "Store membership not found."
 STORE_HOURS_SLOT_REQUIRES_BOTH_TIMES_MESSAGE = "Each business-hours slot requires both open and close times."
 STORE_HOURS_SLOT_ORDER_MESSAGE = "Business-hours slots must close after they open."
@@ -95,6 +108,13 @@ WEEKDAY_LABELS_ES = {
     5: "sábado",
     6: "domingo",
 }
+
+
+def round_delay_minutes(value: int) -> int:
+    """Round one delay estimate up to the next 5-minute mark."""
+    if value <= 0:
+        return 5
+    return ((value + 4) // 5) * 5
 
 
 def normalize_phone_number(value: str | None) -> str | None:
@@ -243,6 +263,128 @@ class BusinessRepository:
         row.updated_at = utc_now()
         await self.session.flush()
         return StoreProfileSnapshot.model_validate(row)
+
+    async def get_store_channel_connection(
+        self,
+        *,
+        store_id: int,
+        channel: Channel,
+        provider: ChannelProvider = ChannelProvider.KAPSO,
+    ) -> StoreChannelConnectionSnapshot:
+        """Return the safe channel-connection snapshot for one store."""
+        row = await self.session.scalar(
+            select(StoreChannelConnection).where(
+                StoreChannelConnection.store_id == store_id,
+                StoreChannelConnection.channel == channel,
+                StoreChannelConnection.provider == provider,
+            )
+        )
+        if row is None:
+            return StoreChannelConnectionSnapshot(
+                store_id=store_id,
+                channel=channel,
+                provider=provider,
+            )
+        return StoreChannelConnectionSnapshot(
+            id=row.id,
+            store_id=row.store_id,
+            channel=row.channel,
+            provider=row.provider,
+            phone_number_id=row.phone_number_id,
+            is_active=row.is_active,
+            api_key_configured=bool(row.api_key),
+            webhook_secret_configured=bool(row.webhook_secret),
+        )
+
+    async def get_store_channel_runtime_config(
+        self,
+        *,
+        store_id: int,
+        channel: Channel,
+        provider: ChannelProvider = ChannelProvider.KAPSO,
+    ) -> StoreChannelConnectionRuntimeConfig | None:
+        """Return one active store-scoped channel connection with runtime credentials."""
+        row = await self.session.scalar(
+            select(StoreChannelConnection).where(
+                StoreChannelConnection.store_id == store_id,
+                StoreChannelConnection.channel == channel,
+                StoreChannelConnection.provider == provider,
+                StoreChannelConnection.is_active.is_(True),
+            )
+        )
+        if row is None or not row.phone_number_id or not row.api_key:
+            return None
+        return StoreChannelConnectionRuntimeConfig(
+            id=row.id,
+            store_id=row.store_id,
+            channel=row.channel,
+            provider=row.provider,
+            phone_number_id=row.phone_number_id,
+            api_key=row.api_key,
+            webhook_secret=row.webhook_secret,
+            is_active=row.is_active,
+        )
+
+    async def get_channel_runtime_config_by_phone_number(
+        self,
+        *,
+        channel: Channel,
+        provider: ChannelProvider,
+        phone_number_id: str,
+    ) -> StoreChannelConnectionRuntimeConfig | None:
+        """Resolve one active connection by the provider phone-number identifier."""
+        row = await self.session.scalar(
+            select(StoreChannelConnection).where(
+                StoreChannelConnection.channel == channel,
+                StoreChannelConnection.provider == provider,
+                StoreChannelConnection.phone_number_id == phone_number_id,
+                StoreChannelConnection.is_active.is_(True),
+            )
+        )
+        if row is None or not row.phone_number_id or not row.api_key:
+            return None
+        return StoreChannelConnectionRuntimeConfig(
+            id=row.id,
+            store_id=row.store_id,
+            channel=row.channel,
+            provider=row.provider,
+            phone_number_id=row.phone_number_id,
+            api_key=row.api_key,
+            webhook_secret=row.webhook_secret,
+            is_active=row.is_active,
+        )
+
+    async def update_store_channel_connection(
+        self,
+        *,
+        store_id: int,
+        channel: Channel,
+        provider: ChannelProvider = ChannelProvider.KAPSO,
+        payload: StoreChannelConnectionUpdateRequest,
+    ) -> StoreChannelConnectionSnapshot:
+        """Create or update one store-scoped channel connection."""
+        row = await self.session.scalar(
+            select(StoreChannelConnection).where(
+                StoreChannelConnection.store_id == store_id,
+                StoreChannelConnection.channel == channel,
+                StoreChannelConnection.provider == provider,
+            )
+        )
+        if row is None:
+            row = StoreChannelConnection(store_id=store_id, channel=channel, provider=provider)
+            self.session.add(row)
+            await self.session.flush()
+
+        normalized_phone_number_id = self._normalize_optional_text(payload.phone_number_id)
+        row.phone_number_id = normalized_phone_number_id
+        if payload.api_key is not None and payload.api_key.strip():
+            row.api_key = payload.api_key.strip()
+        if payload.webhook_secret is not None and payload.webhook_secret.strip():
+            row.webhook_secret = payload.webhook_secret.strip()
+        row.is_active = payload.is_active and bool(row.phone_number_id and row.api_key)
+        row.updated_at = utc_now()
+        await self.session.flush()
+        return await self.get_store_channel_connection(store_id=store_id, channel=channel, provider=provider)
 
     async def get_staff_user_by_id(self, staff_user_id: int) -> StaffUserSnapshot | None:
         """Return one dashboard user by primary key."""
@@ -557,6 +699,7 @@ class BusinessRepository:
         channel: Channel,
         external_id: str,
         customer_id: int,
+        store_id: int = 1,
     ) -> Conversation:
         """Return the persisted conversation for one external identity."""
         conversation = await self.session.scalar(
@@ -569,6 +712,7 @@ class BusinessRepository:
             conversation = Conversation(
                 channel=channel,
                 external_id=external_id,
+                store_id=store_id,
                 customer_id=customer_id,
             )
             self.session.add(conversation)
@@ -577,6 +721,8 @@ class BusinessRepository:
 
         if conversation.customer_id != customer_id:
             conversation.customer_id = customer_id
+        if conversation.store_id != store_id:
+            conversation.store_id = store_id
         conversation.updated_at = utc_now()
         await self.session.flush()
         return conversation
@@ -662,28 +808,155 @@ class BusinessRepository:
             return None
         return await self._build_order_snapshot(order)
 
+    async def discard_empty_draft_order(self, customer_id: int, conversation_id: int) -> bool:
+        """Delete the current draft if it exists but has no line items."""
+        order = await self._get_draft_order(customer_id, conversation_id)
+        if order is None:
+            return False
+        item_count = await self.session.scalar(select(func.count(OrderItem.id)).where(OrderItem.order_id == order.id))
+        if item_count:
+            return False
+        await self.session.delete(order)
+        await self.session.flush()
+        return True
+
     async def list_orders(
         self,
         *,
         limit: int = 50,
         status: OrderStatus | None = None,
+        store_id: int | None = None,
     ) -> list[OrderSnapshot]:
         """List orders ordered by recent activity."""
         statement = select(Order).order_by(Order.updated_at.desc(), Order.id.desc()).limit(limit)
         if status is not None:
             statement = statement.where(Order.status == status)
+        if store_id is not None:
+            statement = statement.join(Conversation, Conversation.id == Order.conversation_id).where(
+                Conversation.store_id == store_id
+            )
         orders = (await self.session.scalars(statement)).all()
         return [await self._build_order_snapshot(order) for order in orders]
+
+    async def get_order(self, order_id: int) -> OrderSnapshot:
+        """Return one order snapshot by identifier."""
+        order = await self.session.get(Order, order_id)
+        if order is None:
+            raise OrderNotFoundError
+        return await self._build_order_snapshot(order)
 
     async def update_order_status(self, order_id: int, status: OrderStatus) -> OrderSnapshot:
         """Update the operational status for one order."""
         order = await self.session.get(Order, order_id)
         if order is None:
             raise OrderNotFoundError
+        previous_status = order.status
         order.status = status
         order.updated_at = utc_now()
         await self.session.flush()
+        await self._queue_status_notification_if_needed(order, previous_status=previous_status)
         return await self._build_order_snapshot(order)
+
+    async def set_order_notify_when_ready(
+        self,
+        customer_id: int,
+        conversation_id: int,
+        *,
+        enabled: bool = True,
+    ) -> OrderSnapshot:
+        """Persist whether the customer wants a proactive ready notification."""
+        order = await self._get_draft_order(customer_id, conversation_id)
+        if order is None:
+            order = await self.session.scalar(
+                select(Order)
+                .where(
+                    Order.customer_id == customer_id,
+                    Order.conversation_id == conversation_id,
+                )
+                .order_by(Order.updated_at.desc(), Order.id.desc())
+            )
+        if order is None:
+            order = Order(customer_id=customer_id, conversation_id=conversation_id, notify_when_ready=enabled)
+            self.session.add(order)
+            await self.session.flush()
+        order.notify_when_ready = enabled
+        order.updated_at = utc_now()
+        await self.session.flush()
+        return await self._build_order_snapshot(order)
+
+    async def list_pending_notifications(
+        self,
+        *,
+        channel: Channel,
+        external_id: str,
+    ) -> list[OutboundNotificationSnapshot]:
+        """Return undelivered notifications for one conversation and mark them as delivered."""
+        snapshots = await self.peek_pending_notifications(channel=channel, external_id=external_id)
+        await self.mark_notifications_delivered([snapshot.id for snapshot in snapshots])
+        return snapshots
+
+    async def peek_pending_notifications(
+        self,
+        *,
+        channel: Channel,
+        external_id: str,
+    ) -> list[OutboundNotificationSnapshot]:
+        """Return undelivered notifications for one conversation without consuming them."""
+        rows = (
+            await self.session.scalars(
+                select(OutboundNotification)
+                .join(Conversation, Conversation.id == OutboundNotification.conversation_id)
+                .where(
+                    Conversation.channel == channel,
+                    Conversation.external_id == external_id,
+                    OutboundNotification.delivered_at.is_(None),
+                )
+                .order_by(OutboundNotification.id.asc())
+            )
+        ).all()
+        return [
+            OutboundNotificationSnapshot(
+                id=row.id,
+                order_id=row.order_id,
+                conversation_id=row.conversation_id,
+                event_type=row.event_type,
+                message_text=row.message_text,
+                created_at=row.created_at,
+            )
+            for row in rows
+        ]
+
+    async def mark_notifications_delivered(self, notification_ids: list[int]) -> None:
+        """Mark the given outbound notifications as delivered."""
+        if not notification_ids:
+            return
+        rows = (
+            await self.session.scalars(
+                select(OutboundNotification).where(OutboundNotification.id.in_(notification_ids))
+            )
+        ).all()
+        delivered_at = utc_now()
+        for row in rows:
+            row.delivered_at = delivered_at
+        await self.session.flush()
+
+    async def get_order_conversation_target(self, order_id: int) -> ConversationTargetSnapshot | None:
+        """Return the outbound conversation target for one order when available."""
+        row = await self.session.execute(
+            select(Conversation.id, Conversation.channel, Conversation.store_id, Conversation.external_id)
+            .join(Order, Order.conversation_id == Conversation.id)
+            .where(Order.id == order_id)
+        )
+        target = row.one_or_none()
+        if target is None:
+            return None
+        conversation_id, channel, store_id, external_id = target
+        return ConversationTargetSnapshot(
+            conversation_id=conversation_id,
+            channel=channel,
+            store_id=store_id,
+            external_id=external_id,
+        )
 
     async def add_item_to_current_order(
         self,
@@ -804,6 +1077,22 @@ class BusinessRepository:
         await self.session.flush()
         return await self._build_order_snapshot(order)
 
+    async def reset_current_order(
+        self,
+        customer_id: int,
+        conversation_id: int,
+    ) -> OrderSnapshot:
+        """Clear all current draft items so the order can be rebuilt after a correction."""
+        order = await self._require_current_order(customer_id, conversation_id)
+        items = await self._load_order_items(order.id)
+        for item in items:
+            await self.session.delete(item)
+        await self.session.flush()
+        order.updated_at = utc_now()
+        await self._refresh_order_total(order)
+        await self.session.flush()
+        return await self._build_order_snapshot(order)
+
     async def confirm_current_order(
         self,
         customer_id: int,
@@ -871,8 +1160,8 @@ class BusinessRepository:
                 return DelayEstimateSnapshot(
                     active_orders_ahead=active_orders_ahead,
                     base_minutes=DEFAULT_DELAY_MINUTES,
-                    estimated_minutes=estimated_minutes,
-                    display_text=f"{estimated_minutes} minutos aproximadamente",
+                    estimated_minutes=round_delay_minutes(estimated_minutes),
+                    display_text=f"{round_delay_minutes(estimated_minutes)} minutos aproximadamente",
                 )
             active_orders_ahead = await self.count_active_orders_ahead_by_order_id(latest_order.id)
             return self._estimate_delay_from_snapshot(latest_order, active_orders_ahead=active_orders_ahead)
@@ -984,6 +1273,9 @@ class BusinessRepository:
         if order.requested_ready_at is None:
             order.preparation_starts_at = None
             return
+        requested_ready_at = self._as_utc_datetime(order.requested_ready_at)
+        assert requested_ready_at is not None
+        order.requested_ready_at = requested_ready_at
 
         items = await self._load_order_items(order.id)
         order_snapshot = OrderSnapshot(
@@ -994,6 +1286,7 @@ class BusinessRepository:
             delivery_type=order.delivery_type,
             delivery_address=order.delivery_address,
             payment_method=order.payment_method,
+            notify_when_ready=order.notify_when_ready,
             requested_ready_at=order.requested_ready_at,
             preparation_starts_at=order.preparation_starts_at,
             total_amount_cents=order.total_amount_cents,
@@ -1011,7 +1304,7 @@ class BusinessRepository:
             ],
         )
         preparation_minutes = self._estimate_preparation_minutes(order_snapshot)
-        order.preparation_starts_at = order.requested_ready_at - timedelta(minutes=preparation_minutes)
+        order.preparation_starts_at = requested_ready_at - timedelta(minutes=preparation_minutes)
 
     async def _validate_requested_ready_at(
         self,
@@ -1023,10 +1316,16 @@ class BusinessRepository:
         """Ensure a scheduled order can be fulfilled during business hours."""
         if order.requested_ready_at is None:
             return
+        requested_ready_at = self._as_utc_datetime(order.requested_ready_at)
+        assert requested_ready_at is not None
+        order.requested_ready_at = requested_ready_at
+
+        preparation_starts_at = self._as_utc_datetime(order.preparation_starts_at)
+        order.preparation_starts_at = preparation_starts_at
 
         zone = ZoneInfo(timezone_name)
         local_now = utc_now().astimezone(zone)
-        local_ready = order.requested_ready_at.astimezone(zone)
+        local_ready = requested_ready_at.astimezone(zone)
         if local_ready <= local_now:
             raise RequestedReadyTimeError.past_time()
 
@@ -1036,14 +1335,14 @@ class BusinessRepository:
             next_open_text = self._find_next_opening_text(schedule, local_now)
             raise RequestedReadyTimeError.outside_business_hours(next_open_text)
 
-        if order.preparation_starts_at is None:
+        if preparation_starts_at is None:
             return
 
         local_open = self._opening_datetime_for_row(schedule_row, local_ready)
-        local_preparation_start = order.preparation_starts_at.astimezone(zone)
+        local_preparation_start = preparation_starts_at.astimezone(zone)
         earliest_start = max(local_now, local_open)
         if local_preparation_start < earliest_start:
-            preparation_minutes = int((order.requested_ready_at - order.preparation_starts_at).total_seconds() // 60)
+            preparation_minutes = int((requested_ready_at - preparation_starts_at).total_seconds() // 60)
             earliest_ready = earliest_start + timedelta(minutes=preparation_minutes)
             raise RequestedReadyTimeError.insufficient_lead_time(
                 self._describe_local_datetime(earliest_ready, local_now)
@@ -1060,8 +1359,9 @@ class BusinessRepository:
             delivery_type=order.delivery_type,
             delivery_address=order.delivery_address,
             payment_method=order.payment_method,
-            requested_ready_at=order.requested_ready_at,
-            preparation_starts_at=order.preparation_starts_at,
+            notify_when_ready=order.notify_when_ready,
+            requested_ready_at=self._as_utc_datetime(order.requested_ready_at),
+            preparation_starts_at=self._as_utc_datetime(order.preparation_starts_at),
             total_amount_cents=order.total_amount_cents,
             total_amount_display=format_price_ars(order.total_amount_cents),
             items=[
@@ -1077,6 +1377,52 @@ class BusinessRepository:
             ],
         )
 
+    async def _queue_status_notification_if_needed(self, order: Order, *, previous_status: OrderStatus) -> None:
+        """Queue one outbound notification when an order reaches a ready state."""
+        if not order.notify_when_ready:
+            return
+        if previous_status == order.status:
+            return
+        event_type = READY_NOTIFICATION_EVENT_BY_STATUS.get(order.status)
+        if event_type is None:
+            return
+        existing = await self.session.scalar(
+            select(OutboundNotification).where(
+                OutboundNotification.order_id == order.id,
+                OutboundNotification.event_type == event_type,
+            )
+        )
+        if existing is not None:
+            return
+        conversation = await self.session.get(Conversation, order.conversation_id)
+        if conversation is None:
+            return
+        self.session.add(
+            OutboundNotification(
+                order_id=order.id,
+                conversation_id=conversation.id,
+                event_type=event_type,
+                message_text=self._build_status_notification_text(order),
+            )
+        )
+        await self.session.flush()
+
+    def _as_utc_datetime(self, value: datetime | None) -> datetime | None:
+        """Normalize SQLite-loaded timestamps into aware UTC datetimes."""
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
+    def _build_status_notification_text(self, order: Order) -> str:
+        """Build the outbound message shown when an order reaches a relevant status."""
+        if order.status == OrderStatus.ALMOST_READY:
+            return "Tu pedido ya casi está 👀"
+        if order.status == OrderStatus.OUT_FOR_DELIVERY:
+            return "Tu pedido ya salió y va en camino 🚚"
+        return "Tu pedido ya está listo para retirar 🙌"
+
     def _estimate_delay_from_snapshot(
         self,
         order: OrderSnapshot,
@@ -1085,7 +1431,7 @@ class BusinessRepository:
     ) -> DelayEstimateSnapshot:
         """Compute an MVP delay estimate based on preparation time and kitchen load."""
         base_minutes = self._estimate_preparation_minutes(order)
-        estimated_minutes = base_minutes + (active_orders_ahead * KITCHEN_LOAD_COEFFICIENT_MINUTES)
+        estimated_minutes = round_delay_minutes(base_minutes + (active_orders_ahead * KITCHEN_LOAD_COEFFICIENT_MINUTES))
 
         return DelayEstimateSnapshot(
             active_orders_ahead=active_orders_ahead,

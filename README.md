@@ -52,29 +52,47 @@ If you plan to send transactional email from the same backend, the SMTP
 settings are now also recognized through `RUPERTO_SMTP_SERVER`,
 `RUPERTO_SMTP_PORT`, `RUPERTO_SMTP_USER`, and `RUPERTO_SMTP_PASSWORD`.
 
+For Kapso-backed WhatsApp, configure:
+
+- `RUPERTO_KAPSO_API_KEY`
+- `RUPERTO_KAPSO_PHONE_NUMBER_ID`
+- `RUPERTO_KAPSO_WEBHOOK_SECRET`
+
 Run the development web chat UI:
 
 ```bash
 uv run ruperto web-chat
 ```
 
+Or open the browser demo page served by the main app:
+
+- `http://127.0.0.1:8000/demo/chat`
+
+This page is intentionally simple and talks to `/api/dev/messages` directly.
+It lets you switch between multiple demo phone numbers so you can emulate
+returning customers with remembered context.
+
 You should then have:
 
 - API root at `http://127.0.0.1:8000/`
 - health check at `http://127.0.0.1:8000/healthz`
+- browser demo chat at `http://127.0.0.1:8000/demo/chat`
 - staff dashboard at `http://127.0.0.1:8000/dashboard`
 - store profile at `http://127.0.0.1:8000/api/store-profile`
 - menu listing at `http://127.0.0.1:8000/api/menu-items`
 - development chat endpoint at `http://127.0.0.1:8000/api/dev/messages`
+- Kapso WhatsApp webhook at `http://127.0.0.1:8000/webhooks/whatsapp/kapso`
 - development web chat at `http://127.0.0.1:7932/`
 
-The current development flow asks for the customer's name before the first
-order unless the customer already introduced themself in the opening message.
-If the first customer message already contains an order or menu question, that
-intent is now remembered and resumed as soon as the customer shares their
-name, instead of resetting the conversation. The assistant also estimates
-kitchen delay from preparation time plus active workload and lets staff move
-orders through operational statuses with `PATCH /api/orders/{order_id}/status`.
+The current development flow no longer blocks purely informational questions
+behind the customer's name. The assistant can answer menu or delivery
+questions first, then ask for the name once it is actually needed to keep
+building or confirming the order. If the first customer message already
+contains an order, that intent is still remembered and resumed as soon as the
+customer shares their name, instead of resetting the conversation. The
+assistant also estimates kitchen delay from preparation time plus active
+workload and lets staff move orders through operational statuses with
+`PATCH /api/orders/{order_id}/status`.
 Store opening hours are now configurable through `GET/PUT /api/store-hours`.
 Each weekday can have zero, one, or many opening slots, so a store can stay
 closed on Mondays, open only at lunch on Sundays, or split the day into as
@@ -84,6 +102,11 @@ If a customer asks for a later ready time such as `para las 12`, the backend
 can now keep the order scheduled for that slot, store when preparation should
 start, and include the configured transfer alias when the payment method is
 `transferencia`.
+After the checkout details are complete, the assistant now shows a deterministic
+review of the persisted draft and only closes the order after an explicit final
+confirmation from the customer. Informational delivery questions such as
+shipping cost or area coverage also stay in informational mode instead of
+forcing the checkout script.
 The backend also serves a simple Tailwind staff dashboard at `/dashboard`.
 Dashboard access now uses a minimal session cookie login backed by a bootstrap
 staff user configured through environment variables. Once signed in, the team
@@ -94,6 +117,14 @@ The demo catalog now includes a broader synthetic menu with pizzas,
 hamburgers, lomitos, milanesas, wraps, empanadas, drinks, and desserts so
 local development can exercise more realistic ordering conversations and
 simple add-on suggestions.
+Informational menu questions are also handled more proactively now: if a
+customer asks for a category such as soft drinks, the assistant should list
+concrete options with prices instead of answering with a bare yes/no.
+That browsing layer now also respects simple constraints such as `sin alcohol`
+when suggesting drinks, asks for clarification instead of over-interpreting
+ambiguous follow-ups like `uno de cada` across multiple product groups, and
+can recover some large first-turn multi-item orders deterministically if the
+model fails before building the draft.
 Compact customer messages are also handled more naturally now, so the assistant
 can reuse cues such as a self-introduction, a payment hint like `te pago acá`,
 and a same-turn price question without asking for the same detail twice.
@@ -103,6 +134,15 @@ today as one configurable store by default. Dashboard users can already belong
 to more than one store and switch the active store for profile and opening-hour
 management, while orders, customers, and the catalog still use the shared MVP
 data model for now.
+There is now also a first production-shaped WhatsApp integration path through
+Kapso: the backend can receive inbound text messages from the
+`/webhooks/whatsapp/kapso` endpoint, answer through the Kapso proxy, and send
+automatic ready/almost-ready/out-for-delivery notifications when a WhatsApp
+order changes status. The adapter is intentionally isolated behind a channel
+layer so future providers or channels do not leak into the assistant logic.
+Kapso credentials can still come from environment variables as a development
+fallback, but the recommended path for multi-store setups is now to configure
+each local's WhatsApp connection from the dashboard agent settings page.
 
 ## Development
 

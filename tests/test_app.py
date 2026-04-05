@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 from base64 import b64encode
 from datetime import UTC, datetime
@@ -17,11 +19,12 @@ from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, Tool
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from sqlalchemy import select
 
-from ruperto.app import create_app, format_dashboard_datetime, parse_store_hours_form
+from ruperto.app import create_app, extract_kapso_phone_number_id, format_dashboard_datetime, parse_store_hours_form
 from ruperto.config import Settings
 from ruperto.db import create_database_runtime, init_database
-from ruperto.models import OrderStatus, StaffRole, StoreMembership
+from ruperto.models import Channel, DeliveryType, OrderStatus, PaymentMethod, StaffRole, StoreMembership
 from ruperto.repository import BusinessRepository
+from ruperto.schemas import AssistantTurnResult
 
 HTTP_OK = 200
 HTTP_NOT_FOUND = 404
@@ -29,6 +32,8 @@ HTTP_FOUND = 303
 HTTP_FORBIDDEN = 403
 HTTP_UNAUTHORIZED = 401
 HTTP_UNPROCESSABLE_ENTITY = 422
+HTTP_BAD_REQUEST = 400
+HTTP_SERVICE_UNAVAILABLE = 503
 MIN_MENU_ITEMS = 35
 DEFAULT_WEEKLY_HOURS = 7
 TENANT_STORE_ID = 7
@@ -49,6 +54,11 @@ def build_settings(tmp_path: Path, *, auto_init_db: bool = True) -> Settings:
         dashboard_admin_password=SecretStr("super-secret"),
         dashboard_admin_name="Staff User",
     )
+
+
+def build_kapso_signature(*, payload: bytes, secret: str) -> str:
+    """Build the Kapso HMAC signature for one raw payload."""
+    return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
 
 
 def login_dashboard(client: TestClient, *, email: str = "staff@example.com", password: str = "super-secret"):
@@ -132,6 +142,36 @@ async def add_staff_user_to_default_store(settings: Settings):
     await runtime.engine.dispose()
 
 
+async def create_whatsapp_confirmed_order(settings: Settings) -> int:
+    """Create one confirmed WhatsApp order ready for status transitions."""
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(
+            channel=Channel.WHATSAPP,
+            external_id="+5493513308454",
+            phone_number="+5493513308454",
+        )
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.WHATSAPP,
+            external_id="+5493513308454",
+            customer_id=customer.id,
+        )
+        await repository.add_item_to_current_order(
+            customer_id=customer.id,
+            conversation_id=conversation.id,
+            sku="hamburguesa-doble",
+            quantity=1,
+        )
+        await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.PICKUP)
+        confirmed_order = await repository.set_order_payment_method(customer.id, conversation.id, PaymentMethod.CASH)
+        confirmed_order = await repository.confirm_current_order(customer.id, conversation.id)
+        await session.commit()
+    await runtime.engine.dispose()
+    return confirmed_order.id
+
+
 def test_root_endpoint(tmp_path: Path):
     """The root endpoint exposes basic service metadata."""
     app = create_app(build_settings(tmp_path))
@@ -165,6 +205,188 @@ def test_root_endpoint_without_auto_init(tmp_path: Path):
     assert response.json()["environment"] == "test"
 
 
+def test_demo_chat_page_renders_the_browser_harness(tmp_path: Path):
+    """The lightweight demo chat page is available from the main app."""
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.get("/demo/chat")
+
+    assert response.status_code == HTTP_OK
+    assert "Demo online" in response.text
+    assert "Clientes demo" in response.text
+    assert "/api/dev/messages" in response.text
+    assert "/api/dev/notifications" in response.text
+    assert "Martín" in response.text
+    assert "Crear cliente aleatorio" in response.text
+    assert "marked.min.js" in response.text
+    assert "purify.min.js" in response.text
+
+
+def test_extract_kapso_phone_number_id_supports_direct_and_nested_payloads():
+    """Kapso webhook routing can read the phone number id from either payload shape."""
+    assert extract_kapso_phone_number_id({"phone_number_id": "direct-id"}) == "direct-id"
+    assert extract_kapso_phone_number_id({"conversation": {"phone_number_id": "nested-id"}}) == "nested-id"
+    assert extract_kapso_phone_number_id({"conversation": {}}) is None
+    assert extract_kapso_phone_number_id(["not-a-dict"]) is None
+
+
+def test_kapso_webhook_requires_valid_signature(tmp_path: Path):
+    """Kapso webhooks are rejected when the signature does not match."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "kapso_api_key": SecretStr("kapso-key"),
+            "kapso_phone_number_id": "597907523413541",
+            "kapso_webhook_secret": SecretStr("kapso-secret"),
+        }
+    )
+    app = create_app(settings)
+    payload = {
+        "event": "whatsapp.message.received",
+        "message": {
+            "id": "wamid.123",
+            "from": "5493513308454",
+            "timestamp": "1730092800",
+            "type": "text",
+            "text": {"body": "Hola"},
+        },
+        "conversation": {
+            "id": "conv_123",
+            "phone_number": "+5493513308454",
+            "phone_number_id": "597907523413541",
+            "kapso": {"contact_name": "Pedro"},
+        },
+        "phone_number_id": "597907523413541",
+    }
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhooks/whatsapp/kapso",
+            content=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-Webhook-Signature": "bad-signature"},
+        )
+
+    assert response.status_code == HTTP_UNAUTHORIZED
+
+
+def test_kapso_webhook_requires_runtime_configuration(tmp_path: Path):
+    """Kapso webhook processing stays disabled until the runtime credentials exist."""
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhooks/whatsapp/kapso",
+            content=b"{}",
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert response.status_code == HTTP_SERVICE_UNAVAILABLE
+
+
+def test_dashboard_agent_channel_form_requires_login(tmp_path: Path):
+    """Channel settings are protected behind the same dashboard login as the rest of the panel."""
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/dashboard/settings/agent/channel",
+            data={"kapso_phone_number_id": "597907523413541"},
+            follow_redirects=False,
+        )
+
+    assert response.status_code == HTTP_FOUND
+    assert response.headers["location"].startswith("/dashboard/login")
+
+
+def test_kapso_webhook_rejects_invalid_json(tmp_path: Path):
+    """Kapso webhook processing rejects malformed JSON payloads."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "kapso_api_key": SecretStr("kapso-key"),
+            "kapso_phone_number_id": "597907523413541",
+            "kapso_webhook_secret": SecretStr("kapso-secret"),
+        }
+    )
+    app = create_app(settings)
+    raw_payload = b"{bad json"
+    signature = build_kapso_signature(payload=raw_payload, secret="kapso-secret")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhooks/whatsapp/kapso",
+            content=raw_payload,
+            headers={"Content-Type": "application/json", "X-Webhook-Signature": signature},
+        )
+
+    assert response.status_code == HTTP_BAD_REQUEST
+
+
+def test_kapso_webhook_processes_inbound_message_and_sends_reply(tmp_path: Path, mocker):
+    """Kapso inbound webhooks are normalized, processed, and answered."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "kapso_api_key": SecretStr("kapso-key"),
+            "kapso_phone_number_id": "597907523413541",
+            "kapso_webhook_secret": SecretStr("kapso-secret"),
+        }
+    )
+    app = create_app(settings)
+    fake_result = AssistantTurnResult.model_validate(
+        {
+            "conversation_id": 1,
+            "customer": {"id": 1, "name": "Pedro", "phone_number": "+5493513308454", "default_address": None},
+            "reply": {"reply_text": "Hola Pedro, ¿qué te gustaría pedir?", "next_step": "choose_items"},
+            "current_order": None,
+        }
+    )
+    handled_messages = []
+    sent_payloads: list[dict[str, Any]] = []
+
+    async def fake_handle_inbound_customer_message(*, session_factory, settings, inbound_message, store_id=None):
+        handled_messages.append(inbound_message)
+        return fake_result
+
+    async def fake_send_text(self, message):
+        sent_payloads.append({"to": message.external_user_id, "text": message.message_text})
+
+    mocker.patch("ruperto.app.handle_inbound_customer_message", side_effect=fake_handle_inbound_customer_message)
+    mocker.patch("ruperto.channels.kapso_whatsapp.KapsoWhatsAppGateway.send_text", new=fake_send_text)
+
+    payload = {
+        "event": "whatsapp.message.received",
+        "message": {
+            "id": "wamid.123",
+            "from": "5493513308454",
+            "timestamp": "1730092800",
+            "type": "text",
+            "text": {"body": "Hola, ¿tenés menú?"},
+        },
+        "conversation": {
+            "id": "conv_123",
+            "phone_number": "+5493513308454",
+            "phone_number_id": "597907523413541",
+            "kapso": {"contact_name": "Pedro"},
+        },
+        "phone_number_id": "597907523413541",
+    }
+    raw_payload = json.dumps(payload).encode("utf-8")
+    signature = build_kapso_signature(payload=raw_payload, secret="kapso-secret")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhooks/whatsapp/kapso",
+            content=raw_payload,
+            headers={"Content-Type": "application/json", "X-Webhook-Signature": signature},
+        )
+
+    assert response.status_code == HTTP_OK
+    assert response.json() == {"status": "ok", "processed": 1}
+    assert handled_messages[0].external_user_id == "+5493513308454"
+    assert handled_messages[0].sender_name == "Pedro"
+    assert handled_messages[0].message_text == "Hola, ¿tenés menú?"
+    assert sent_payloads == [{"to": "+5493513308454", "text": "Hola Pedro, ¿qué te gustaría pedir?"}]
+
+
 def test_format_dashboard_datetime_formats_local_time():
     """Dashboard timestamps are shown in the configured local timezone."""
     value = datetime(2026, 4, 4, 15, 30, tzinfo=UTC)
@@ -188,11 +410,27 @@ def test_public_settings_marks_secret_configuration():
     assert public["gemini_api_key_configured"] is True
     assert public["kapso_api_key_configured"] is True
     assert public["default_store_id"] == TENANT_STORE_ID
+    assert public["kapso_webhook_secret_configured"] is False
     assert public["smtp_server"] == "smtp.example.com"
     assert public["smtp_port"] == SMTP_PORT
     assert public["smtp_user"] == "mailer@example.com"
     assert public["smtp_password_configured"] is True
     assert public["smtp_configured"] is True
+
+
+def test_public_settings_marks_kapso_webhook_secret_configuration():
+    """Kapso webhook secrets are exposed as safe configured flags only."""
+    settings = Settings(
+        kapso_api_key=SecretStr("kapso-key"),
+        kapso_phone_number_id="597907523413541",
+        kapso_webhook_secret=SecretStr("kapso-secret"),
+    )
+
+    public = settings.public_settings()
+
+    assert public["kapso_api_key_configured"] is True
+    assert public["kapso_phone_number_id"] == "597907523413541"
+    assert public["kapso_webhook_secret_configured"] is True
 
 
 def collect_tool_returns(messages: list[ModelMessage]) -> dict[str, Any]:
@@ -207,15 +445,66 @@ def collect_tool_returns(messages: list[ModelMessage]) -> dict[str, Any]:
     return tool_returns
 
 
+def extract_latest_user_text(messages: list[ModelMessage]) -> str:
+    """Return the latest user prompt text from the deterministic model history."""
+    for message in reversed(messages):
+        if not isinstance(message, ModelRequest):
+            continue
+        for part in reversed(message.parts):
+            content = getattr(part, "content", None)
+            if isinstance(content, str):
+                return content
+    return ""
+
+
 def dev_message_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
     """Deterministic model used to exercise the development chat endpoint."""
     tool_returns = collect_tool_returns(messages)
+    latest_user_text = extract_latest_user_text(messages).casefold().strip()
+    if latest_user_text == "martina":
+        if "update_customer_name" not in tool_returns:
+            return ModelResponse(
+                parts=[ToolCallPart("update_customer_name", {"name": "Martina"})],
+                model_name="function:test-api-dev-message",
+            )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name,
+                    {
+                        "reply_text": "Hola Martina, decime qué te gustaría pedir.",
+                        "next_step": "choose_items",
+                        "handoff": False,
+                    },
+                )
+            ],
+            model_name="function:test-api-dev-message",
+        )
+
+    if "confirm" in latest_user_text:
+        if "confirm_current_order" not in tool_returns:
+            return ModelResponse(
+                parts=[ToolCallPart("confirm_current_order", {})],
+                model_name="function:test-api-dev-message",
+            )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name,
+                    {
+                        "reply_text": "Hola Martina, tu pedido quedó confirmado.",
+                        "next_step": "complete",
+                        "handoff": False,
+                    },
+                )
+            ],
+            model_name="function:test-api-dev-message",
+        )
+
     sequence: list[tuple[str, dict[str, Any]]] = [
-        ("update_customer_name", {"name": "Martina"}),
         ("add_item_to_current_order", {"sku": "hamburguesa-completa", "quantity": 1}),
         ("set_order_delivery_type", {"delivery_type": "pickup"}),
         ("set_order_payment_method", {"payment_method": "cash"}),
-        ("confirm_current_order", {}),
     ]
     for tool_name, arguments in sequence:
         if tool_name not in tool_returns:
@@ -229,8 +518,8 @@ def dev_message_model(messages: list[ModelMessage], info: AgentInfo) -> ModelRes
             ToolCallPart(
                 info.output_tools[0].name,
                 {
-                    "reply_text": "Hola Martina, tu pedido quedó confirmado.",
-                    "next_step": "complete",
+                    "reply_text": "Así queda el pedido. Si está bien, confirmámelo.",
+                    "next_step": "confirm_order",
                     "handoff": False,
                 },
             )
@@ -260,6 +549,10 @@ def test_mvp_api_surface_exposes_dev_chat_and_read_models(tmp_path: Path, monkey
             "/api/dev/messages",
             json={"external_user_id": "cli-user", "message_text": "Quiero una hamburguesa"},
         )
+        confirm_response = client.post(
+            "/api/dev/messages",
+            json={"external_user_id": "cli-user", "message_text": "Confirmá el pedido"},
+        )
         customers_response = client.get("/api/customers", params={"limit": 1})
         orders_response = client.get("/api/orders", params={"limit": 10})
         confirmed_orders_response = client.get("/api/orders", params={"status": "confirmed", "limit": 10})
@@ -276,14 +569,19 @@ def test_mvp_api_surface_exposes_dev_chat_and_read_models(tmp_path: Path, monkey
     assert first_chat_response.json()["reply"]["next_step"] == "ask_name"
     assert second_chat_response.status_code == HTTP_OK
     assert second_chat_response.json()["customer"]["name"] == "Martina"
-    assert second_chat_response.json()["reply"]["next_step"] == "complete"
-    assert second_chat_response.json()["current_order"]["status"] == "confirmed"
+    assert second_chat_response.json()["reply"]["next_step"] == "choose_items"
+    assert second_chat_response.json()["current_order"] is None
 
     assert chat_response.status_code == HTTP_OK
     chat_payload = chat_response.json()
     assert chat_payload["customer"]["name"] == "Martina"
-    assert chat_payload["reply"]["next_step"] == "complete"
-    assert chat_payload["current_order"]["status"] == "confirmed"
+    assert chat_payload["reply"]["next_step"] == "choose_items"
+    assert chat_payload["current_order"]["status"] == "draft"
+    assert "bebida o un postre" in chat_payload["reply"]["reply_text"].lower()
+
+    assert confirm_response.status_code == HTTP_OK
+    assert confirm_response.json()["reply"]["next_step"] == "complete"
+    assert confirm_response.json()["current_order"]["status"] == "confirmed"
 
     assert customers_response.status_code == HTTP_OK
     assert customers_response.json()[0]["name"] == "Martina"
@@ -301,12 +599,13 @@ def test_staff_can_update_order_status(tmp_path: Path, monkeypatch: pytest.Monke
     app = create_app(build_settings(tmp_path))
 
     with TestClient(app) as client:
-        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Hola"})
+        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Hola, quiero pedir"})
         client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Martina"})
         order_response = client.post(
             "/api/dev/messages",
             json={"external_user_id": "cli-user", "message_text": "Quiero una hamburguesa"},
         )
+        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Confirmá el pedido"})
         order_id = order_response.json()["current_order"]["id"]
         status_response = client.patch(
             f"/api/orders/{order_id}/status",
@@ -315,6 +614,59 @@ def test_staff_can_update_order_status(tmp_path: Path, monkeypatch: pytest.Monke
 
     assert status_response.status_code == HTTP_OK
     assert status_response.json()["status"] == OrderStatus.ALMOST_READY.value
+
+
+def test_order_status_update_delivers_whatsapp_notifications(tmp_path: Path, mocker):
+    """Status changes dispatch queued notifications through the WhatsApp gateway."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "kapso_api_key": SecretStr("kapso-key"),
+            "kapso_phone_number_id": "597907523413541",
+            "kapso_webhook_secret": SecretStr("kapso-secret"),
+        }
+    )
+    order_id = anyio.run(create_whatsapp_confirmed_order, settings)
+    app = create_app(settings)
+    sent_payloads: list[dict[str, Any]] = []
+
+    async def fake_send_text(self, message):
+        sent_payloads.append({"to": message.external_user_id, "text": message.message_text})
+
+    mocker.patch("ruperto.channels.kapso_whatsapp.KapsoWhatsAppGateway.send_text", new=fake_send_text)
+
+    with TestClient(app) as client:
+        response = client.patch(
+            f"/api/orders/{order_id}/status",
+            json={"status": OrderStatus.ALMOST_READY.value},
+        )
+
+    assert response.status_code == HTTP_OK
+    assert sent_payloads == [{"to": "+5493513308454", "text": "Tu pedido ya casi está 👀"}]
+
+
+def test_dev_notifications_endpoint_returns_pending_messages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The browser harness can poll queued status notifications for one demo client."""
+    monkeypatch.setattr("ruperto.assistant.build_google_model", lambda settings: FunctionModel(dev_message_model))
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Hola, quiero pedir"})
+        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Martina"})
+        order_response = client.post(
+            "/api/dev/messages",
+            json={"external_user_id": "cli-user", "message_text": "Quiero una hamburguesa"},
+        )
+        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Confirmá el pedido"})
+        order_id = order_response.json()["current_order"]["id"]
+        client.patch(f"/api/orders/{order_id}/status", json={"status": OrderStatus.ALMOST_READY.value})
+        client.patch(f"/api/orders/{order_id}/status", json={"status": OrderStatus.READY_FOR_PICKUP.value})
+        first_poll = client.get("/api/dev/notifications", params={"external_user_id": "cli-user"})
+        second_poll = client.get("/api/dev/notifications", params={"external_user_id": "cli-user"})
+
+    assert first_poll.status_code == HTTP_OK
+    assert [notification["event_type"] for notification in first_poll.json()] == ["order_almost_ready", "order_ready"]
+    assert second_poll.status_code == HTTP_OK
+    assert second_poll.json() == []
 
 
 def test_staff_update_order_status_returns_not_found_for_unknown_order(tmp_path: Path):
@@ -469,6 +821,16 @@ def test_dashboard_forms_can_update_profile_agent_and_hours(tmp_path: Path):
             },
             follow_redirects=True,
         )
+        channel_response = client.post(
+            "/dashboard/settings/agent/channel",
+            data={
+                "kapso_phone_number_id": "597907523413541",
+                "kapso_api_key": "kapso-key",
+                "kapso_webhook_secret": "kapso-secret",
+                "kapso_is_active": "on",
+            },
+            follow_redirects=True,
+        )
         hours_response = client.post(
             "/dashboard/settings/hours",
             data={
@@ -488,6 +850,8 @@ def test_dashboard_forms_can_update_profile_agent_and_hours(tmp_path: Path):
     assert "Perfil del local actualizado." in profile_response.text
     assert agent_response.status_code == HTTP_OK
     assert "Configuración del agente actualizada." in agent_response.text
+    assert channel_response.status_code == HTTP_OK
+    assert "597907523413541" in channel_response.text
     assert hours_response.status_code == HTTP_OK
     assert "Horarios actualizados." in hours_response.text
     assert store_response.json()["store_name"] == "Panel Rotisería"
@@ -550,12 +914,13 @@ def test_dashboard_can_update_order_status_and_handles_missing_orders(tmp_path: 
 
     with TestClient(app) as client:
         login_dashboard(client)
-        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Hola"})
+        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Hola, quiero pedir"})
         client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Martina"})
         order_response = client.post(
             "/api/dev/messages",
             json={"external_user_id": "cli-user", "message_text": "Quiero una hamburguesa"},
         )
+        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Confirmá el pedido"})
         order_id = order_response.json()["current_order"]["id"]
         dashboard_response = client.post(
             f"/dashboard/orders/{order_id}/status",
@@ -603,6 +968,19 @@ def test_dashboard_login_page_redirects_when_already_authenticated(tmp_path: Pat
     assert "Ingresá al panel" in login_page.text
     assert redirect_response.status_code == HTTP_FOUND
     assert redirect_response.headers["location"] == "/dashboard"
+
+
+def test_dashboard_shell_links_to_demo_chat(tmp_path: Path):
+    """The staff dashboard exposes a direct link to the browser demo chat."""
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        response = client.get("/dashboard")
+
+    assert response.status_code == HTTP_OK
+    assert "Abrir demo del chat" in response.text
+    assert 'href="/demo/chat"' in response.text
 
 
 def test_dashboard_logout_clears_the_session(tmp_path: Path):
@@ -706,7 +1084,7 @@ def test_dashboard_customers_search_filters_results(tmp_path: Path, monkeypatch:
 
     with TestClient(app) as client:
         login_dashboard(client)
-        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Hola"})
+        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Hola, quiero pedir"})
         client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Martina"})
         response = client.get("/dashboard/customers", params={"q": "martina"})
         empty_response = client.get("/dashboard/customers", params={"q": "nadie"})
@@ -737,6 +1115,7 @@ def test_dashboard_settings_pages_render_menu_filters_and_profile_data(tmp_path:
     assert "Alias de transferencia" in profile_response.text
     assert agent_response.status_code == HTTP_OK
     assert "Modelo" in agent_response.text
+    assert "WhatsApp vía Kapso" in agent_response.text
     assert hours_response.status_code == HTTP_OK
     assert "Guardar agenda semanal" in hours_response.text
     assert users_response.status_code == HTTP_OK

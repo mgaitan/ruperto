@@ -6,12 +6,22 @@ from dataclasses import dataclass
 
 from sqlalchemy import func, inspect, select, text
 from sqlalchemy.engine import Connection
+from sqlalchemy.engine.reflection import Inspector
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from ruperto.bootstrap import DEFAULT_BUSINESS_HOURS, DEMO_MENU_ITEMS
 from ruperto.config import Settings
-from ruperto.models import Base, MenuItem, StaffRole, StoreBusinessHours, StoreProfile
+from ruperto.models import (
+    Base,
+    Channel,
+    ChannelProvider,
+    MenuItem,
+    StaffRole,
+    StoreBusinessHours,
+    StoreProfile,
+)
 from ruperto.repository import BusinessRepository
+from ruperto.schemas import StoreChannelConnectionUpdateRequest
 
 
 @dataclass(slots=True)
@@ -100,6 +110,28 @@ async def init_database(*, settings: Settings, runtime: DatabaseRuntime | None =
                 store_id=settings.default_store_id,
                 role=StaffRole.OWNER,
             )
+        if settings.kapso_api_key is not None and settings.kapso_phone_number_id is not None:
+            existing_channel = await repository.get_store_channel_connection(
+                store_id=settings.default_store_id,
+                channel=Channel.WHATSAPP,
+                provider=ChannelProvider.KAPSO,
+            )
+            if existing_channel.id is None:
+                await repository.update_store_channel_connection(
+                    store_id=settings.default_store_id,
+                    channel=Channel.WHATSAPP,
+                    provider=ChannelProvider.KAPSO,
+                    payload=StoreChannelConnectionUpdateRequest(
+                        phone_number_id=settings.kapso_phone_number_id,
+                        api_key=settings.kapso_api_key.get_secret_value(),
+                        webhook_secret=(
+                            settings.kapso_webhook_secret.get_secret_value()
+                            if settings.kapso_webhook_secret is not None
+                            else None
+                        ),
+                        is_active=True,
+                    ),
+                )
         await session.commit()
     return active_runtime
 
@@ -113,18 +145,99 @@ async def ping_database(runtime: DatabaseRuntime) -> None:
 def _ensure_schema_columns(connection: Connection) -> None:
     """Backfill additive columns for databases created by older MVP versions."""
     inspector = inspect(connection)
+    _ensure_store_profile_columns(connection, inspector=inspector)
+    _ensure_customer_order_columns(connection, inspector=inspector)
+    _ensure_outbound_notification_table(connection, inspector=inspector)
+    _ensure_conversation_columns(connection, inspector=inspector)
+    _ensure_store_channel_connection_table(connection, inspector=inspector)
+    _ensure_store_business_hours_shape(connection, inspector=inspector)
+
+
+def _ensure_store_profile_columns(connection: Connection, *, inspector: Inspector) -> None:
+    """Additive migration for store profile fields."""
     if "store_profile" in inspector.get_table_names():
         store_profile_columns = {column["name"] for column in inspector.get_columns("store_profile")}
         if "transfer_alias" not in store_profile_columns:
             connection.execute(text("ALTER TABLE store_profile ADD COLUMN transfer_alias VARCHAR(120)"))
 
+
+def _ensure_customer_order_columns(connection: Connection, *, inspector: Inspector) -> None:
+    """Additive migration for scheduling and notification order fields."""
     if "customer_order" in inspector.get_table_names():
         order_columns = {column["name"] for column in inspector.get_columns("customer_order")}
+        if "notify_when_ready" not in order_columns:
+            connection.execute(
+                text("ALTER TABLE customer_order ADD COLUMN notify_when_ready BOOLEAN NOT NULL DEFAULT 1")
+            )
         if "requested_ready_at" not in order_columns:
             connection.execute(text("ALTER TABLE customer_order ADD COLUMN requested_ready_at DATETIME"))
         if "preparation_starts_at" not in order_columns:
             connection.execute(text("ALTER TABLE customer_order ADD COLUMN preparation_starts_at DATETIME"))
 
+
+def _ensure_outbound_notification_table(connection: Connection, *, inspector: Inspector) -> None:
+    """Create the outbound notification table on older databases."""
+    if "outbound_notification" not in inspector.get_table_names():
+        connection.execute(
+            text(
+                """
+                CREATE TABLE outbound_notification (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    order_id INTEGER NOT NULL,
+                    conversation_id INTEGER NOT NULL,
+                    event_type VARCHAR(64) NOT NULL,
+                    message_text TEXT NOT NULL,
+                    delivered_at DATETIME,
+                    created_at DATETIME NOT NULL,
+                    FOREIGN KEY(order_id) REFERENCES customer_order (id) ON DELETE CASCADE,
+                    FOREIGN KEY(conversation_id) REFERENCES conversation (id) ON DELETE CASCADE,
+                    CONSTRAINT uq_outbound_notification_order_event UNIQUE (order_id, event_type)
+                )
+                """
+            )
+        )
+
+
+def _ensure_conversation_columns(connection: Connection, *, inspector: Inspector) -> None:
+    """Backfill conversation tenancy data for older installs."""
+    if "conversation" in inspector.get_table_names():
+        conversation_columns = {column["name"] for column in inspector.get_columns("conversation")}
+        if "store_id" not in conversation_columns:
+            connection.execute(
+                text("ALTER TABLE conversation ADD COLUMN store_id INTEGER REFERENCES store_profile (id)")
+            )
+            connection.execute(text("UPDATE conversation SET store_id = 1 WHERE store_id IS NULL"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_conversation_store_id ON conversation (store_id)"))
+
+
+def _ensure_store_channel_connection_table(connection: Connection, *, inspector: Inspector) -> None:
+    """Create the store-scoped channel-connection table on older installs."""
+    if "store_channel_connection" not in inspector.get_table_names():
+        connection.execute(
+            text(
+                """
+                CREATE TABLE store_channel_connection (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    store_id INTEGER NOT NULL,
+                    channel VARCHAR(32) NOT NULL,
+                    provider VARCHAR(32) NOT NULL,
+                    phone_number_id VARCHAR(120),
+                    api_key TEXT,
+                    webhook_secret TEXT,
+                    is_active BOOLEAN NOT NULL DEFAULT 0,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    FOREIGN KEY(store_id) REFERENCES store_profile (id) ON DELETE CASCADE,
+                    CONSTRAINT uq_store_channel_connection_store UNIQUE (store_id, channel, provider),
+                    CONSTRAINT uq_store_channel_connection_phone UNIQUE (channel, provider, phone_number_id)
+                )
+                """
+            )
+        )
+
+
+def _ensure_store_business_hours_shape(connection: Connection, *, inspector: Inspector) -> None:
+    """Upgrade weekly business hours to the multi-slot shape when needed."""
     if "store_business_hours" in inspector.get_table_names():
         hours_columns = {column["name"] for column in inspector.get_columns("store_business_hours")}
         if "slot_index" not in hours_columns:
