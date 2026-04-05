@@ -252,6 +252,23 @@ def add_item_only_model(messages: list[ModelMessage], info: AgentInfo) -> ModelR
     )
 
 
+def price_comparison_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Answer a simple menu comparison without asking for the customer's name."""
+    return ModelResponse(
+        parts=[
+            ToolCallPart(
+                info.output_tools[0].name,
+                {
+                    "reply_text": "El lomito completo sale más que la milanesa completa.",
+                    "next_step": "choose_items",
+                    "handoff": False,
+                },
+            )
+        ],
+        model_name="function:test-price-comparison",
+    )
+
+
 def delivery_info_handoff_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
     """Return a poor delivery-info handoff so the service can stabilize it."""
     return ModelResponse(
@@ -418,8 +435,8 @@ async def test_assistant_retries_once_before_fallback(tmp_path: Path):
     await runtime.engine.dispose()
 
 
-async def test_assistant_does_not_swallow_guardrail_errors(tmp_path: Path):
-    """Guardrail exceptions should still propagate instead of degrading to handoff."""
+async def test_assistant_recovers_from_guardrail_errors_with_useful_replies(tmp_path: Path):
+    """Guardrail exceptions should recover into deterministic next-step guidance."""
     settings = build_settings(tmp_path)
     runtime = create_database_runtime(settings)
     await init_database(settings=settings, runtime=runtime)
@@ -441,12 +458,24 @@ async def test_assistant_does_not_swallow_guardrail_errors(tmp_path: Path):
         agent=cast(Any, GuardrailAgent()),
     )
 
-    with pytest.raises(MissingConfirmationSignalError):
-        await service.handle_customer_message(
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="guardrail-user")
+        conversation = await repository.get_or_create_conversation(
             channel=Channel.DEV,
-            external_user_id="guardrail-user",
-            message_text="confirmalo",
+            external_id="guardrail-user",
+            customer_id=customer.id,
         )
+        await repository.add_item_to_current_order(customer.id, conversation.id, sku="pizza-rucula-crudo", quantity=1)
+        await session.commit()
+
+    confirmation_result = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="guardrail-user",
+        message_text="retiro",
+    )
+    assert confirmation_result.reply.next_step == AssistantNextStep.CHOOSE_PAYMENT
+    assert "efectivo, transferencia o link de pago" in confirmation_result.reply.reply_text.lower()
 
     class InformationalGuardrailAgent:
         async def run(self, *args: Any, **kwargs: Any):
@@ -458,11 +487,53 @@ async def test_assistant_does_not_swallow_guardrail_errors(tmp_path: Path):
         agent=cast(Any, InformationalGuardrailAgent()),
     )
 
-    with pytest.raises(InformationalTurnMutationError):
-        await informational_service.handle_customer_message(
+    informational_result = await informational_service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="guardrail-user",
+        message_text="Hola, ¿tenés para enviar?",
+    )
+    assert informational_result.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
+    assert "hacemos envíos" in informational_result.reply.reply_text.lower()
+
+    menu_result = await informational_service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="guardrail-user",
+        message_text="¿Tenés postres?",
+    )
+    assert menu_result.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
+    assert "tenemos postres" in menu_result.reply.reply_text.lower()
+
+    await runtime.engine.dispose()
+
+
+async def test_missing_confirmation_without_a_draft_still_raises(tmp_path: Path):
+    """Missing-confirmation recovery should only run when a real draft exists."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    baseline_service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        baseline_service,
+        channel=Channel.DEV,
+        external_user_id="missing-confirmation-no-draft",
+        name="Martina",
+    )
+
+    class GuardrailAgent:
+        async def run(self, *args: Any, **kwargs: Any):
+            raise MissingConfirmationSignalError
+
+    service = OrderingAssistantService(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        agent=cast(Any, GuardrailAgent()),
+    )
+
+    with pytest.raises(MissingConfirmationSignalError):
+        await service.handle_customer_message(
             channel=Channel.DEV,
-            external_user_id="guardrail-user",
-            message_text="¿Cuánto sale una pizza?",
+            external_user_id="missing-confirmation-no-draft",
+            message_text="confirmalo",
         )
 
     await runtime.engine.dispose()
@@ -1005,6 +1076,15 @@ async def test_name_candidate_heuristics_cover_edge_cases(tmp_path: Path):
     assert service._should_store_pending_message_before_name("cuánto es?") is True
     assert service._should_store_pending_message_before_name("combo familiar") is True
     assert service._should_store_pending_message_before_name("   ") is False
+    assert service._should_require_name_before_continuing("Quiero una pizza napolitana.") is True
+    assert service._should_require_name_before_continuing("pizza") is True
+    assert (
+        service._should_require_name_before_continuing("¿Qué sale más, el lomito completo o la milanesa completa?")
+        is False
+    )
+    assert service._should_require_name_before_continuing("Hola, ¿tenés para enviar?") is False
+    assert service._message_is_informational_menu_question("¿Cuánto sale una pizza?") is True
+    assert service._detect_delivery_type_hint("Hacé el envío, por favor.") is DeliveryType.DELIVERY
     assert (
         "así sigo con lo que me pediste"
         in service._build_name_prompt(
@@ -1103,6 +1183,27 @@ async def test_assistant_uses_name_introduced_in_the_first_message(tmp_path: Pat
     assert reply.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
     assert "Hola Martín" in reply.reply.reply_text
     assert "¿me decís tu nombre?" not in reply.reply.reply_text
+
+    await runtime.engine.dispose()
+
+
+async def test_assistant_answers_price_comparisons_without_requiring_name(tmp_path: Path):
+    """Pure menu comparisons should not trigger the onboarding gate."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+
+    result = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="comparison-user",
+        message_text="¿Qué sale más, el lomito completo o la milanesa completa?",
+        model=FunctionModel(price_comparison_model),
+    )
+
+    assert result.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
+    assert "lomito completo sale más" in result.reply.reply_text.lower()
+    assert result.customer.name is None
 
     await runtime.engine.dispose()
 
@@ -2397,6 +2498,28 @@ async def test_handle_customer_message_stabilizes_delivery_info_questions_over_d
     await runtime.engine.dispose()
 
 
+async def test_handle_customer_message_stabilizes_delivery_info_questions_without_a_draft(tmp_path: Path):
+    """Delivery-info questions should stay informational even without an active order."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+
+    result = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="delivery-info-no-draft-user",
+        message_text="¿Y más o menos por qué zona llegan?",
+        model=FunctionModel(delivery_info_handoff_model),
+    )
+
+    assert result.reply.handoff is False
+    assert result.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
+    assert "zona" in result.reply.reply_text.lower() or "dirección" in result.reply.reply_text.lower()
+    assert result.current_order is None
+
+    await runtime.engine.dispose()
+
+
 async def test_guide_reply_with_current_order_keeps_informational_delivery_answer_when_it_is_already_useful(
     tmp_path: Path,
 ):
@@ -2781,7 +2904,7 @@ async def test_scheduling_and_next_step_helpers_cover_remaining_branches(tmp_pat
     assert service._extract_requested_ready_at("para las 25", timezone_name=STORE_TIMEZONE) is None
     assert parsed_tomorrow is not None
     assert service._describe_order_ready_time(parsed_tomorrow).startswith("mañana")
-    today_ready = datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(hours=1)
+    today_ready = datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(hour=13, minute=0, second=0, microsecond=0)
     assert service._describe_order_ready_time(today_ready.astimezone(UTC)).startswith("hoy")
     assert service._format_local_time(today_ready.astimezone(UTC)) == today_ready.strftime("%H:%M")
 
@@ -3225,6 +3348,48 @@ async def test_model_failure_recovers_large_multi_item_orders_deterministically(
         "Gaseosa cola 1.5L",
     ]
     assert [item.quantity for item in result.current_order.items] == [2, 1, 2]
+
+    await runtime.engine.dispose()
+
+
+async def test_apply_checkout_hints_can_fill_payment_from_the_message(tmp_path: Path):
+    """Checkout-hint recovery should also persist payment hints from the latest turn."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        service,
+        channel=Channel.DEV,
+        external_user_id="checkout-hints-user",
+        name="Martina",
+    )
+
+    async with service.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="checkout-hints-user")
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.DEV,
+            external_id="checkout-hints-user",
+            customer_id=customer.id,
+        )
+        current_order = await repository.add_item_to_current_order(
+            customer.id,
+            conversation.id,
+            sku="hamburguesa-completa",
+            quantity=1,
+        )
+        current_order = await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.PICKUP)
+        recovered_order = await service._apply_checkout_hints_from_message(
+            repository=repository,
+            customer_id=customer.id,
+            conversation_id=conversation.id,
+            current_order=current_order,
+            message_text="Pago cash.",
+        )
+        await session.commit()
+
+    assert recovered_order.payment_method is PaymentMethod.CASH
 
     await runtime.engine.dispose()
 

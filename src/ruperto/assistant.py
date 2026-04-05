@@ -710,15 +710,39 @@ class OrderingAssistantService:
                     user_text=user_text,
                     store_id=store_id,
                 )
-            reply = AssistantReply(
-                reply_text=self._build_order_review_reply(
+            current_order = await self._apply_checkout_hints_from_message(
+                repository=repository,
+                customer_id=customer_id,
+                conversation_id=conversation_id,
+                current_order=current_order,
+                message_text=user_text,
+            )
+            delay = await repository.get_estimated_delay(customer_id, conversation_id)
+            if current_order.payment_method is None:
+                reply = self._guide_reply_with_current_order(
+                    AssistantReply(
+                        reply_text="Seguimos con el pedido.",
+                        next_step=AssistantNextStep.CHOOSE_ITEMS,
+                        handoff=False,
+                    ),
                     customer=customer,
                     current_order=current_order,
+                    message_text=user_text,
+                    delay=delay,
                     store=store,
-                ),
-                next_step=AssistantNextStep.CONFIRM_ORDER,
-                handoff=False,
-            )
+                    order_changed_during_turn=True,
+                    item_lines_changed_during_turn=False,
+                )
+            else:
+                reply = AssistantReply(
+                    reply_text=self._build_order_review_reply(
+                        customer=customer,
+                        current_order=current_order,
+                        store=store,
+                    ),
+                    next_step=AssistantNextStep.CONFIRM_ORDER,
+                    handoff=False,
+                )
             await self._persist_direct_reply(
                 repository=repository,
                 conversation_id=conversation_id,
@@ -732,6 +756,68 @@ class OrderingAssistantService:
             reply=reply,
             current_order=current_order,
         )
+
+    async def _recover_informational_turn_result(
+        self,
+        *,
+        conversation_id: int,
+        customer_id: int,
+        customer: CustomerSnapshot,
+        user_text: str,
+    ) -> AssistantTurnResult:
+        """Recover a useful informational reply when the model tried to mutate state."""
+        async with self.session_factory() as session:
+            repository = BusinessRepository(session)
+            current_order = await repository.get_latest_order(customer_id, conversation_id)
+            reply = AssistantReply(
+                reply_text="Puedo ayudarte con información del menú o del envío sin tocar el pedido todavía.",
+                next_step=AssistantNextStep.CHOOSE_ITEMS,
+                handoff=False,
+            )
+            if self._message_requests_delivery_information(user_text):
+                reply = reply.model_copy(update={"reply_text": self._build_delivery_information_reply(user_text)})
+            else:
+                reply = await self._answer_menu_information_turn(
+                    reply,
+                    repository=repository,
+                    message_text=user_text,
+                    previous_user_message=self._extract_latest_user_text(
+                        await repository.load_conversation_messages(conversation_id)
+                    ),
+                    turn_policy=TurnPolicy(allow_order_mutations=False, allow_order_confirmation=False),
+                )
+            await self._persist_direct_reply(
+                repository=repository,
+                conversation_id=conversation_id,
+                user_text=user_text,
+                reply_text=reply.reply_text,
+            )
+            await session.commit()
+        return AssistantTurnResult(
+            conversation_id=conversation_id,
+            customer=customer,
+            reply=reply,
+            current_order=current_order if current_order is not None and current_order.items else None,
+        )
+
+    async def _apply_checkout_hints_from_message(
+        self,
+        *,
+        repository: BusinessRepository,
+        customer_id: int,
+        conversation_id: int,
+        current_order: OrderSnapshot,
+        message_text: str,
+    ) -> OrderSnapshot:
+        """Apply deterministic checkout hints from the current customer message."""
+        delivery_hint = self._detect_delivery_type_hint(message_text)
+        if delivery_hint is not None and current_order.delivery_type is None:
+            current_order = await repository.set_order_delivery_type(customer_id, conversation_id, delivery_hint)
+
+        payment_hint = self._detect_payment_method_hint(message_text)
+        if payment_hint is not None and current_order.payment_method is None:
+            current_order = await repository.set_order_payment_method(customer_id, conversation_id, payment_hint)
+        return current_order
 
     async def _run_agent_with_retries(
         self,
@@ -883,8 +969,15 @@ class OrderingAssistantService:
                     conversation_id=conversation_id,
                 ),
             )
+        except InformationalTurnMutationError:
+            return await self._recover_informational_turn_result(
+                conversation_id=conversation_id,
+                customer_id=customer_id,
+                customer=customer,
+                user_text=message_text,
+            )
         except MissingConfirmationSignalError:
-            if self._detect_payment_method_hint(message_text) is None or current_order_before_run is None:
+            if current_order_before_run is None:
                 raise
             return await self._recover_missing_confirmation_result(
                 conversation_id=conversation_id,
@@ -901,9 +994,7 @@ class OrderingAssistantService:
                 user_text=message_text,
                 store_id=resolved_store_id,
             )
-        except Exception as error:
-            if isinstance(error, (InformationalTurnMutationError, MissingConfirmationSignalError)):
-                raise
+        except Exception:  # noqa: BLE001
             return await self._build_model_unavailable_result(
                 conversation_id=conversation_id,
                 customer_id=customer_id,
@@ -1004,7 +1095,7 @@ class OrderingAssistantService:
                     current_order=current_order,
                 )
             delivery_info_request = self._message_requests_delivery_information(message_text)
-            if delivery_info_request and current_order is not None and current_order.items:
+            if delivery_info_request:
                 reply = self._stabilize_delivery_information_reply(reply, message_text=message_text)
             if not turn_policy.allow_order_mutations and not (
                 delivery_info_request and current_order is not None and current_order.items
@@ -1247,9 +1338,39 @@ class OrderingAssistantService:
     def _should_require_name_before_continuing(self, message_text: str) -> bool:
         """Return whether the current turn needs the customer's name before proceeding."""
         lowered = message_text.casefold()
+        if self._message_is_informational_menu_question(message_text):
+            return False
+        if self._message_requests_delivery_information(message_text):
+            return False
         if any(hint in lowered for hint in ORDER_INTENT_HINTS):
             return True
         return any(keyword in lowered for keyword in ("hamburguesa", "pizza", "empanada", "lomito", "milanesa"))
+
+    def _message_is_informational_menu_question(self, message_text: str) -> bool:
+        """Return whether the customer is browsing or comparing menu items without ordering yet."""
+        lowered = message_text.casefold()
+        if "?" not in message_text and "¿" not in message_text:
+            return False
+        if any(hint in lowered for hint in ORDER_INTENT_HINTS):
+            return False
+        if self._message_requests_total(message_text):
+            return True
+        return any(
+            keyword in lowered
+            for keyword in (
+                "hamburguesa",
+                "pizza",
+                "empanada",
+                "lomito",
+                "milanesa",
+                "wrap",
+                "ensalada",
+                "gaseosa",
+                "cerveza",
+                "postre",
+                "helado",
+            )
+        )
 
     def _extract_name_from_introduction(self, message_text: str) -> str | None:
         """Extract a first name from a longer self-introduction message."""
@@ -1623,6 +1744,15 @@ class OrderingAssistantService:
             )
         ):
             return PaymentMethod.CASH
+        return None
+
+    def _detect_delivery_type_hint(self, message_text: str) -> DeliveryType | None:
+        """Infer whether the customer just specified delivery or pickup."""
+        lowered = message_text.casefold()
+        if any(phrase in lowered for phrase in ("retiro", "retirar", "paso a buscar", "lo busco")):
+            return DeliveryType.PICKUP
+        if any(phrase in lowered for phrase in ("envío", "envio", "mandalo", "mandámelo", "mandamelo")):
+            return DeliveryType.DELIVERY
         return None
 
     def _message_requests_total(self, message_text: str) -> bool:
