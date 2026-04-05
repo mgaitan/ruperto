@@ -97,6 +97,13 @@ WEEKDAY_LABELS_ES = {
 }
 
 
+def round_delay_minutes(value: int) -> int:
+    """Round one delay estimate up to the next 5-minute mark."""
+    if value <= 0:
+        return 5
+    return ((value + 4) // 5) * 5
+
+
 def normalize_phone_number(value: str | None) -> str | None:
     """Normalize phone numbers to a compact identity-friendly representation."""
     if value is None:
@@ -804,6 +811,22 @@ class BusinessRepository:
         await self.session.flush()
         return await self._build_order_snapshot(order)
 
+    async def reset_current_order(
+        self,
+        customer_id: int,
+        conversation_id: int,
+    ) -> OrderSnapshot:
+        """Clear all current draft items so the order can be rebuilt after a correction."""
+        order = await self._require_current_order(customer_id, conversation_id)
+        items = await self._load_order_items(order.id)
+        for item in items:
+            await self.session.delete(item)
+        await self.session.flush()
+        order.updated_at = utc_now()
+        await self._refresh_order_total(order)
+        await self.session.flush()
+        return await self._build_order_snapshot(order)
+
     async def confirm_current_order(
         self,
         customer_id: int,
@@ -871,8 +894,8 @@ class BusinessRepository:
                 return DelayEstimateSnapshot(
                     active_orders_ahead=active_orders_ahead,
                     base_minutes=DEFAULT_DELAY_MINUTES,
-                    estimated_minutes=estimated_minutes,
-                    display_text=f"{estimated_minutes} minutos aproximadamente",
+                    estimated_minutes=round_delay_minutes(estimated_minutes),
+                    display_text=f"{round_delay_minutes(estimated_minutes)} minutos aproximadamente",
                 )
             active_orders_ahead = await self.count_active_orders_ahead_by_order_id(latest_order.id)
             return self._estimate_delay_from_snapshot(latest_order, active_orders_ahead=active_orders_ahead)
@@ -1085,7 +1108,7 @@ class BusinessRepository:
     ) -> DelayEstimateSnapshot:
         """Compute an MVP delay estimate based on preparation time and kitchen load."""
         base_minutes = self._estimate_preparation_minutes(order)
-        estimated_minutes = base_minutes + (active_orders_ahead * KITCHEN_LOAD_COEFFICIENT_MINUTES)
+        estimated_minutes = round_delay_minutes(base_minutes + (active_orders_ahead * KITCHEN_LOAD_COEFFICIENT_MINUTES))
 
         return DelayEstimateSnapshot(
             active_orders_ahead=active_orders_ahead,

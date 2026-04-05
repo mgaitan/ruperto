@@ -58,10 +58,19 @@ Run the development web chat UI:
 uv run ruperto web-chat
 ```
 
+Or open the browser demo page served by the main app:
+
+- `http://127.0.0.1:8000/demo/chat`
+
+This page is intentionally simple and talks to `/api/dev/messages` directly.
+It lets you switch between multiple demo phone numbers so you can emulate
+returning customers with remembered context.
+
 You should then have:
 
 - API root at `http://127.0.0.1:8000/`
 - health check at `http://127.0.0.1:8000/healthz`
+- browser demo chat at `http://127.0.0.1:8000/demo/chat`
 - staff dashboard at `http://127.0.0.1:8000/dashboard`
 - store profile at `http://127.0.0.1:8000/api/store-profile`
 - menu listing at `http://127.0.0.1:8000/api/menu-items`
@@ -94,6 +103,9 @@ The demo catalog now includes a broader synthetic menu with pizzas,
 hamburgers, lomitos, milanesas, wraps, empanadas, drinks, and desserts so
 local development can exercise more realistic ordering conversations and
 simple add-on suggestions.
+Informational menu questions are also handled more proactively now: if a
+customer asks for a category such as soft drinks, the assistant should list
+concrete options with prices instead of answering with a bare yes/no.
 Compact customer messages are also handled more naturally now, so the assistant
 can reuse cues such as a self-introduction, a payment hint like `te pago acá`,
 and a same-turn price question without asking for the same detail twice.

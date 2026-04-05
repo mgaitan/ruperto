@@ -18,10 +18,12 @@ from ruperto.assistant import (
     MODEL_UNAVAILABLE_REPLY,
     MissingConfirmationSignalError,
     OrderingAssistantService,
+    TurnPolicy,
     add_item_to_current_order,
     build_google_model,
     confirm_current_order,
     get_store_availability,
+    reset_current_order,
     set_order_delivery_address,
     set_order_delivery_type,
     set_order_payment_method,
@@ -650,10 +652,58 @@ async def test_assistant_asks_for_name_before_taking_the_first_order(tmp_path: P
         "tu nombre" in first_reply.reply.reply_text.lower() or "cómo te llamás" in first_reply.reply.reply_text.lower()
     )
     assert second_reply.customer.name == "Martina"
-    assert second_reply.reply.next_step == AssistantNextStep.CHOOSE_DELIVERY
+    assert second_reply.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
     assert "hamburguesa completa" in second_reply.reply.reply_text.lower()
-    assert "envío o retirás" in second_reply.reply.reply_text.lower()
+    assert "¿querés sumar algo más?" in second_reply.reply.reply_text.lower()
     assert second_reply.current_order is not None
+
+    await runtime.engine.dispose()
+
+
+async def test_assistant_allows_informational_first_turns_without_asking_for_name(tmp_path: Path):
+    """Informational questions should not be blocked by the onboarding name gate."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+
+    reply = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-informativo",
+        message_text="hola tenés para enviar?",
+        model=FunctionModel(informational_delivery_model),
+    )
+
+    assert reply.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
+    assert "hacemos envíos" in reply.reply.reply_text.lower()
+    assert "tu nombre" not in reply.reply.reply_text.lower()
+    assert reply.customer.name is None
+
+    await runtime.engine.dispose()
+
+
+async def test_assistant_does_not_ask_for_name_mid_conversation_when_order_starts_later(tmp_path: Path):
+    """A nameless conversation that already started should not be reset by onboarding mid-flow."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+
+    await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-sin-nombre-en-flujo",
+        message_text="hola tenés para enviar?",
+        model=FunctionModel(informational_delivery_model),
+    )
+    reply = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-sin-nombre-en-flujo",
+        message_text="quiero una pizza",
+        model=FunctionModel(transactional_model),
+    )
+
+    assert reply.reply.next_step != AssistantNextStep.ASK_NAME
+    assert "tu nombre" not in reply.reply.reply_text.lower()
 
     await runtime.engine.dispose()
 
@@ -680,6 +730,30 @@ def onboarding_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResp
             )
         ],
         model_name="function:test-onboarding",
+    )
+
+
+def informational_delivery_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Answer an informational question without requiring a name upfront."""
+    tool_returns = collect_tool_returns(messages)
+    if "get_store_availability" not in tool_returns:
+        return ModelResponse(
+            parts=[ToolCallPart("get_store_availability", {})],
+            model_name="function:test-informational-delivery",
+        )
+
+    return ModelResponse(
+        parts=[
+            ToolCallPart(
+                info.output_tools[0].name,
+                {
+                    "reply_text": "Sí, hacemos envíos. Si querés, decime qué te gustaría pedir y te paso opciones.",
+                    "next_step": "choose_items",
+                    "handoff": False,
+                },
+            )
+        ],
+        model_name="function:test-informational-delivery",
     )
 
 
@@ -727,7 +801,7 @@ async def test_assistant_reasks_for_name_when_the_reply_is_not_a_name(tmp_path: 
     await service.handle_customer_message(
         channel=Channel.DEV,
         external_user_id="cliente-repregunta",
-        message_text="Hola",
+        message_text="quiero una pizza",
         model=FunctionModel(transactional_model),
     )
     second_reply = await service.handle_customer_message(
@@ -793,9 +867,9 @@ async def test_assistant_resumes_pending_request_after_collecting_name(tmp_path:
     assert first_reply.reply.next_step == AssistantNextStep.ASK_NAME
     assert "así sigo con lo que me pediste" in first_reply.reply.reply_text.lower()
     assert resumed_reply.customer.name == "Martín"
-    assert resumed_reply.reply.next_step == AssistantNextStep.CHOOSE_DELIVERY
+    assert resumed_reply.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
     assert "hamburguesa completa" in resumed_reply.reply.reply_text.lower()
-    assert "envío o retirás" in resumed_reply.reply.reply_text.lower()
+    assert "¿querés sumar algo más?" in resumed_reply.reply.reply_text.lower()
     assert resumed_reply.current_order is not None
     assert resumed_reply.current_order.items[0].name == "Hamburguesa completa"
     assert resumed_reply.current_order.delivery_type is None
@@ -836,7 +910,15 @@ async def test_name_candidate_heuristics_cover_edge_cases(tmp_path: Path):
         service._extract_latest_assistant_text([ModelRequest(parts=[ToolReturnPart(tool_name="x", content={})])])
         is None
     )
+    assert service._has_prior_conversation([]) is False
+    assert (
+        service._has_prior_conversation(
+            cast(list[ModelMessage], [ModelResponse(parts=[TextPart(content="Hola")], model_name="test")])
+        )
+        is True
+    )
     assert service._detect_payment_method_hint("te pago acá") is PaymentMethod.CASH
+    assert service._detect_payment_method_hint("cash") is PaymentMethod.CASH
     assert service._detect_payment_method_hint("te transfiero") is PaymentMethod.TRANSFER
     assert service._detect_payment_method_hint("te pido link de pago") is PaymentMethod.CARD_LINK
     assert service._detect_payment_method_hint("hola") is None
@@ -846,7 +928,9 @@ async def test_name_candidate_heuristics_cover_edge_cases(tmp_path: Path):
     assert "Rotisería Test" in service._build_name_prompt(conversation_id=1)
     assert service._should_store_pending_message_before_name("quiero una hamburguesa y bebida") is True
     assert service._should_store_pending_message_before_name("tenés postre?") is True
+    assert service._should_store_pending_message_before_name("tenés menú?") is True
     assert service._should_store_pending_message_before_name("cuánto es?") is True
+    assert service._should_store_pending_message_before_name("combo familiar") is True
     assert service._should_store_pending_message_before_name("   ") is False
     assert (
         "así sigo con lo que me pediste"
@@ -855,6 +939,75 @@ async def test_name_candidate_heuristics_cover_edge_cases(tmp_path: Path):
             remembers_pending_message=True,
         ).lower()
     )
+
+    await runtime.engine.dispose()
+
+
+async def test_name_capture_without_pending_message_replies_with_confirmation(tmp_path: Path, mocker):
+    """If no pending request exists, a provided name gets a simple confirmation reply."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    repository = mocker.AsyncMock()
+    updated_customer = CustomerSnapshot(id=1, name="Ana", phone_number=None, default_address=None)
+    repository.update_customer_name.return_value = updated_customer
+
+    history = cast(
+        list[ModelMessage],
+        [
+            ModelResponse(
+                parts=[TextPart(content="🙂 Necesito tu nombre para seguir. ¿Cómo te llamás?")],
+                model_name="test",
+            )
+        ],
+    )
+    result = await service._maybe_handle_missing_customer_name(
+        repository=repository,
+        customer=CustomerSnapshot(id=1, name=None, phone_number=None, default_address=None),
+        conversation_id=1,
+        history=history,
+        message_text="Ana",
+        availability=StoreAvailabilitySnapshot(is_open=True, message_text=""),
+        pending_customer_message=None,
+        latest_assistant_text="🙂 Necesito tu nombre para seguir. ¿Cómo te llamás?",
+    )
+
+    assert result.direct_reply is not None
+    assert result.direct_reply.reply.reply_text == "¡Gracias, Ana! 😄 ¿Qué querés pedir hoy?"
+    repository.set_pending_customer_message.assert_not_called()
+
+    await runtime.engine.dispose()
+
+
+async def test_waiting_for_name_with_pending_message_resumes_without_direct_reply(tmp_path: Path, mocker):
+    """If there was a pending request, providing the name should resume that request."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    repository = mocker.AsyncMock()
+    updated_customer = CustomerSnapshot(id=1, name="Ana", phone_number=None, default_address=None)
+    repository.update_customer_name.return_value = updated_customer
+
+    result = await service._maybe_handle_missing_customer_name(
+        repository=repository,
+        customer=CustomerSnapshot(id=1, name=None, phone_number=None, default_address=None),
+        conversation_id=1,
+        history=cast(
+            list[ModelMessage],
+            [
+                ModelResponse(
+                    parts=[TextPart(content="🙂 Necesito tu nombre para seguir. ¿Cómo te llamás?")],
+                    model_name="test",
+                )
+            ],
+        ),
+        message_text="Ana",
+        availability=StoreAvailabilitySnapshot(is_open=True, message_text=""),
+        pending_customer_message="quiero una pizza",
+        latest_assistant_text="🙂 Necesito tu nombre para seguir. ¿Cómo te llamás?",
+    )
+
+    assert result.direct_reply is None
+    assert result.resumed_pending_message == "quiero una pizza"
+    repository.set_pending_customer_message.assert_awaited_once_with(1, None)
 
     await runtime.engine.dispose()
 
@@ -920,6 +1073,68 @@ async def test_turn_context_hint_mentions_other_payment_cues(tmp_path: Path):
     assert "transferencia" in transfer_hint
     assert card_link_hint is not None
     assert "link o tarjeta" in card_link_hint
+
+    await runtime.engine.dispose()
+
+
+async def test_turn_context_hint_for_menu_prices_prefers_category_over_order_total(tmp_path: Path):
+    """Price follow-ups about one category should not be reframed as order totals."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+
+    hint = service._build_turn_context_hint(
+        customer=CustomerSnapshot(id=1, name="Martín", phone_number=None, default_address=None),
+        message_text="¿Cuánto sale?",
+        current_order=None,
+        previous_user_message="¿Tenés gaseosas?",
+    )
+
+    assert hint is not None
+    assert "consultando por gaseosas" in hint
+    assert "no al total del pedido" in hint
+
+    await runtime.engine.dispose()
+
+
+async def test_turn_context_hint_marks_order_corrections_and_variant_splits(tmp_path: Path):
+    """Corrections like `uno de cada` should be treated as fixes, not extra items."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    current_order = OrderSnapshot(
+        id=1,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=None,
+        delivery_address=None,
+        payment_method=None,
+        total_amount_cents=1420000,
+        total_amount_display="$ 14.200",
+        items=[
+            OrderItemSnapshot(
+                menu_item_id=1,
+                name="Lomito especial",
+                quantity=1,
+                unit_price_cents=1420000,
+                unit_price_display="$ 14.200",
+                notes=None,
+            )
+        ],
+    )
+
+    hint = service._build_turn_context_hint(
+        customer=CustomerSnapshot(id=1, name="Ana", phone_number=None, default_address=None),
+        message_text="dije uno de cada uno",
+        current_order=current_order,
+        latest_assistant_text=(
+            "¿Qué tipo de lomo te gustaría, Ana? Tenemos:\n\nLomito completo ($13.200)\nLomito especial ($14.200)"
+        ),
+    )
+
+    assert hint is not None
+    assert "corrigiendo el pedido actual" in hint
+    assert "reset_current_order" in hint
+    assert "una unidad de cada opción" in hint
 
     await runtime.engine.dispose()
 
@@ -1064,6 +1279,90 @@ async def test_turn_policy_blocks_order_mutations_for_menu_only_questions(tmp_pa
     await runtime.engine.dispose()
 
 
+async def test_answer_menu_information_turn_lists_real_options_for_gaseosas(tmp_path: Path):
+    """Informational drink questions should be answered with concrete options and prices."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        reply = await service._answer_menu_information_turn(
+            AssistantReply(reply_text="Sí, tenemos.", next_step=AssistantNextStep.CHOOSE_ITEMS),
+            repository=repository,
+            message_text="¿Tenés gaseosas?",
+            previous_user_message=None,
+            turn_policy=TurnPolicy(allow_order_mutations=False, allow_order_confirmation=False),
+        )
+
+    lowered_reply = reply.reply_text.lower()
+    assert "tenemos gaseosas" in lowered_reply
+    assert "gaseosa cola 1.5l" in lowered_reply
+    assert "$ 3.200" in lowered_reply
+    assert "sumo una al pedido" in lowered_reply
+
+    await runtime.engine.dispose()
+
+
+async def test_answer_menu_information_turn_uses_previous_focus_for_price_follow_up(tmp_path: Path):
+    """A follow-up `¿cuánto sale?` should reuse the previous category in focus."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        reply = await service._answer_menu_information_turn(
+            AssistantReply(
+                reply_text="Tu pedido actual suma $ 11.900.",
+                next_step=AssistantNextStep.CHOOSE_ITEMS,
+            ),
+            repository=repository,
+            message_text="¿Cuánto sale?",
+            previous_user_message="¿Tenés gaseosas?",
+            turn_policy=TurnPolicy(allow_order_mutations=False, allow_order_confirmation=False),
+        )
+
+    lowered_reply = reply.reply_text.lower()
+    assert "tenemos gaseosas" in lowered_reply
+    assert "tu pedido actual suma" not in lowered_reply
+    assert "¿cuál te gustaría sumar?" in lowered_reply
+
+    await runtime.engine.dispose()
+
+
+async def test_filter_menu_options_for_unknown_focus_returns_empty_list(tmp_path: Path):
+    """Unknown informational focuses should not match any menu items."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+
+    assert service._filter_menu_options_for_focus([], focus="desconocido") == []
+
+    await runtime.engine.dispose()
+
+
+async def test_answer_menu_information_turn_keeps_original_reply_when_no_items_match(tmp_path: Path):
+    """If a focus yields no concrete menu items, the original reply should survive."""
+    service = OrderingAssistantService(
+        session_factory=cast(Any, None),
+        settings=build_settings(tmp_path),
+    )
+    repository = AsyncMock()
+    repository.list_menu_items.return_value = []
+
+    reply = await service._answer_menu_information_turn(
+        AssistantReply(reply_text="Sí, tenemos eso.", next_step=AssistantNextStep.CHOOSE_ITEMS),
+        repository=cast(Any, repository),
+        message_text="¿Tenés papas?",
+        previous_user_message=None,
+        turn_policy=TurnPolicy(allow_order_mutations=False, allow_order_confirmation=False),
+    )
+
+    assert reply.reply_text == "Sí, tenemos eso."
+
+
 async def test_turn_policy_allows_order_building_but_not_confirmation_by_default(tmp_path: Path):
     """Normal ordering intents can mutate and confirm during the same turn."""
     runtime = create_database_runtime(build_settings(tmp_path))
@@ -1138,6 +1437,8 @@ async def test_order_tools_reject_informational_turns(mocker):
         await set_order_delivery_address(ctx, "Lavalle 123")
     with pytest.raises(ValueError, match="solo informativo"):
         await set_order_payment_method(ctx, PaymentMethod.CASH)
+    with pytest.raises(ValueError, match="solo informativo"):
+        await reset_current_order(ctx)
 
     with pytest.raises(ValueError, match="señal explícita"):
         await confirm_current_order(ctx)
@@ -1353,8 +1654,8 @@ async def test_ground_reply_falls_back_to_no_changes_when_draft_exists(tmp_path:
     await runtime.engine.dispose()
 
 
-async def test_guide_reply_with_current_order_asks_for_missing_delivery_and_payment(tmp_path: Path):
-    """Draft guidance should deterministically ask for whichever checkout field is still missing."""
+async def test_guide_reply_with_current_order_offers_add_on_before_checkout(tmp_path: Path):
+    """Simple drafts should first offer one add-on before moving into checkout."""
     runtime = create_database_runtime(build_settings(tmp_path))
     service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
     customer = CustomerSnapshot(id=1, name="Pirulo", phone_number=None, default_address="Lavalle 12333")
@@ -1386,11 +1687,38 @@ async def test_guide_reply_with_current_order_asks_for_missing_delivery_and_paym
         ],
     )
 
+    add_on_reply = service._guide_reply_with_current_order(
+        AssistantReply(reply_text="Texto libre", next_step=AssistantNextStep.CHOOSE_ITEMS),
+        customer=customer,
+        current_order=order,
+        delay=delay,
+        item_lines_changed_during_turn=True,
+    )
+    assert add_on_reply.next_step == AssistantNextStep.CHOOSE_ITEMS
+    assert "papas, una bebida o un postre" in add_on_reply.reply_text.lower()
+    assert (
+        "¿querés sumar algo más?" in add_on_reply.reply_text.lower()
+        or "te tienta algo más" in add_on_reply.reply_text.lower()
+    )
+    assert service._pick_add_on_suggestion(order) == "unas papas, una bebida o un postre"
+
+    order.items.append(
+        OrderItemSnapshot(
+            menu_item_id=2,
+            name="Agua sin gas 500ml",
+            quantity=1,
+            unit_price_cents=180000,
+            unit_price_display="$ 1.800",
+            notes=None,
+        )
+    )
+
     delivery_reply = service._guide_reply_with_current_order(
         AssistantReply(reply_text="Texto libre", next_step=AssistantNextStep.CHOOSE_ITEMS),
         customer=customer,
         current_order=order,
         delay=delay,
+        item_lines_changed_during_turn=False,
     )
     assert delivery_reply.next_step == AssistantNextStep.CHOOSE_DELIVERY
     assert "envío o retirás" in delivery_reply.reply_text.lower()
@@ -1401,6 +1729,7 @@ async def test_guide_reply_with_current_order_asks_for_missing_delivery_and_paym
         customer=customer,
         current_order=order,
         delay=delay,
+        item_lines_changed_during_turn=False,
     )
     assert address_reply.next_step == AssistantNextStep.ASK_ADDRESS
     assert "lavalle 12333" in address_reply.reply_text.lower()
@@ -1411,6 +1740,7 @@ async def test_guide_reply_with_current_order_asks_for_missing_delivery_and_paym
         customer=customer,
         current_order=order,
         delay=delay,
+        item_lines_changed_during_turn=False,
     )
     assert payment_reply.next_step == AssistantNextStep.CHOOSE_PAYMENT
     assert "efectivo" in payment_reply.reply_text.lower()
@@ -1421,6 +1751,7 @@ async def test_guide_reply_with_current_order_asks_for_missing_delivery_and_paym
         customer=customer,
         current_order=order,
         delay=delay,
+        item_lines_changed_during_turn=False,
     )
     assert unchanged_reply.reply_text == "Texto libre"
 
@@ -1431,8 +1762,289 @@ async def test_guide_reply_with_current_order_asks_for_missing_delivery_and_paym
         customer=customer_without_default,
         current_order=order.model_copy(update={"payment_method": None}),
         delay=delay,
+        item_lines_changed_during_turn=False,
     )
     assert "pasame la dirección de envío" in address_without_default.reply_text.lower()
+
+    pizza_order = order.model_copy(
+        update={
+            "items": [
+                OrderItemSnapshot(
+                    menu_item_id=3,
+                    name="Pizza especial",
+                    quantity=1,
+                    unit_price_cents=1390000,
+                    unit_price_display="$ 13.900",
+                    notes=None,
+                )
+            ],
+            "delivery_type": None,
+            "delivery_address": None,
+            "payment_method": None,
+        }
+    )
+    assert service._pick_add_on_suggestion(pizza_order) == "una bebida o un postre"
+
+    generic_order = order.model_copy(
+        update={
+            "items": [
+                OrderItemSnapshot(
+                    menu_item_id=4,
+                    name="Ensalada César",
+                    quantity=1,
+                    unit_price_cents=870000,
+                    unit_price_display="$ 8.700",
+                    notes=None,
+                )
+            ],
+            "delivery_type": None,
+            "delivery_address": None,
+            "payment_method": None,
+        }
+    )
+    assert service._pick_add_on_suggestion(generic_order) == "una bebida o un postre"
+    assert service._should_offer_add_on(order.model_copy(update={"items": []})) is False
+    assert (
+        service._pick_add_on_suggestion(
+            order.model_copy(
+                update={
+                    "items": [
+                        OrderItemSnapshot(
+                            menu_item_id=5,
+                            name="Hamburguesa completa",
+                            quantity=1,
+                            unit_price_cents=950000,
+                            unit_price_display="$ 9.500",
+                            notes=None,
+                        ),
+                        OrderItemSnapshot(
+                            menu_item_id=6,
+                            name="Cerveza rubia lata",
+                            quantity=1,
+                            unit_price_cents=290000,
+                            unit_price_display="$ 2.900",
+                            notes=None,
+                        ),
+                    ]
+                }
+            )
+        )
+        == "un postre"
+    )
+    assert (
+        service._pick_add_on_suggestion(
+            order.model_copy(
+                update={
+                    "items": [
+                        OrderItemSnapshot(
+                            menu_item_id=7,
+                            name="Hamburguesa completa",
+                            quantity=1,
+                            unit_price_cents=950000,
+                            unit_price_display="$ 9.500",
+                            notes=None,
+                        ),
+                        OrderItemSnapshot(
+                            menu_item_id=8,
+                            name="Helado 1/4 kg",
+                            quantity=1,
+                            unit_price_cents=420000,
+                            unit_price_display="$ 4.200",
+                            notes=None,
+                        ),
+                    ]
+                }
+            )
+        )
+        == "una bebida"
+    )
+    assert (
+        service._pick_add_on_suggestion(
+            order.model_copy(
+                update={
+                    "items": [
+                        OrderItemSnapshot(
+                            menu_item_id=9,
+                            name="Hamburguesa completa",
+                            quantity=1,
+                            unit_price_cents=950000,
+                            unit_price_display="$ 9.500",
+                            notes=None,
+                        ),
+                        OrderItemSnapshot(
+                            menu_item_id=10,
+                            name="Gaseosa cola 1.5L",
+                            quantity=1,
+                            unit_price_cents=320000,
+                            unit_price_display="$ 3.200",
+                            notes=None,
+                        ),
+                        OrderItemSnapshot(
+                            menu_item_id=11,
+                            name="Brownie con nuez",
+                            quantity=1,
+                            unit_price_cents=310000,
+                            unit_price_display="$ 3.100",
+                            notes=None,
+                        ),
+                    ]
+                }
+            )
+        )
+        == "algo más para acompañar"
+    )
+
+    await runtime.engine.dispose()
+
+
+async def test_guide_reply_with_current_order_preserves_item_clarifications_when_order_did_not_change(tmp_path: Path):
+    """Checkout guidance should not overwrite a clarification if the draft stayed the same."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    customer = CustomerSnapshot(id=1, name="Ana", phone_number=None, default_address=None)
+    order = OrderSnapshot(
+        id=1,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=None,
+        delivery_address=None,
+        payment_method=None,
+        total_amount_cents=2740000,
+        total_amount_display="$ 27.400",
+        items=[
+            OrderItemSnapshot(
+                menu_item_id=1,
+                name="Lomito especial",
+                quantity=1,
+                unit_price_cents=1420000,
+                unit_price_display="$ 14.200",
+                notes=None,
+            ),
+            OrderItemSnapshot(
+                menu_item_id=2,
+                name="Lomito completo",
+                quantity=1,
+                unit_price_cents=1320000,
+                unit_price_display="$ 13.200",
+                notes=None,
+            ),
+        ],
+    )
+
+    clarification_reply = service._guide_reply_with_current_order(
+        AssistantReply(
+            reply_text="¿Querés papas clásicas o papas cheddar y bacon?",
+            next_step=AssistantNextStep.CHOOSE_ITEMS,
+        ),
+        customer=customer,
+        current_order=order,
+        delay=None,
+        order_changed_during_turn=False,
+        item_lines_changed_during_turn=False,
+    )
+
+    assert clarification_reply.reply_text == "¿Querés papas clásicas o papas cheddar y bacon?"
+    assert clarification_reply.next_step == AssistantNextStep.CHOOSE_ITEMS
+
+    await runtime.engine.dispose()
+
+
+async def test_guide_reply_with_current_order_offers_add_on_even_when_delivery_is_already_known(tmp_path: Path):
+    """A freshly added main dish can still trigger upsell before asking for the address."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    customer = CustomerSnapshot(id=1, name="Pedro", phone_number=None, default_address=None)
+    order = OrderSnapshot(
+        id=1,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=DeliveryType.DELIVERY,
+        delivery_address=None,
+        payment_method=None,
+        total_amount_cents=1680000,
+        total_amount_display="$ 16.800",
+        items=[
+            OrderItemSnapshot(
+                menu_item_id=1,
+                name="Pizza rúcula y crudo",
+                quantity=1,
+                unit_price_cents=1680000,
+                unit_price_display="$ 16.800",
+                notes=None,
+            )
+        ],
+    )
+
+    reply = service._guide_reply_with_current_order(
+        AssistantReply(
+            reply_text="Dale. Pasame la dirección de envío, por favor.", next_step=AssistantNextStep.ASK_ADDRESS
+        ),
+        customer=customer,
+        current_order=order,
+        delay=None,
+        item_lines_changed_during_turn=True,
+    )
+
+    assert reply.next_step == AssistantNextStep.CHOOSE_ITEMS
+    assert "bebida o un postre" in reply.reply_text.lower()
+
+    await runtime.engine.dispose()
+
+
+async def test_guide_reply_with_current_order_offers_drink_or_dessert_after_main_and_side(tmp_path: Path):
+    """A draft with a main dish and a side can still trigger one more useful add-on suggestion."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    customer = CustomerSnapshot(id=1, name="Pedro", phone_number=None, default_address=None)
+    order = OrderSnapshot(
+        id=7,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=None,
+        delivery_address=None,
+        payment_method=None,
+        total_amount_cents=1320000,
+        total_amount_display="$ 13.200",
+        items=[
+            OrderItemSnapshot(
+                menu_item_id=1,
+                name="Sanguche de milanesa",
+                quantity=1,
+                unit_price_cents=890000,
+                unit_price_display="$ 8.900",
+                notes=None,
+            ),
+            OrderItemSnapshot(
+                menu_item_id=2,
+                name="Papas fritas clásicas",
+                quantity=1,
+                unit_price_cents=430000,
+                unit_price_display="$ 4.300",
+                notes=None,
+            ),
+        ],
+    )
+
+    reply = service._guide_reply_with_current_order(
+        AssistantReply(
+            reply_text=(
+                "Anotado, Pedro: hasta ahora va 1 x Sanguche de milanesa, "
+                "1 x Papas fritas clásicas por $ 13.200. "
+                "¿Querés envío o retirás por el local?"
+            ),
+            next_step=AssistantNextStep.CHOOSE_DELIVERY,
+        ),
+        customer=customer,
+        current_order=order,
+        delay=None,
+        item_lines_changed_during_turn=True,
+    )
+
+    assert reply.next_step == AssistantNextStep.CHOOSE_ITEMS
+    assert "bebida o un postre" in reply.reply_text.lower()
 
     await runtime.engine.dispose()
 
@@ -1636,6 +2248,18 @@ async def test_scheduling_and_next_step_helpers_cover_remaining_branches(tmp_pat
     assert (
         service._build_timing_prompt_fragment(
             current_order=base_order.model_copy(update={"requested_ready_at": None}),
+            delay=DelayEstimateSnapshot(
+                active_orders_ahead=0,
+                base_minutes=17,
+                estimated_minutes=20,
+                display_text="20 minutos aproximadamente",
+            ),
+        )
+        == ""
+    )
+    assert (
+        service._build_timing_prompt_fragment(
+            current_order=base_order.model_copy(update={"requested_ready_at": None}),
             delay=None,
         )
         == ""
@@ -1644,5 +2268,184 @@ async def test_scheduling_and_next_step_helpers_cover_remaining_branches(tmp_pat
     assert service._extract_requested_ready_at("para las 25", timezone_name=STORE_TIMEZONE) is None
     assert parsed_tomorrow is not None
     assert service._describe_order_ready_time(parsed_tomorrow).startswith("mañana")
+
+    await runtime.engine.dispose()
+
+
+def cash_checkout_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Drive the last checkout turn by setting cash and confirming the draft."""
+    tool_returns = collect_tool_returns(messages)
+    if "set_order_payment_method" not in tool_returns:
+        return ModelResponse(
+            parts=[ToolCallPart("set_order_payment_method", {"payment_method": "cash"})],
+            model_name="function:test-cash-checkout",
+        )
+    if "confirm_current_order" not in tool_returns:
+        return ModelResponse(
+            parts=[ToolCallPart("confirm_current_order", {})],
+            model_name="function:test-cash-checkout",
+        )
+    order = tool_returns["confirm_current_order"]
+    return ModelResponse(
+        parts=[
+            ToolCallPart(
+                info.output_tools[0].name,
+                {
+                    "reply_text": f"Pedido confirmado por {order.total_amount_display}.",
+                    "next_step": "complete",
+                    "handoff": False,
+                },
+            )
+        ],
+        model_name="function:test-cash-checkout",
+    )
+
+
+def corrected_lomito_mix_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Correct a mistaken draft by rebuilding it as one of each lomito."""
+    tool_returns = collect_tool_returns(messages)
+    if "reset_current_order" not in tool_returns:
+        return ModelResponse(
+            parts=[ToolCallPart("reset_current_order", {})],
+            model_name="function:test-corrected-lomito-mix",
+        )
+    if "add_item_to_current_order" not in tool_returns:
+        return ModelResponse(
+            parts=[ToolCallPart("add_item_to_current_order", {"sku": "lomito-completo", "quantity": 1})],
+            model_name="function:test-corrected-lomito-mix",
+        )
+    add_calls = [
+        part
+        for message in messages
+        if isinstance(message, ModelResponse)
+        for part in message.parts
+        if isinstance(part, ToolCallPart) and part.tool_name == "add_item_to_current_order"
+    ]
+    if len(add_calls) == 1:
+        return ModelResponse(
+            parts=[ToolCallPart("add_item_to_current_order", {"sku": "lomito-especial", "quantity": 1})],
+            model_name="function:test-corrected-lomito-mix",
+        )
+    return ModelResponse(
+        parts=[
+            ToolCallPart(
+                info.output_tools[0].name,
+                {
+                    "reply_text": "Listo, te dejo uno de cada lomito.",
+                    "next_step": "choose_delivery",
+                    "handoff": False,
+                },
+            )
+        ],
+        model_name="function:test-corrected-lomito-mix",
+    )
+
+
+async def test_cash_payment_hint_allows_checkout_confirmation(tmp_path: Path):
+    """A mixed Spanish/English cash hint should not crash the checkout flow."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        service,
+        channel=Channel.DEV,
+        external_user_id="cash-checkout-user",
+        name="Martín",
+    )
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="cash-checkout-user")
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.DEV,
+            external_id="cash-checkout-user",
+            customer_id=customer.id,
+        )
+        await repository.add_item_to_current_order(
+            customer.id,
+            conversation.id,
+            sku="hamburguesa-doble",
+            quantity=1,
+        )
+        await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.PICKUP)
+        await session.commit()
+
+    result = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cash-checkout-user",
+        message_text="pago en el local, cash",
+        model=FunctionModel(cash_checkout_model),
+    )
+
+    assert "**pedido**" in result.reply.reply_text.lower()
+    assert "hamburguesa doble cheddar" in result.reply.reply_text.lower()
+    assert "**pago**" in result.reply.reply_text.lower()
+    assert "efectivo" in result.reply.reply_text.lower()
+    assert result.current_order is not None
+    assert result.current_order.payment_method is PaymentMethod.CASH
+    assert result.current_order.status is OrderStatus.CONFIRMED
+
+    await runtime.engine.dispose()
+
+
+async def test_customer_correction_can_rebuild_the_current_order(tmp_path: Path):
+    """Corrections should be able to replace mistaken draft lines instead of stacking more items."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        service,
+        channel=Channel.DEV,
+        external_user_id="lomito-correction-user",
+        name="Ana",
+    )
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="lomito-correction-user")
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.DEV,
+            external_id="lomito-correction-user",
+            customer_id=customer.id,
+        )
+        await repository.add_item_to_current_order(
+            customer.id,
+            conversation.id,
+            sku="lomito-especial",
+            quantity=1,
+        )
+        await repository.append_conversation_messages(
+            conversation.id,
+            [
+                ModelResponse(
+                    parts=[
+                        TextPart(
+                            content=(
+                                "¿Qué tipo de lomo te gustaría, Ana? Tenemos:\n\n"
+                                "Lomito completo ($13.200)\n"
+                                "Lomito especial ($14.200)"
+                            )
+                        )
+                    ],
+                    model_name="ruperto:test",
+                )
+            ],
+        )
+        await session.commit()
+
+    result = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="lomito-correction-user",
+        message_text="dije uno de cada uno",
+        model=FunctionModel(corrected_lomito_mix_model),
+    )
+
+    assert result.current_order is not None
+    assert [item.name for item in result.current_order.items] == ["Lomito completo", "Lomito especial"]
+    assert result.current_order.total_amount_display == "$ 27.400"
+    assert result.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
+    assert "papas, una bebida o un postre" in result.reply.reply_text.lower()
 
     await runtime.engine.dispose()

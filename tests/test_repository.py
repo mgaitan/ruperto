@@ -21,6 +21,7 @@ from ruperto.repository import (
     STORE_HOURS_SLOT_REQUIRES_BOTH_TIMES_MESSAGE,
     BusinessRepository,
     normalize_phone_number,
+    round_delay_minutes,
 )
 from ruperto.schemas import StoreBusinessHoursSnapshot, StoreProfileUpdateRequest
 
@@ -29,12 +30,16 @@ EXPECTED_HISTORY_MESSAGES = 2
 EXPECTED_ORDER_TOTAL = 1900000
 EXPECTED_SINGLE_BURGER_TOTAL = 950000
 EXPECTED_DELAY_MINUTES = 22
+ROUNDED_DELAY_MINUTES = 25
 DEFAULT_DELAY_MINUTES = 25
 DRAFT_DELAY_MINUTES = 15
 PICKUP_DELAY_MINUTES = 15
 LARGE_ORDER_DELAY_MINUTES = 31
+ROUNDED_LARGE_ORDER_DELAY_MINUTES = 35
 KITCHEN_LOAD_DELAY_MINUTES = 18
+ROUNDED_KITCHEN_LOAD_DELAY_MINUTES = 20
 EMPTY_DRAFT_DELAY_MINUTES = 15
+MIN_ROUNDED_DELAY_MINUTES = 5
 DEFAULT_WEEKLY_HOURS = 7
 MIN_MENU_ITEMS = 35
 TENANT_STORE_ID = 7
@@ -90,6 +95,12 @@ async def test_bootstrap_seeds_store_menu_and_empty_memory(tmp_path: Path):
     await close_repository(repository, runtime)
 
 
+async def test_round_delay_minutes_never_returns_less_than_five_minutes():
+    """Delay rounding keeps zero or negative estimates user-friendly."""
+    assert round_delay_minutes(0) == MIN_ROUNDED_DELAY_MINUTES
+    assert round_delay_minutes(-7) == MIN_ROUNDED_DELAY_MINUTES
+
+
 async def test_store_profile_can_be_updated_with_empty_optional_fields(tmp_path: Path):
     """Store customization trims optional empty fields down to null."""
     repository, runtime = await build_repository(tmp_path)
@@ -108,6 +119,40 @@ async def test_store_profile_can_be_updated_with_empty_optional_fields(tmp_path:
     assert updated.store_name == "Panel Rotisería"
     assert updated.store_location is None
     assert updated.transfer_alias is None
+
+    await close_repository(repository, runtime)
+
+
+async def test_reset_current_order_rebuilds_a_draft_from_scratch(tmp_path: Path):
+    """Draft corrections can clear current items before the order is rebuilt."""
+    repository, runtime = await build_repository(tmp_path)
+
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="reset-draft-user")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="reset-draft-user",
+        customer_id=customer.id,
+    )
+    await repository.add_item_to_current_order(
+        customer.id,
+        conversation.id,
+        sku="lomito-especial",
+        quantity=2,
+    )
+
+    reset_order = await repository.reset_current_order(customer.id, conversation.id)
+
+    assert reset_order.items == []
+    assert reset_order.total_amount_cents == 0
+    assert reset_order.total_amount_display == "$ 0"
+
+    rebuilt_order = await repository.add_item_to_current_order(
+        customer.id,
+        conversation.id,
+        sku="lomito-completo",
+        quantity=1,
+    )
+    assert [item.name for item in rebuilt_order.items] == ["Lomito completo"]
 
     await close_repository(repository, runtime)
 
@@ -399,8 +444,8 @@ async def test_order_lifecycle_and_customer_memory(tmp_path: Path):
     assert confirmed.items[0].notes == "sin cebolla"
     assert delay.base_minutes == EXPECTED_DELAY_MINUTES
     assert delay.active_orders_ahead == 0
-    assert delay.estimated_minutes == EXPECTED_DELAY_MINUTES
-    assert delay.display_text == "22 minutos aproximadamente"
+    assert delay.estimated_minutes == ROUNDED_DELAY_MINUTES
+    assert delay.display_text == "25 minutos aproximadamente"
     assert memory.favorite_item_name == "Hamburguesa completa"
     assert memory.recent_items == ["Hamburguesa completa"]
 
@@ -909,8 +954,8 @@ async def test_delay_estimate_adds_extra_time_for_large_orders(tmp_path: Path):
     delay = await repository.get_estimated_delay(customer.id, conversation.id)
 
     assert delay.base_minutes == LARGE_ORDER_DELAY_MINUTES
-    assert delay.estimated_minutes == LARGE_ORDER_DELAY_MINUTES
-    assert delay.display_text == "31 minutos aproximadamente"
+    assert delay.estimated_minutes == ROUNDED_LARGE_ORDER_DELAY_MINUTES
+    assert delay.display_text == "35 minutos aproximadamente"
 
     await close_repository(repository, runtime)
 
@@ -952,8 +997,8 @@ async def test_delay_estimate_reflects_kitchen_load_from_previous_active_orders(
 
     assert delay.base_minutes == DRAFT_DELAY_MINUTES
     assert delay.active_orders_ahead == 1
-    assert delay.estimated_minutes == KITCHEN_LOAD_DELAY_MINUTES
-    assert delay.display_text == "18 minutos aproximadamente"
+    assert delay.estimated_minutes == ROUNDED_KITCHEN_LOAD_DELAY_MINUTES
+    assert delay.display_text == "20 minutos aproximadamente"
 
     await close_repository(repository, runtime)
 

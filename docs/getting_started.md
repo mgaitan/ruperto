@@ -112,6 +112,9 @@ hamburgers, lomitos, milanesas, wraps, empanadas, drinks, and desserts. That
 makes it easier to test more realistic conversations, including follow-up
 suggestions such as offering a beverage or a dessert after the customer
 chooses a main dish.
+Informational menu questions are also grounded more explicitly now, so prompts
+like `¿Tenés gaseosas?` should return concrete options and prices instead of a
+generic yes/no answer.
 
 Or launch the built-in PydanticAI web client for development:
 
@@ -125,6 +128,15 @@ In this mode there is no WhatsApp phone number, so Ruperto identifies the user
 with a stable development identity derived from the web chat id:
 `web:<chat-id>`. If you continue in the same web chat, the stored customer,
 order, and conversation history are reused automatically.
+
+If you want a simpler browser harness that ships inside the main FastAPI app,
+open:
+
+- `http://127.0.0.1:8000/demo/chat`
+
+This demo page sends requests to `/api/dev/messages` and lets you switch
+between multiple phone numbers, which makes it handy for simulating known
+customers with existing conversation memory.
 
 Staff can also move an order through operational statuses from the API, for
 example to mark a pickup order as almost ready:

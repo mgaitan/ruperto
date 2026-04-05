@@ -328,6 +328,27 @@ def dashboard_login_context(
     }
 
 
+def demo_chat_page_context(*, request: Request, settings: Settings) -> dict[str, Any]:
+    """Build the template context for the lightweight demo chat page."""
+    return {
+        "request": request,
+        "store_name": settings.store_name,
+        "bot_name": settings.bot_name,
+        "store_location": settings.store_location or "Local sin ubicación configurada",
+        "api_path": "/api/dev/messages",
+        "demo_profiles": [
+            {"label": "Martín", "phone": "+54 351 555 7788"},
+            {"label": "Ana", "phone": "+54 9 11 3344 5566"},
+        ],
+        "demo_prompts": [
+            "Hola, quiero ver la carta",
+            "Soy Martín Gaitán",
+            "Una hamburguesa doble cheddar para retirar",
+            "¿Me lo podés preparar para las 12?",
+        ],
+    }
+
+
 def dashboard_store_scope_note(memberships: list[StoreMembershipSnapshot]) -> str | None:
     """Explain the current tenancy boundary of the MVP dashboard."""
     if len(memberships) <= 1:
@@ -489,6 +510,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
         runtime = get_runtime(request)
         await ping_database(runtime.database)
         return {"status": "ok", "database": "ok"}
+
+    @app.get("/demo/chat", response_class=HTMLResponse)
+    async def read_demo_chat(request: Request) -> Response:
+        runtime = get_runtime(request)
+        context = demo_chat_page_context(request=request, settings=runtime.settings)
+        return TEMPLATES.TemplateResponse(request=request, name="demo_chat.html", context=context)
 
     @app.get(DASHBOARD_LOGIN_PATH, response_class=HTMLResponse)
     async def get_dashboard_login(

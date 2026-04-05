@@ -165,6 +165,23 @@ def test_root_endpoint_without_auto_init(tmp_path: Path):
     assert response.json()["environment"] == "test"
 
 
+def test_demo_chat_page_renders_the_browser_harness(tmp_path: Path):
+    """The lightweight demo chat page is available from the main app."""
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.get("/demo/chat")
+
+    assert response.status_code == HTTP_OK
+    assert "Demo online" in response.text
+    assert "Clientes demo" in response.text
+    assert "/api/dev/messages" in response.text
+    assert "Martín" in response.text
+    assert "Crear cliente aleatorio" in response.text
+    assert "marked.min.js" in response.text
+    assert "purify.min.js" in response.text
+
+
 def test_format_dashboard_datetime_formats_local_time():
     """Dashboard timestamps are shown in the configured local timezone."""
     value = datetime(2026, 4, 4, 15, 30, tzinfo=UTC)
@@ -301,7 +318,7 @@ def test_staff_can_update_order_status(tmp_path: Path, monkeypatch: pytest.Monke
     app = create_app(build_settings(tmp_path))
 
     with TestClient(app) as client:
-        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Hola"})
+        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Hola, quiero pedir"})
         client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Martina"})
         order_response = client.post(
             "/api/dev/messages",
@@ -550,7 +567,7 @@ def test_dashboard_can_update_order_status_and_handles_missing_orders(tmp_path: 
 
     with TestClient(app) as client:
         login_dashboard(client)
-        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Hola"})
+        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Hola, quiero pedir"})
         client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Martina"})
         order_response = client.post(
             "/api/dev/messages",
@@ -706,7 +723,7 @@ def test_dashboard_customers_search_filters_results(tmp_path: Path, monkeypatch:
 
     with TestClient(app) as client:
         login_dashboard(client)
-        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Hola"})
+        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Hola, quiero pedir"})
         client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Martina"})
         response = client.get("/dashboard/customers", params={"q": "martina"})
         empty_response = client.get("/dashboard/customers", params={"q": "nadie"})

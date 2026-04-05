@@ -45,7 +45,8 @@ Reglas operativas:
 - No inventes productos, precios, stock, direcciones, tiempos ni pagos.
 - Para cualquier dato del negocio tenés que usar herramientas.
 - Hace una sola pregunta por vez cuando falten datos.
-- Si no conocés el nombre del cliente, pedilo al comienzo antes de avanzar con el pedido.
+- Si no conocés el nombre del cliente, no frenes preguntas informativas solo para pedirlo.
+- Pedí el nombre cuando ya haga falta para seguir armando o confirmar el pedido.
 - Si el cliente manda varias definiciones en un solo mensaje, resolvé en ese mismo turno
   todo lo explícito que puedas: nombre, items, cantidades, precio consultado y preferencia de pago.
 - Prioriza cerrar el pedido con la menor fricción posible.
@@ -55,7 +56,14 @@ Reglas operativas:
 - Si el cliente ya eligió una comida y todavía no sumó bebida ni postre,
   podés sugerir una opción de bebida o postre de forma breve y natural.
 - Si el cliente ya expresó una preferencia de pago en el mensaje actual, no la repreguntes.
-- Si el cliente pregunta cuánto sale, incluí el total o subtotal actual cuando ya lo puedas calcular.
+- Si el cliente pregunta si hay una categoría o producto, no respondas solo sí o no:
+  mencioná opciones concretas y precios.
+- Si el cliente pregunta cuánto sale sobre una categoría o producto, respondé el precio
+  de esa opción o listá variantes con precios.
+- Solo informá el total o subtotal actual cuando esté claro que pregunta por el pedido,
+  no cuando pregunta por una categoría o producto del menú.
+- Si el cliente corrige algo del pedido, ajustá el borrador actual en vez de sumar más líneas por error.
+- Si hace falta rehacer las líneas del pedido por una corrección, vaciá el borrador y cargalo de nuevo.
 - Si el cliente pide programar un pedido para una hora puntual, tratá ese horario como prioridad.
 - Evitá repetir muletillas como "Perfecto" o copiar exactamente la misma frase en cada turno.
 - Cuando confirmes un pedido, mostrálos con aire visual: resumen separado, líneas cortas y datos fáciles de escanear.
@@ -143,6 +151,28 @@ INFORMATIONAL_MENU_HINTS = (
     "mostrame el menú",
     "menu",
 )
+MENU_INFORMATION_GROUPS = {
+    "gaseosas": {
+        "message_hints": ("gaseosa", "gaseosas", "coca", "cola", "sprite", "lima-limón", "naranja"),
+        "item_hints": ("gaseosa", "cola", "lima-limón", "naranja"),
+        "category_hints": ("bebidas",),
+    },
+    "bebidas": {
+        "message_hints": ("bebida", "bebidas", "para tomar", "tomar"),
+        "item_hints": ("gaseosa", "agua", "cerveza", "saborizada"),
+        "category_hints": ("bebidas",),
+    },
+    "papas": {
+        "message_hints": ("papas", "papas fritas", "fritas"),
+        "item_hints": ("papas",),
+        "category_hints": ("guarniciones",),
+    },
+    "postres": {
+        "message_hints": ("postre", "postres", "helado", "brownie", "flan", "tiramisú", "cheesecake"),
+        "item_hints": ("budín", "brownie", "flan", "helado", "tiramisú", "cheesecake"),
+        "category_hints": ("postres",),
+    },
+}
 EXPLICIT_CONFIRMATION_HINTS = (
     "confirmo",
     "confirmá",
@@ -152,6 +182,20 @@ EXPLICIT_CONFIRMATION_HINTS = (
     "cerralo",
     "cerrá el pedido",
     "confirmar pedido",
+)
+ORDER_CORRECTION_HINTS = (
+    "dije",
+    "quise decir",
+    "mejor dicho",
+    "en realidad",
+    "corrijo",
+    "corrección",
+    "corregí",
+    "corregi",
+    "no, era",
+    "no, quise decir",
+    "uno de cada",
+    "uno y uno",
 )
 NAME_PROMPT_VARIANTS = (
     "👋 Hola, soy {bot_name}, el asistente de pedidos de {store_name}. Antes de seguir, ¿me decís tu nombre?",
@@ -167,6 +211,14 @@ DELIVERY_PROMPT_VARIANTS = (
     "Anotado, {name}: hasta ahora va {items} por {total}.{timing_text} ¿Querés envío o retirás por el local?",
     "Bien, {name}: tengo {items} por {total}.{timing_text} ¿Querés envío o retirás por el local?",
 )
+ADD_ON_PROMPT_VARIANTS = (
+    "{lead}, {name}: tengo {items} por {total}. Si querés, podés sumar {suggestion}. ¿Te tienta algo más?",
+    "Anotado, {name}: va {items} por {total}. Si te copa, le podés agregar {suggestion}. ¿Querés sumar algo más?",
+    (
+        "Buenísimo, {name}: llevo {items} por {total}. "
+        "Si querés completar el pedido, podés sumar {suggestion}. ¿Te sirve algo más?"
+    ),
+)
 ADDRESS_PROMPT_VARIANTS = (
     "Dale. ¿Te lo envío a {address}? Si preferís otra dirección, pasámela.",
     "Buenísimo. ¿Va a {address}? Si querés otro domicilio, decímelo.",
@@ -174,8 +226,8 @@ ADDRESS_PROMPT_VARIANTS = (
 )
 PAYMENT_PROMPT_VARIANTS = (
     "{lead}. El total es {total}.{timing_text} ¿Cómo querés pagar: efectivo, transferencia o link de pago?",
-    "Seguimos bien. Son {total}.{timing_text} ¿Preferís efectivo, transferencia o link de pago?",
-    "Ya casi está: el total es {total}.{timing_text} ¿Lo resolvemos con efectivo, transferencia o link de pago?",
+    "Son {total}.{timing_text} ¿Preferís efectivo, transferencia o link de pago?",
+    "Ya tengo {total}.{timing_text} ¿Lo resolvemos con efectivo, transferencia o link de pago?",
 )
 WEEKDAY_LABELS_ES = {
     0: "lunes",
@@ -454,6 +506,21 @@ async def set_order_payment_method(
 
 
 @ordering_agent.tool
+async def reset_current_order(ctx: RunContext[AssistantDeps]) -> OrderSnapshot:
+    """Clear the current draft items so the order can be rebuilt after a correction."""
+    if not ctx.deps.allow_order_mutations:
+        raise InformationalTurnMutationError
+    return await with_repository(
+        ctx,
+        lambda repository: repository.reset_current_order(
+            ctx.deps.customer_id,
+            ctx.deps.conversation_id,
+        ),
+        commit=True,
+    )
+
+
+@ordering_agent.tool
 async def confirm_current_order(ctx: RunContext[AssistantDeps]) -> OrderSnapshot:
     """Confirm the active order once it contains items."""
     if not ctx.deps.allow_order_confirmation:
@@ -595,6 +662,7 @@ class OrderingAssistantService:
             )
             history = await repository.load_conversation_messages(conversation.id)
             latest_assistant_text = self._extract_latest_assistant_text(history)
+            latest_user_text = self._extract_latest_user_text(history)
             pending_customer_message = await repository.get_pending_customer_message(conversation.id)
             current_order_before_run = await repository.get_current_order(
                 customer.id,
@@ -646,6 +714,8 @@ class OrderingAssistantService:
                     message_text=message_text,
                     current_order=current_order_before_run,
                     pending_customer_message=resumed_pending_message,
+                    previous_user_message=latest_user_text,
+                    latest_assistant_text=latest_assistant_text,
                 ),
                 allow_order_mutations=turn_policy.allow_order_mutations,
                 allow_order_confirmation=turn_policy.allow_order_confirmation,
@@ -728,11 +798,26 @@ class OrderingAssistantService:
             )
             reply = self._ground_reply_for_turn_policy(reply, turn_policy, current_order=current_order)
             if schedule_error_text is None:
+                reply = await self._answer_menu_information_turn(
+                    reply,
+                    repository=repository,
+                    message_text=message_text,
+                    previous_user_message=latest_user_text,
+                    turn_policy=turn_policy,
+                )
                 reply = self._guide_reply_with_current_order(
                     reply,
                     customer=refreshed_customer,
                     current_order=current_order,
                     delay=delay,
+                    order_changed_during_turn=self._order_changed_during_turn(
+                        previous_order=current_order_before_run,
+                        current_order=current_order,
+                    ),
+                    item_lines_changed_during_turn=self._order_items_changed_during_turn(
+                        previous_order=current_order_before_run,
+                        current_order=current_order,
+                    ),
                 )
                 reply = self._finalize_confirmed_order_reply(
                     reply,
@@ -759,7 +844,7 @@ class OrderingAssistantService:
                 current_order=current_order,
             )
 
-    async def _maybe_handle_missing_customer_name(  # noqa: PLR0913
+    async def _maybe_handle_missing_customer_name(  # noqa: PLR0911, PLR0913
         self,
         *,
         repository: BusinessRepository,
@@ -836,6 +921,12 @@ class OrderingAssistantService:
                     current_order=None,
                 ),
             )
+
+        if self._has_prior_conversation(history):
+            return NameHandlingResult(customer=customer)
+
+        if not self._should_require_name_before_continuing(message_text):
+            return NameHandlingResult(customer=customer)
 
         if self._should_store_pending_message_before_name(message_text):
             await repository.set_pending_customer_message(conversation_id, message_text)
@@ -920,6 +1011,20 @@ class OrderingAssistantService:
                     return part.content
         return None
 
+    def _extract_latest_user_text(self, history: list[ModelMessage]) -> str | None:
+        """Extract the latest customer prompt persisted in the conversation history."""
+        for message in reversed(history):
+            if not isinstance(message, ModelRequest):
+                continue
+            for part in reversed(message.parts):
+                if isinstance(part, UserPromptPart):
+                    return part.content if isinstance(part.content, str) else None
+        return None
+
+    def _has_prior_conversation(self, history: list[ModelMessage]) -> bool:
+        """Return whether the customer is already past the very first turn."""
+        return bool(history)
+
     def _extract_name_candidate(self, message_text: str) -> str | None:
         """Infer a plausible first-name style answer from a short user message."""
         cleaned = " ".join(message_text.split()).strip(" .,!?:;")
@@ -964,6 +1069,13 @@ class OrderingAssistantService:
         if self._message_requests_total(message_text):
             return True
         return any(keyword in lowered for keyword in ("bebida", "postre", "combo", "hamburguesa", "pizza", "empanada"))
+
+    def _should_require_name_before_continuing(self, message_text: str) -> bool:
+        """Return whether the current turn needs the customer's name before proceeding."""
+        lowered = message_text.casefold()
+        if any(hint in lowered for hint in ORDER_INTENT_HINTS):
+            return True
+        return any(keyword in lowered for keyword in ("hamburguesa", "pizza", "empanada", "lomito", "milanesa"))
 
     def _extract_name_from_introduction(self, message_text: str) -> str | None:
         """Extract a first name from a longer self-introduction message."""
@@ -1019,13 +1131,15 @@ class OrderingAssistantService:
             allow_order_confirmation=allow_order_confirmation,
         )
 
-    def _build_turn_context_hint(
+    def _build_turn_context_hint(  # noqa: C901, PLR0913
         self,
         *,
         customer: CustomerSnapshot,
         message_text: str,
         current_order: OrderSnapshot | None,
         pending_customer_message: str | None = None,
+        previous_user_message: str | None = None,
+        latest_assistant_text: str | None = None,
     ) -> str | None:
         """Build safe guidance for dense first-turn customer messages."""
         hints: list[str] = []
@@ -1052,16 +1166,49 @@ class OrderingAssistantService:
                 "Si el pedido ya está suficientemente definido, podés registrar esa forma de pago."
             )
 
-        if self._message_requests_total(message_text):
+        menu_information_focus = self._detect_menu_information_focus(
+            message_text,
+            previous_user_message=previous_user_message,
+        )
+        if menu_information_focus is not None:
             hints.append(
-                "El cliente quiere saber cuánto sale en este mismo turno. "
-                "Si ya podés calcularlo con herramientas, informá el total o subtotal actual."
+                "El cliente está consultando por "
+                f"{menu_information_focus}. "
+                "Usá el menú para responder con 2 a 4 opciones concretas y sus precios, no solo con un sí o un no."
             )
+
+        if self._message_requests_total(message_text):
+            if menu_information_focus is not None:
+                hints.append(
+                    "Acá 'cuánto sale' se refiere a esa categoría o producto del menú, "
+                    "no al total del pedido. Respondé con precios concretos o un rango útil."
+                )
+            else:
+                hints.append(
+                    "El cliente quiere saber cuánto sale en este mismo turno. "
+                    "Si ya podés calcularlo con herramientas, informá el total o subtotal actual."
+                )
         if pending_customer_message is not None:
             hints.append(
                 "Antes de identificarse, el cliente dejó una consulta pendiente: "
                 f"'{pending_customer_message}'. "
                 "Retomá eso ahora sin volver a preguntarle qué quiere."
+            )
+        if self._message_is_order_correction(message_text) and current_order is not None and current_order.items:
+            hints.append(
+                "El cliente está corrigiendo el pedido actual. "
+                "No sumes líneas arriba de lo ya anotado por error: ajustá el borrador actual. "
+                "Si hace falta, usá reset_current_order y cargá de nuevo las líneas correctas."
+            )
+        if (
+            self._message_requests_split_across_recent_options(message_text)
+            and latest_assistant_text is not None
+            and "tenemos:" in latest_assistant_text.casefold()
+        ):
+            hints.append(
+                "En el turno anterior acabás de ofrecer variantes del mismo producto. "
+                "Si ahora responde 'uno y uno' o 'uno de cada', interpretalo como una "
+                "unidad de cada opción recién ofrecida."
             )
         hints.extend(self._build_current_order_context_hints(customer=customer, current_order=current_order))
 
@@ -1136,19 +1283,39 @@ class OrderingAssistantService:
             }
         )
 
-    def _guide_reply_with_current_order(
+    def _guide_reply_with_current_order(  # noqa: PLR0911, PLR0913
         self,
         reply: AssistantReply,
         *,
         customer: CustomerSnapshot,
         current_order: OrderSnapshot | None,
         delay: DelayEstimateSnapshot | None,
+        order_changed_during_turn: bool = True,
+        item_lines_changed_during_turn: bool = True,
     ) -> AssistantReply:
         """Prefer deterministic checkout guidance once a draft already exists."""
         if current_order is None or not current_order.items or current_order.status.value != "draft":
             return reply
+        if not order_changed_during_turn and reply.next_step == AssistantNextStep.CHOOSE_ITEMS:
+            return reply
 
         timing_text = self._build_timing_prompt_fragment(current_order=current_order, delay=delay)
+        if item_lines_changed_during_turn and self._should_offer_add_on(current_order):
+            item_summary = ", ".join(f"{item.quantity} x {item.name}" for item in current_order.items)
+            template = self._pick_variant(ADD_ON_PROMPT_VARIANTS, seed=current_order.id)
+            return reply.model_copy(
+                update={
+                    "reply_text": template.format(
+                        lead=self._pick_lead_phrase(current_order.id),
+                        name=customer.name or "che",
+                        items=item_summary,
+                        total=current_order.total_amount_display,
+                        suggestion=self._pick_add_on_suggestion(current_order),
+                    ),
+                    "next_step": AssistantNextStep.CHOOSE_ITEMS,
+                }
+            )
+
         if current_order.delivery_type is None:
             item_summary = ", ".join(f"{item.quantity} x {item.name}" for item in current_order.items)
             template = self._pick_variant(DELIVERY_PROMPT_VARIANTS, seed=current_order.id)
@@ -1193,6 +1360,28 @@ class OrderingAssistantService:
 
         return reply
 
+    def _order_changed_during_turn(
+        self,
+        *,
+        previous_order: OrderSnapshot | None,
+        current_order: OrderSnapshot | None,
+    ) -> bool:
+        """Return whether the order state materially changed during the latest turn."""
+        if previous_order is None or current_order is None:
+            return previous_order != current_order
+        return previous_order.model_dump() != current_order.model_dump()
+
+    def _order_items_changed_during_turn(
+        self,
+        *,
+        previous_order: OrderSnapshot | None,
+        current_order: OrderSnapshot | None,
+    ) -> bool:
+        """Return whether the latest turn changed the draft line items."""
+        previous_items = [] if previous_order is None else previous_order.items
+        current_items = [] if current_order is None else current_order.items
+        return [item.model_dump() for item in previous_items] != [item.model_dump() for item in current_items]
+
     def _detect_payment_method_hint(self, message_text: str) -> PaymentMethod | None:
         """Infer payment intent from common Argentine customer phrasing."""
         lowered = message_text.casefold()
@@ -1224,6 +1413,7 @@ class OrderingAssistantService:
                 "cuando llegue",
                 "cuando llegues",
                 "al retirar",
+                "cash",
             )
         ):
             return PaymentMethod.CASH
@@ -1244,6 +1434,109 @@ class OrderingAssistantService:
                 "precio",
                 "total",
             )
+        )
+
+    def _message_is_order_correction(self, message_text: str) -> bool:
+        """Return whether the customer is correcting a previously captured order detail."""
+        lowered = message_text.casefold()
+        return any(hint in lowered for hint in ORDER_CORRECTION_HINTS)
+
+    def _message_requests_split_across_recent_options(self, message_text: str) -> bool:
+        """Return whether the customer is splitting quantity across recently offered variants."""
+        lowered = message_text.casefold()
+        return "uno y uno" in lowered or "uno de cada" in lowered
+
+    def _detect_menu_information_focus(
+        self,
+        message_text: str,
+        *,
+        previous_user_message: str | None = None,
+    ) -> str | None:
+        """Infer the menu category currently in focus for informational turns."""
+        lowered = message_text.casefold()
+        if focus := self._match_menu_information_focus(lowered):
+            return focus
+        if not self._message_requests_total(message_text):
+            return None
+        if previous_user_message is None:
+            return None
+        return self._match_menu_information_focus(previous_user_message.casefold())
+
+    def _match_menu_information_focus(self, lowered_message: str) -> str | None:
+        """Return the canonical menu-information focus mentioned in one message."""
+        for focus, config in MENU_INFORMATION_GROUPS.items():
+            if any(hint in lowered_message for hint in config["message_hints"]):
+                return focus
+        return None
+
+    def _filter_menu_options_for_focus(
+        self,
+        menu_items: list[MenuItemSnapshot],
+        *,
+        focus: str,
+    ) -> list[MenuItemSnapshot]:
+        """Return menu items matching one informational focus."""
+        config = MENU_INFORMATION_GROUPS.get(focus)
+        if config is None:
+            return []
+        name_matches: list[MenuItemSnapshot] = []
+        category_matches: list[MenuItemSnapshot] = []
+        for item in menu_items:
+            lowered_name = item.name.casefold()
+            lowered_category = item.category.casefold()
+            if any(hint in lowered_name for hint in config["item_hints"]):
+                name_matches.append(item)
+                continue
+            if any(hint in lowered_category for hint in config["category_hints"]):
+                category_matches.append(item)
+        return name_matches or category_matches
+
+    async def _answer_menu_information_turn(
+        self,
+        reply: AssistantReply,
+        *,
+        repository: BusinessRepository,
+        message_text: str,
+        previous_user_message: str | None,
+        turn_policy: TurnPolicy,
+    ) -> AssistantReply:
+        """Replace vague informational answers with concrete menu options and prices."""
+        if turn_policy.allow_order_mutations:
+            return reply
+
+        focus = self._detect_menu_information_focus(
+            message_text,
+            previous_user_message=previous_user_message,
+        )
+        if focus is None:
+            return reply
+
+        menu_items = await repository.list_menu_items()
+        matching_items = self._filter_menu_options_for_focus(menu_items, focus=focus)[:4]
+        if not matching_items:
+            return reply
+
+        focus_label = {
+            "gaseosas": "gaseosas",
+            "bebidas": "bebidas",
+            "papas": "papas",
+            "postres": "postres",
+        }.get(focus, focus)
+        options_block = "\n".join(f"- {item.name}: {item.price_display}" for item in matching_items)
+        if self._message_requests_total(message_text):
+            reply_text = (
+                f"Sí, tenemos {focus_label}. Estas son algunas opciones:\n{options_block}\n\n¿Cuál te gustaría sumar?"
+            )
+        else:
+            reply_text = (
+                f"Sí, tenemos {focus_label}. Por ejemplo:\n{options_block}\n\nSi querés, te sumo una al pedido."
+            )
+
+        return reply.model_copy(
+            update={
+                "reply_text": reply_text,
+                "next_step": AssistantNextStep.CHOOSE_ITEMS,
+            }
         )
 
     def _build_name_prompt(self, *, conversation_id: int, remembers_pending_message: bool = False) -> str:
@@ -1341,8 +1634,6 @@ class OrderingAssistantService:
             if current_order.preparation_starts_at is not None:
                 start_text = self._format_local_time(current_order.preparation_starts_at)
                 schedule_block += f"\nEmpezamos a prepararlo cerca de las {start_text}."
-        elif delay is not None:
-            schedule_block = f"\n**Demora estimada**\n{delay.display_text.capitalize()}."
 
         payment_block = f"\n**Pago**\n{payment_text}"
         if current_order.payment_method is PaymentMethod.TRANSFER and store.transfer_alias:
@@ -1393,9 +1684,66 @@ class OrderingAssistantService:
         """Describe either a scheduled ready time or the current estimated delay."""
         if current_order.requested_ready_at is not None:
             return f" Lo dejo programado para {self._describe_order_ready_time(current_order.requested_ready_at)}."
-        if delay is not None:
-            return f" La demora estimada es de {delay.display_text}."
         return ""
+
+    def _should_offer_add_on(self, current_order: OrderSnapshot) -> bool:
+        """Return whether the current draft should nudge one simple add-on."""
+        if not current_order.items:
+            return False
+
+        item_names = [item.name.casefold() for item in current_order.items]
+        has_main = any(self._item_is_main(name) for name in item_names)
+        has_beverage = any(self._item_is_beverage(name) for name in item_names)
+        has_dessert = any(self._item_is_dessert(name) for name in item_names)
+        return has_main and (not has_beverage or not has_dessert)
+
+    def _pick_add_on_suggestion(self, current_order: OrderSnapshot) -> str:
+        """Choose a simple complement suggestion based on the current draft."""
+        item_names = [item.name.casefold() for item in current_order.items]
+        lowered_names = " ".join(item_names)
+        has_side = any(self._item_is_side(name) for name in item_names)
+        has_beverage = any(self._item_is_beverage(name) for name in item_names)
+        has_dessert = any(self._item_is_dessert(name) for name in item_names)
+
+        if not has_beverage and not has_dessert:
+            if not has_side and any(
+                keyword in lowered_names for keyword in ("hamburguesa", "lomito", "milanesa", "wrap")
+            ):
+                return "unas papas, una bebida o un postre"
+            return "una bebida o un postre"
+        if not has_beverage:
+            return "una bebida"
+        if not has_dessert:
+            return "un postre"
+        return "algo más para acompañar"
+
+    def _item_is_main(self, item_name: str) -> bool:
+        """Return whether one line item should count as a main dish."""
+        return any(
+            keyword in item_name
+            for keyword in (
+                "hamburguesa",
+                "lomito",
+                "milanesa",
+                "wrap",
+                "pizza",
+                "empanada",
+                "sanguche",
+                "ensalada",
+            )
+        )
+
+    def _item_is_side(self, item_name: str) -> bool:
+        """Return whether one line item is primarily a side dish."""
+        return "papas" in item_name
+
+    def _item_is_beverage(self, item_name: str) -> bool:
+        """Return whether one line item is a beverage."""
+        return any(keyword in item_name for keyword in ("gaseosa", "agua", "cerveza", "saborizada"))
+
+    def _item_is_dessert(self, item_name: str) -> bool:
+        """Return whether one line item is a dessert."""
+        return any(keyword in item_name for keyword in ("budín", "brownie", "flan", "helado", "tiramisú", "cheesecake"))
 
     def _extract_requested_ready_at(self, message_text: str, *, timezone_name: str) -> datetime | None:
         """Parse a customer request such as `para las 12` into a timezone-aware datetime."""
