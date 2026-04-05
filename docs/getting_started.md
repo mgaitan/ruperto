@@ -149,6 +149,12 @@ with a stable development identity derived from the web chat id:
 `web:<chat-id>`. If you continue in the same web chat, the stored customer,
 order, and conversation history are reused automatically.
 
+For WhatsApp testing through Kapso, the environment variables are now only the
+fastest bootstrap path. In the dashboard, open `Configuración del agente` and
+fill the Kapso WhatsApp section for the active store. That per-store
+configuration is the recommended setup when you want different locals to own
+different numbers.
+
 If you want a simpler browser harness that ships inside the main FastAPI app,
 open:
 

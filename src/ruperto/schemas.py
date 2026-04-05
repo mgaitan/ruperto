@@ -7,7 +7,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ruperto.models import Channel, DeliveryType, OrderStatus, PaymentMethod, StaffRole
+from ruperto.models import Channel, ChannelProvider, DeliveryType, OrderStatus, PaymentMethod, StaffRole
 
 
 def format_price_ars(amount_cents: int) -> str:
@@ -35,6 +35,32 @@ class StoreProfileSnapshot(BaseSchema):
     locale: str
     currency_code: str
     transfer_alias: str | None
+
+
+class StoreChannelConnectionSnapshot(BaseModel):
+    """Safe store-scoped channel connection data for templates and handlers."""
+
+    id: int | None = None
+    store_id: int
+    channel: Channel
+    provider: ChannelProvider
+    phone_number_id: str | None = None
+    is_active: bool = False
+    api_key_configured: bool = False
+    webhook_secret_configured: bool = False
+
+
+class StoreChannelConnectionRuntimeConfig(BaseModel):
+    """Internal runtime credentials for one concrete store channel connection."""
+
+    id: int
+    store_id: int
+    channel: Channel
+    provider: ChannelProvider
+    phone_number_id: str
+    api_key: str
+    webhook_secret: str | None = None
+    is_active: bool = True
 
 
 class StoreBusinessHoursSnapshot(BaseSchema):
@@ -208,6 +234,7 @@ class ConversationTargetSnapshot(BaseModel):
 
     conversation_id: int
     channel: Channel
+    store_id: int
     external_id: str
 
 
@@ -248,3 +275,12 @@ class StoreProfileUpdateRequest(BaseModel):
     store_description: str = Field(min_length=1)
     assistant_personality: str = Field(min_length=1)
     transfer_alias: str | None = None
+
+
+class StoreChannelConnectionUpdateRequest(BaseModel):
+    """Payload accepted by staff endpoints to update one store channel connection."""
+
+    phone_number_id: str | None = None
+    api_key: str | None = None
+    webhook_secret: str | None = None
+    is_active: bool = False

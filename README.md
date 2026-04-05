@@ -140,6 +140,9 @@ Kapso: the backend can receive inbound text messages from the
 automatic ready/almost-ready/out-for-delivery notifications when a WhatsApp
 order changes status. The adapter is intentionally isolated behind a channel
 layer so future providers or channels do not leak into the assistant logic.
+Kapso credentials can still come from environment variables as a development
+fallback, but the recommended path for multi-store setups is now to configure
+each local's WhatsApp connection from the dashboard agent settings page.
 
 ## Development
 

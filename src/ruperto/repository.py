@@ -17,6 +17,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from ruperto.auth import hash_password, normalize_email, verify_password
 from ruperto.models import (
     Channel,
+    ChannelProvider,
     Conversation,
     ConversationMessage,
     ConversationState,
@@ -32,6 +33,7 @@ from ruperto.models import (
     StaffRole,
     StaffUser,
     StoreBusinessHours,
+    StoreChannelConnection,
     StoreMembership,
     StoreProfile,
     utc_now,
@@ -48,6 +50,9 @@ from ruperto.schemas import (
     StaffUserSnapshot,
     StoreAvailabilitySnapshot,
     StoreBusinessHoursSnapshot,
+    StoreChannelConnectionRuntimeConfig,
+    StoreChannelConnectionSnapshot,
+    StoreChannelConnectionUpdateRequest,
     StoreMembershipSnapshot,
     StoreProfileSnapshot,
     StoreProfileUpdateRequest,
@@ -258,6 +263,128 @@ class BusinessRepository:
         row.updated_at = utc_now()
         await self.session.flush()
         return StoreProfileSnapshot.model_validate(row)
+
+    async def get_store_channel_connection(
+        self,
+        *,
+        store_id: int,
+        channel: Channel,
+        provider: ChannelProvider = ChannelProvider.KAPSO,
+    ) -> StoreChannelConnectionSnapshot:
+        """Return the safe channel-connection snapshot for one store."""
+        row = await self.session.scalar(
+            select(StoreChannelConnection).where(
+                StoreChannelConnection.store_id == store_id,
+                StoreChannelConnection.channel == channel,
+                StoreChannelConnection.provider == provider,
+            )
+        )
+        if row is None:
+            return StoreChannelConnectionSnapshot(
+                store_id=store_id,
+                channel=channel,
+                provider=provider,
+            )
+        return StoreChannelConnectionSnapshot(
+            id=row.id,
+            store_id=row.store_id,
+            channel=row.channel,
+            provider=row.provider,
+            phone_number_id=row.phone_number_id,
+            is_active=row.is_active,
+            api_key_configured=bool(row.api_key),
+            webhook_secret_configured=bool(row.webhook_secret),
+        )
+
+    async def get_store_channel_runtime_config(
+        self,
+        *,
+        store_id: int,
+        channel: Channel,
+        provider: ChannelProvider = ChannelProvider.KAPSO,
+    ) -> StoreChannelConnectionRuntimeConfig | None:
+        """Return one active store-scoped channel connection with runtime credentials."""
+        row = await self.session.scalar(
+            select(StoreChannelConnection).where(
+                StoreChannelConnection.store_id == store_id,
+                StoreChannelConnection.channel == channel,
+                StoreChannelConnection.provider == provider,
+                StoreChannelConnection.is_active.is_(True),
+            )
+        )
+        if row is None or not row.phone_number_id or not row.api_key:
+            return None
+        return StoreChannelConnectionRuntimeConfig(
+            id=row.id,
+            store_id=row.store_id,
+            channel=row.channel,
+            provider=row.provider,
+            phone_number_id=row.phone_number_id,
+            api_key=row.api_key,
+            webhook_secret=row.webhook_secret,
+            is_active=row.is_active,
+        )
+
+    async def get_channel_runtime_config_by_phone_number(
+        self,
+        *,
+        channel: Channel,
+        provider: ChannelProvider,
+        phone_number_id: str,
+    ) -> StoreChannelConnectionRuntimeConfig | None:
+        """Resolve one active connection by the provider phone-number identifier."""
+        row = await self.session.scalar(
+            select(StoreChannelConnection).where(
+                StoreChannelConnection.channel == channel,
+                StoreChannelConnection.provider == provider,
+                StoreChannelConnection.phone_number_id == phone_number_id,
+                StoreChannelConnection.is_active.is_(True),
+            )
+        )
+        if row is None or not row.phone_number_id or not row.api_key:
+            return None
+        return StoreChannelConnectionRuntimeConfig(
+            id=row.id,
+            store_id=row.store_id,
+            channel=row.channel,
+            provider=row.provider,
+            phone_number_id=row.phone_number_id,
+            api_key=row.api_key,
+            webhook_secret=row.webhook_secret,
+            is_active=row.is_active,
+        )
+
+    async def update_store_channel_connection(
+        self,
+        *,
+        store_id: int,
+        channel: Channel,
+        provider: ChannelProvider = ChannelProvider.KAPSO,
+        payload: StoreChannelConnectionUpdateRequest,
+    ) -> StoreChannelConnectionSnapshot:
+        """Create or update one store-scoped channel connection."""
+        row = await self.session.scalar(
+            select(StoreChannelConnection).where(
+                StoreChannelConnection.store_id == store_id,
+                StoreChannelConnection.channel == channel,
+                StoreChannelConnection.provider == provider,
+            )
+        )
+        if row is None:
+            row = StoreChannelConnection(store_id=store_id, channel=channel, provider=provider)
+            self.session.add(row)
+            await self.session.flush()
+
+        normalized_phone_number_id = self._normalize_optional_text(payload.phone_number_id)
+        row.phone_number_id = normalized_phone_number_id
+        if payload.api_key is not None and payload.api_key.strip():
+            row.api_key = payload.api_key.strip()
+        if payload.webhook_secret is not None and payload.webhook_secret.strip():
+            row.webhook_secret = payload.webhook_secret.strip()
+        row.is_active = payload.is_active and bool(row.phone_number_id and row.api_key)
+        row.updated_at = utc_now()
+        await self.session.flush()
+        return await self.get_store_channel_connection(store_id=store_id, channel=channel, provider=provider)
 
     async def get_staff_user_by_id(self, staff_user_id: int) -> StaffUserSnapshot | None:
         """Return one dashboard user by primary key."""
@@ -572,6 +699,7 @@ class BusinessRepository:
         channel: Channel,
         external_id: str,
         customer_id: int,
+        store_id: int = 1,
     ) -> Conversation:
         """Return the persisted conversation for one external identity."""
         conversation = await self.session.scalar(
@@ -584,6 +712,7 @@ class BusinessRepository:
             conversation = Conversation(
                 channel=channel,
                 external_id=external_id,
+                store_id=store_id,
                 customer_id=customer_id,
             )
             self.session.add(conversation)
@@ -592,6 +721,8 @@ class BusinessRepository:
 
         if conversation.customer_id != customer_id:
             conversation.customer_id = customer_id
+        if conversation.store_id != store_id:
+            conversation.store_id = store_id
         conversation.updated_at = utc_now()
         await self.session.flush()
         return conversation
@@ -694,11 +825,16 @@ class BusinessRepository:
         *,
         limit: int = 50,
         status: OrderStatus | None = None,
+        store_id: int | None = None,
     ) -> list[OrderSnapshot]:
         """List orders ordered by recent activity."""
         statement = select(Order).order_by(Order.updated_at.desc(), Order.id.desc()).limit(limit)
         if status is not None:
             statement = statement.where(Order.status == status)
+        if store_id is not None:
+            statement = statement.join(Conversation, Conversation.id == Order.conversation_id).where(
+                Conversation.store_id == store_id
+            )
         orders = (await self.session.scalars(statement)).all()
         return [await self._build_order_snapshot(order) for order in orders]
 
@@ -807,17 +943,18 @@ class BusinessRepository:
     async def get_order_conversation_target(self, order_id: int) -> ConversationTargetSnapshot | None:
         """Return the outbound conversation target for one order when available."""
         row = await self.session.execute(
-            select(Conversation.id, Conversation.channel, Conversation.external_id)
+            select(Conversation.id, Conversation.channel, Conversation.store_id, Conversation.external_id)
             .join(Order, Order.conversation_id == Conversation.id)
             .where(Order.id == order_id)
         )
         target = row.one_or_none()
         if target is None:
             return None
-        conversation_id, channel, external_id = target
+        conversation_id, channel, store_id, external_id = target
         return ConversationTargetSnapshot(
             conversation_id=conversation_id,
             channel=channel,
+            store_id=store_id,
             external_id=external_id,
         )
 

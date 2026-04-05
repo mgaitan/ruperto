@@ -19,7 +19,7 @@ from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, Tool
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from sqlalchemy import select
 
-from ruperto.app import create_app, format_dashboard_datetime, parse_store_hours_form
+from ruperto.app import create_app, extract_kapso_phone_number_id, format_dashboard_datetime, parse_store_hours_form
 from ruperto.config import Settings
 from ruperto.db import create_database_runtime, init_database
 from ruperto.models import Channel, DeliveryType, OrderStatus, PaymentMethod, StaffRole, StoreMembership
@@ -223,6 +223,14 @@ def test_demo_chat_page_renders_the_browser_harness(tmp_path: Path):
     assert "purify.min.js" in response.text
 
 
+def test_extract_kapso_phone_number_id_supports_direct_and_nested_payloads():
+    """Kapso webhook routing can read the phone number id from either payload shape."""
+    assert extract_kapso_phone_number_id({"phone_number_id": "direct-id"}) == "direct-id"
+    assert extract_kapso_phone_number_id({"conversation": {"phone_number_id": "nested-id"}}) == "nested-id"
+    assert extract_kapso_phone_number_id({"conversation": {}}) is None
+    assert extract_kapso_phone_number_id(["not-a-dict"]) is None
+
+
 def test_kapso_webhook_requires_valid_signature(tmp_path: Path):
     """Kapso webhooks are rejected when the signature does not match."""
     settings = build_settings(tmp_path).model_copy(
@@ -275,6 +283,21 @@ def test_kapso_webhook_requires_runtime_configuration(tmp_path: Path):
     assert response.status_code == HTTP_SERVICE_UNAVAILABLE
 
 
+def test_dashboard_agent_channel_form_requires_login(tmp_path: Path):
+    """Channel settings are protected behind the same dashboard login as the rest of the panel."""
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/dashboard/settings/agent/channel",
+            data={"kapso_phone_number_id": "597907523413541"},
+            follow_redirects=False,
+        )
+
+    assert response.status_code == HTTP_FOUND
+    assert response.headers["location"].startswith("/dashboard/login")
+
+
 def test_kapso_webhook_rejects_invalid_json(tmp_path: Path):
     """Kapso webhook processing rejects malformed JSON payloads."""
     settings = build_settings(tmp_path).model_copy(
@@ -319,7 +342,7 @@ def test_kapso_webhook_processes_inbound_message_and_sends_reply(tmp_path: Path,
     handled_messages = []
     sent_payloads: list[dict[str, Any]] = []
 
-    async def fake_handle_inbound_customer_message(*, session_factory, settings, inbound_message):
+    async def fake_handle_inbound_customer_message(*, session_factory, settings, inbound_message, store_id=None):
         handled_messages.append(inbound_message)
         return fake_result
 
@@ -798,6 +821,16 @@ def test_dashboard_forms_can_update_profile_agent_and_hours(tmp_path: Path):
             },
             follow_redirects=True,
         )
+        channel_response = client.post(
+            "/dashboard/settings/agent/channel",
+            data={
+                "kapso_phone_number_id": "597907523413541",
+                "kapso_api_key": "kapso-key",
+                "kapso_webhook_secret": "kapso-secret",
+                "kapso_is_active": "on",
+            },
+            follow_redirects=True,
+        )
         hours_response = client.post(
             "/dashboard/settings/hours",
             data={
@@ -817,6 +850,8 @@ def test_dashboard_forms_can_update_profile_agent_and_hours(tmp_path: Path):
     assert "Perfil del local actualizado." in profile_response.text
     assert agent_response.status_code == HTTP_OK
     assert "Configuración del agente actualizada." in agent_response.text
+    assert channel_response.status_code == HTTP_OK
+    assert "597907523413541" in channel_response.text
     assert hours_response.status_code == HTTP_OK
     assert "Horarios actualizados." in hours_response.text
     assert store_response.json()["store_name"] == "Panel Rotisería"
@@ -1080,6 +1115,7 @@ def test_dashboard_settings_pages_render_menu_filters_and_profile_data(tmp_path:
     assert "Alias de transferencia" in profile_response.text
     assert agent_response.status_code == HTTP_OK
     assert "Modelo" in agent_response.text
+    assert "WhatsApp vía Kapso" in agent_response.text
     assert hours_response.status_code == HTTP_OK
     assert "Guardar agenda semanal" in hours_response.text
     assert users_response.status_code == HTTP_OK

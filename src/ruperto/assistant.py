@@ -932,6 +932,7 @@ class OrderingAssistantService:
                 channel=channel,
                 external_id=external_user_id,
                 customer_id=customer.id,
+                store_id=resolved_store_id,
             )
             history = await repository.load_conversation_messages(conversation.id)
             latest_assistant_text = self._extract_latest_assistant_text(history)

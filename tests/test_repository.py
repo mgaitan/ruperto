@@ -17,6 +17,7 @@ from ruperto.config import Settings
 from ruperto.db import DatabaseRuntime, _ensure_schema_columns, create_database_runtime, init_database
 from ruperto.models import (
     Channel,
+    ChannelProvider,
     DeliveryType,
     MenuItem,
     Order,
@@ -33,7 +34,11 @@ from ruperto.repository import (
     normalize_phone_number,
     round_delay_minutes,
 )
-from ruperto.schemas import StoreBusinessHoursSnapshot, StoreProfileUpdateRequest
+from ruperto.schemas import (
+    StoreBusinessHoursSnapshot,
+    StoreChannelConnectionUpdateRequest,
+    StoreProfileUpdateRequest,
+)
 
 pytestmark = pytest.mark.anyio
 EXPECTED_HISTORY_MESSAGES = 2
@@ -133,6 +138,49 @@ async def test_store_profile_can_be_updated_with_empty_optional_fields(tmp_path:
     await close_repository(repository, runtime)
 
 
+async def test_store_channel_connection_can_be_created_and_loaded(tmp_path: Path):
+    """Store-scoped channel credentials are persisted separately from app settings."""
+    repository, runtime = await build_repository(tmp_path)
+
+    initial = await repository.get_store_channel_connection(
+        store_id=1,
+        channel=Channel.WHATSAPP,
+        provider=ChannelProvider.KAPSO,
+    )
+    updated = await repository.update_store_channel_connection(
+        store_id=1,
+        channel=Channel.WHATSAPP,
+        provider=ChannelProvider.KAPSO,
+        payload=StoreChannelConnectionUpdateRequest(
+            phone_number_id="phone-id-1",
+            api_key="kapso-key-1",
+            webhook_secret="kapso-secret-1",
+            is_active=True,
+        ),
+    )
+    runtime_config = await repository.get_store_channel_runtime_config(
+        store_id=1,
+        channel=Channel.WHATSAPP,
+        provider=ChannelProvider.KAPSO,
+    )
+    by_phone = await repository.get_channel_runtime_config_by_phone_number(
+        channel=Channel.WHATSAPP,
+        provider=ChannelProvider.KAPSO,
+        phone_number_id="phone-id-1",
+    )
+
+    assert initial.id is None
+    assert updated.is_active is True
+    assert updated.api_key_configured is True
+    assert updated.webhook_secret_configured is True
+    assert runtime_config is not None
+    assert runtime_config.phone_number_id == "phone-id-1"
+    assert by_phone is not None
+    assert by_phone.store_id == 1
+
+    await close_repository(repository, runtime)
+
+
 async def test_reset_current_order_rebuilds_a_draft_from_scratch(tmp_path: Path):
     """Draft corrections can clear current items before the order is rebuilt."""
     repository, runtime = await build_repository(tmp_path)
@@ -163,6 +211,53 @@ async def test_reset_current_order_rebuilds_a_draft_from_scratch(tmp_path: Path)
         quantity=1,
     )
     assert [item.name for item in rebuilt_order.items] == ["Lomito completo"]
+
+    await close_repository(repository, runtime)
+
+
+async def test_get_or_create_conversation_updates_store_scope(tmp_path: Path):
+    """Existing conversations can be reassigned to another store when the active local changes."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="tenant-switch-user")
+    second_store = await repository.create_store_profile(
+        store_name="Sucursal Dos",
+        bot_name="Ruperto Dos",
+        store_description="Segundo local para scope de conversación.",
+        assistant_personality="Calm and direct.",
+    )
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="tenant-switch-user",
+        customer_id=customer.id,
+        store_id=1,
+    )
+
+    reassigned = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="tenant-switch-user",
+        customer_id=customer.id,
+        store_id=second_store.id,
+    )
+
+    assert conversation.id == reassigned.id
+    assert reassigned.store_id == second_store.id
+
+    await close_repository(repository, runtime)
+
+
+async def test_discard_empty_draft_order_returns_false_without_existing_order(tmp_path: Path):
+    """Discarding an empty draft is a no-op when the customer has no draft yet."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="no-draft-user")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="no-draft-user",
+        customer_id=customer.id,
+    )
+
+    discarded = await repository.discard_empty_draft_order(customer.id, conversation.id)
+
+    assert discarded is False
 
     await close_repository(repository, runtime)
 
@@ -777,6 +872,110 @@ async def test_legacy_business_hours_table_gains_slot_index_column(tmp_path: Pat
 
     assert "slot_index" in columns
     assert migrated_row == (1, 0, "11:00", "15:00", 0)
+
+
+async def test_legacy_conversation_table_gains_store_id_column(tmp_path: Path):
+    """Legacy conversations are backfilled with the default store id during bootstrap."""
+    database_path = tmp_path / "legacy-conversation.db"
+    sync_engine = create_engine(f"sqlite:///{database_path}")
+    with sync_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE store_profile (
+                    id INTEGER PRIMARY KEY,
+                    store_name VARCHAR(120),
+                    bot_name VARCHAR(120),
+                    store_location VARCHAR(255),
+                    store_description VARCHAR(500),
+                    assistant_personality VARCHAR(255),
+                    locale VARCHAR(32),
+                    currency_code VARCHAR(8),
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO store_profile (
+                    id, store_name, bot_name, store_location, store_description,
+                    assistant_personality, locale, currency_code, created_at, updated_at
+                ) VALUES (
+                    1, 'Legacy Rotisería', 'Legacy Bot', NULL, 'Perfil viejo',
+                    'Amable', 'es-AR', 'ARS', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE customer (
+                    id INTEGER PRIMARY KEY,
+                    name VARCHAR(120),
+                    phone_number VARCHAR(32),
+                    default_address VARCHAR(255),
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO customer (
+                    id, name, phone_number, default_address, created_at, updated_at
+                ) VALUES (
+                    1, 'Cliente viejo', NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE conversation (
+                    id INTEGER PRIMARY KEY,
+                    channel VARCHAR(32),
+                    external_id VARCHAR(120),
+                    customer_id INTEGER,
+                    created_at DATETIME,
+                    updated_at DATETIME,
+                    CONSTRAINT uq_conversation_identity UNIQUE (channel, external_id)
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO conversation (
+                    id, channel, external_id, customer_id, created_at, updated_at
+                ) VALUES (
+                    1, 'dev', 'legacy-user', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        _ensure_schema_columns(connection)
+    sync_engine.dispose()
+
+    with sqlite3.connect(database_path) as sqlite_connection:
+        columns = {row[1] for row in sqlite_connection.execute("PRAGMA table_info(conversation)")}
+        migrated_row = sqlite_connection.execute(
+            """
+            SELECT store_id
+            FROM conversation
+            WHERE id = 1
+            """
+        ).fetchone()
+
+    assert "store_id" in columns
+    assert migrated_row == (1,)
 
 
 async def test_schedule_validation_helpers_cover_past_missing_prep_and_relative_day_text(tmp_path: Path):

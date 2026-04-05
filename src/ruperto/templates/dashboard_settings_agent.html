@@ -70,18 +70,116 @@
             <div class="rounded-2xl bg-white/5 px-4 py-3">
                 <dt class="font-semibold text-slate-200">Kapso</dt>
                 <dd class="mt-1 text-slate-300">
-                    {% if settings_snapshot.kapso_api_key_configured
-                    %}Configurado{% else %}Pendiente{% endif %}
+                    {% if channel_connection.is_active %}Activo para este
+                    local{% elif channel_connection.id %}Configurado para este
+                    local{% elif settings_snapshot.kapso_api_key_configured
+                    %}Usando fallback global{% else %}Pendiente{% endif %}
                 </dd>
             </div>
             <div class="rounded-2xl bg-white/5 px-4 py-3">
                 <dt class="font-semibold text-slate-200">Webhook Kapso</dt>
                 <dd class="mt-1 text-slate-300">
-                    {% if settings_snapshot.kapso_webhook_secret_configured
-                    %}Configurado{% else %}Pendiente{% endif %}
+                    {% if channel_connection.webhook_secret_configured
+                    %}Configurado para este local{% elif
+                    settings_snapshot.kapso_webhook_secret_configured %}Usando
+                    fallback global{% else %}Pendiente{% endif %}
                 </dd>
             </div>
         </dl>
+    </article>
+</section>
+<section class="mt-6 grid gap-6 xl:grid-cols-[minmax(0,1fr)_320px]">
+    <article
+        class="rounded-[2rem] border border-white/70 bg-white/85 p-6 shadow-card backdrop-blur"
+    >
+        <div class="mb-4">
+            <p
+                class="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500"
+            >
+                Canal
+            </p>
+            <h3 class="mt-2 text-2xl font-semibold text-slate-900">
+                WhatsApp vía Kapso
+            </h3>
+            <p class="mt-2 text-sm text-slate-500">
+                Guardá el número, la API key y el secreto del webhook para este
+                local. Si dejás los secretos vacíos, se conserva el valor ya
+                guardado.
+            </p>
+        </div>
+        <form
+            action="/dashboard/settings/agent/channel"
+            method="post"
+            class="space-y-4"
+        >
+            <label class="block space-y-2 text-sm font-medium text-slate-700">
+                <span>Phone number ID</span>
+                <input
+                    class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                    name="kapso_phone_number_id"
+                    value="{{ channel_connection.phone_number_id or '' }}"
+                    placeholder="597907523413541"
+                />
+            </label>
+            <label class="block space-y-2 text-sm font-medium text-slate-700">
+                <span>API key</span>
+                <input
+                    class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                    name="kapso_api_key"
+                    placeholder="{% if channel_connection.api_key_configured %}Guardada, escribí otra para reemplazarla{% else %}Pegá la API key de Kapso{% endif %}"
+                />
+            </label>
+            <label class="block space-y-2 text-sm font-medium text-slate-700">
+                <span>Webhook secret</span>
+                <input
+                    class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                    name="kapso_webhook_secret"
+                    placeholder="{% if channel_connection.webhook_secret_configured %}Guardado, escribí otro para reemplazarlo{% else %}Secreto para validar webhooks{% endif %}"
+                />
+            </label>
+            <label
+                class="flex items-center gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700"
+            >
+                <input
+                    {%
+                    if
+                    channel_connection.is_active
+                    %}checked{%
+                    endif
+                    %}
+                    class="h-4 w-4 rounded border-slate-300 text-ember focus:ring-ember"
+                    name="kapso_is_active"
+                    type="checkbox"
+                />
+                <span>Activar esta conexión para el local</span>
+            </label>
+            <div class="flex justify-end">
+                <button
+                    class="rounded-full bg-ink px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-800"
+                    type="submit"
+                >
+                    Guardar canal
+                </button>
+            </div>
+        </form>
+    </article>
+
+    <article
+        class="rounded-[2rem] border border-white/70 bg-white/85 p-6 shadow-card backdrop-blur"
+    >
+        <p
+            class="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500"
+        >
+            Alcance
+        </p>
+        <h3 class="mt-2 text-2xl font-semibold text-slate-900">
+            Configuración por local
+        </h3>
+        <p class="mt-3 text-sm leading-6 text-slate-600">
+            Cada comercio puede tener su propio número de WhatsApp. Las
+            variables de entorno siguen sirviendo como fallback de desarrollo,
+            pero el comportamiento recomendado es configurarlo desde este panel.
+        </p>
     </article>
 </section>
 {% endblock %}

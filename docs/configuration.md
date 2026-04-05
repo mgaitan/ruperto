@@ -93,18 +93,21 @@ RUPERTO_ASSISTANT_MODEL_RETRY_ATTEMPTS
   failure before returning the fallback handoff reply.
 
 RUPERTO_KAPSO_API_KEY
-  API key for Kapso WhatsApp operations.
-  Used by the Kapso-backed WhatsApp adapter to send assistant replies and
-  proactive order-status notifications.
+  Fallback API key for Kapso WhatsApp operations.
+  Used when the active store does not yet have a Kapso connection configured in
+  the dashboard.
 
 RUPERTO_KAPSO_PHONE_NUMBER_ID
-  Kapso or WhatsApp phone number identifier used by outbound messaging.
+  Fallback Kapso or WhatsApp phone number identifier used by outbound
+  messaging.
 
 RUPERTO_KAPSO_WEBHOOK_SECRET
-  Shared secret used to verify the `X-Webhook-Signature` header sent by Kapso
-  phone-number webhooks.
+  Fallback shared secret used to verify the `X-Webhook-Signature` header sent
+  by Kapso phone-number webhooks.
   Use the same value when you create the webhook in Kapso for
   `/webhooks/whatsapp/kapso`.
+  For multi-store setups, prefer saving the Kapso connection directly from the
+  dashboard so each store can own its own WhatsApp number.
 
 PYTHONPATH
   Python import search path.
