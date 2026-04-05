@@ -1212,6 +1212,50 @@ async def test_turn_context_hint_marks_order_corrections_and_variant_splits(tmp_
     await runtime.engine.dispose()
 
 
+async def test_turn_context_hint_keeps_split_corrections_ambiguous_when_multiple_groups_were_offered(tmp_path: Path):
+    """`Uno de cada` should ask for clarification if the previous turn mixed multiple product groups."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    current_order = OrderSnapshot(
+        id=1,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=None,
+        delivery_address=None,
+        payment_method=None,
+        total_amount_cents=1420000,
+        total_amount_display="$ 14.200",
+        items=[
+            OrderItemSnapshot(
+                menu_item_id=1,
+                name="Lomito especial",
+                quantity=1,
+                unit_price_cents=1420000,
+                unit_price_display="$ 14.200",
+                notes=None,
+            )
+        ],
+    )
+
+    hint = service._build_turn_context_hint(
+        customer=CustomerSnapshot(id=1, name="Ana", phone_number=None, default_address=None),
+        message_text="dije uno de cada uno",
+        current_order=current_order,
+        latest_assistant_text=(
+            "Ana, tenemos dos opciones de lomos: Lomito completo ($13.200) y Lomito especial ($14.200). "
+            "¿Cuáles preferís? Y para las papas, "
+            "¿quisieras Papas fritas clásicas ($4.300) o Papas cheddar y bacon ($6.900)?"
+        ),
+    )
+
+    assert hint is not None
+    assert "sigue siendo ambiguo" in hint
+    assert "interpretalo como una unidad de cada opción" not in hint
+
+    await runtime.engine.dispose()
+
+
 async def test_turn_context_hint_describes_missing_checkout_fields(tmp_path: Path):
     """Draft orders add explicit hints about whichever checkout field is still missing."""
     runtime = create_database_runtime(build_settings(tmp_path))
@@ -1406,12 +1450,65 @@ async def test_answer_menu_information_turn_uses_previous_focus_for_price_follow
     await runtime.engine.dispose()
 
 
+async def test_answer_menu_information_turn_respects_non_alcoholic_constraints(tmp_path: Path):
+    """Category suggestions should filter out alcoholic drinks when the customer asks for non-alcoholic options."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        reply = await service._answer_menu_information_turn(
+            AssistantReply(reply_text="Sí, tenemos bebidas.", next_step=AssistantNextStep.CHOOSE_ITEMS),
+            repository=repository,
+            message_text="¿Tenés algo para tomar sin alcohol?",
+            previous_user_message="Dame un tiramisú y un cheesecake.",
+            turn_policy=TurnPolicy(allow_order_mutations=False, allow_order_confirmation=False),
+        )
+
+    lowered_reply = reply.reply_text.lower()
+    assert "agua" in lowered_reply
+    assert "gaseosa" in lowered_reply
+    assert "cerveza" not in lowered_reply
+
+    await runtime.engine.dispose()
+
+
 async def test_filter_menu_options_for_unknown_focus_returns_empty_list(tmp_path: Path):
     """Unknown informational focuses should not match any menu items."""
     runtime = create_database_runtime(build_settings(tmp_path))
     service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
 
     assert service._filter_menu_options_for_focus([], focus="desconocido") == []
+
+    await runtime.engine.dispose()
+
+
+async def test_parse_menu_helpers_skip_unknown_or_duplicate_segments(tmp_path: Path):
+    """Deterministic order parsing should ignore unknown chunks and duplicate item mentions."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        menu_items = await repository.list_menu_items()
+
+    parsed = service._parse_menu_lines_from_message(
+        "Quiero 2 pizzas muzza, 2 pizzas muzza y algo raro.",
+        menu_items=menu_items,
+    )
+    unknown_quantity, unknown_item = service._parse_menu_line_segment("!!!", menu_items=menu_items)
+    low_score_quantity, low_score_item = service._parse_menu_line_segment("sorpresa alien", menu_items=menu_items)
+
+    assert [(item.name, quantity) for item, quantity in parsed] == [("Pizza muzzarella", 2)]
+    assert unknown_quantity == 1
+    assert unknown_item is None
+    assert low_score_quantity == 1
+    assert low_score_item is None
+    assert service._alias_match_score({"pizza"}, set()) == 0.0
 
     await runtime.engine.dispose()
 
@@ -3082,5 +3179,129 @@ async def test_customer_correction_can_rebuild_the_current_order(tmp_path: Path)
     assert result.current_order.total_amount_display == "$ 27.400"
     assert result.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
     assert "papas, una bebida o un postre" in result.reply.reply_text.lower()
+
+    await runtime.engine.dispose()
+
+
+async def test_model_failure_recovers_large_multi_item_orders_deterministically(tmp_path: Path):
+    """Large first-turn orders should degrade into a deterministic draft instead of a generic handoff."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    baseline_service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        baseline_service,
+        channel=Channel.DEV,
+        external_user_id="large-order-recovery-user",
+        name="Diego",
+    )
+
+    class FailingAgent:
+        async def run(self, *args: Any, **kwargs: Any):
+            raise RuntimeError
+
+    service = OrderingAssistantService(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        agent=cast(Any, FailingAgent()),
+    )
+    service.settings.assistant_model_retry_attempts = 1
+
+    result = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="large-order-recovery-user",
+        message_text="Quiero 2 pizzas muzza, 1 docena de empanadas clásicas y 2 gaseosas cola 1.5L.",
+    )
+
+    assert result.reply.handoff is False
+    assert result.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
+    assert "2 x Pizza muzzarella" in result.reply.reply_text
+    assert "1 x Docena de empanadas clásicas" in result.reply.reply_text
+    assert "2 x Gaseosa cola 1.5L" in result.reply.reply_text
+    assert result.current_order is not None
+    assert [item.name for item in result.current_order.items] == [
+        "Pizza muzzarella",
+        "Docena de empanadas clásicas",
+        "Gaseosa cola 1.5L",
+    ]
+    assert [item.quantity for item in result.current_order.items] == [2, 1, 2]
+
+    await runtime.engine.dispose()
+
+
+async def test_recover_large_order_after_model_failure_returns_none_when_not_enough_lines_parse(tmp_path: Path):
+    """Large-order recovery should refuse ambiguous parses with fewer than two solid lines."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        service,
+        channel=Channel.DEV,
+        external_user_id="large-order-weak-parse-user",
+        name="Diego",
+    )
+
+    async with service.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(
+            channel=Channel.DEV, external_id="large-order-weak-parse-user"
+        )
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.DEV,
+            external_id="large-order-weak-parse-user",
+            customer_id=customer.id,
+        )
+        await session.commit()
+
+    result = await service._recover_large_order_after_model_failure(
+        conversation_id=conversation.id,
+        customer_id=customer.id,
+        customer=customer,
+        user_text="Quiero una hamburguesa completa y sorpresa.",
+        store_id=settings.default_store_id,
+    )
+
+    assert result is None
+
+    await runtime.engine.dispose()
+
+
+async def test_recover_large_order_after_model_failure_skips_existing_draft_orders(tmp_path: Path):
+    """Large-order recovery should not overwrite an existing draft."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        service,
+        channel=Channel.DEV,
+        external_user_id="large-order-existing-draft-user",
+        name="Diego",
+    )
+
+    async with service.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(
+            channel=Channel.DEV,
+            external_id="large-order-existing-draft-user",
+        )
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.DEV,
+            external_id="large-order-existing-draft-user",
+            customer_id=customer.id,
+        )
+        await repository.add_item_to_current_order(customer.id, conversation.id, sku="hamburguesa-completa", quantity=1)
+        await session.commit()
+
+    result = await service._recover_large_order_after_model_failure(
+        conversation_id=conversation.id,
+        customer_id=customer.id,
+        customer=customer,
+        user_text="Quiero 2 pizzas muzza, 1 docena de empanadas clásicas y 2 gaseosas cola 1.5L.",
+        store_id=settings.default_store_id,
+    )
+
+    assert result is None
 
     await runtime.engine.dispose()

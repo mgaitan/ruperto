@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -177,6 +178,27 @@ MENU_INFORMATION_GROUPS = {
         "category_hints": ("postres",),
     },
 }
+MENU_CONSTRAINT_PATTERNS = {
+    "non_alcoholic": (
+        "sin alcohol",
+        "no alcohol",
+        "sin cerveza",
+        "no cerveza",
+        "sin birra",
+        "sin bebidas alcoholicas",
+        "sin bebidas alcohólicas",
+    ),
+}
+COMMON_MENU_SYNONYMS = {
+    "muzzarella": ("muzza",),
+    "hamburguesa": ("burger", "burguer"),
+    "milanesa": ("mila",),
+}
+MIN_LARGE_ORDER_SEGMENTS = 2
+MIN_LARGE_ORDER_QUANTITY_MENTIONS = 2
+MIN_PARSED_FALLBACK_LINES = 2
+MIN_ALIAS_MATCH_SCORE = 0.55
+MIN_PLURAL_TOKEN_LENGTH = 3
 EXPLICIT_CONFIRMATION_HINTS = (
     "confirmo",
     "confirmá",
@@ -566,10 +588,21 @@ class OrderingAssistantService:
         self,
         *,
         conversation_id: int,
+        customer_id: int,
         customer: CustomerSnapshot,
         user_text: str,
+        store_id: int,
     ) -> AssistantTurnResult:
         """Persist and return a friendly fallback when the model is unavailable."""
+        recovered_result = await self._recover_large_order_after_model_failure(
+            conversation_id=conversation_id,
+            customer_id=customer_id,
+            customer=customer,
+            user_text=user_text,
+            store_id=store_id,
+        )
+        if recovered_result is not None:
+            return recovered_result
         fallback_reply = AssistantReply(
             reply_text=MODEL_UNAVAILABLE_REPLY,
             next_step=AssistantNextStep.HANDOFF,
@@ -591,6 +624,70 @@ class OrderingAssistantService:
             current_order=None,
         )
 
+    async def _recover_large_order_after_model_failure(
+        self,
+        *,
+        conversation_id: int,
+        customer_id: int,
+        customer: CustomerSnapshot,
+        user_text: str,
+        store_id: int,
+    ) -> AssistantTurnResult | None:
+        """Try a deterministic recovery for large multi-item orders after a model failure."""
+        if not self._looks_like_large_order_attempt(user_text):
+            return None
+
+        async with self.session_factory() as session:
+            repository = BusinessRepository(session)
+            menu_items = await repository.list_menu_items()
+            parsed_lines = self._parse_menu_lines_from_message(user_text, menu_items=menu_items)
+            if len(parsed_lines) < MIN_PARSED_FALLBACK_LINES:
+                return None
+
+            current_order = await repository.get_current_order(customer_id, conversation_id, create_if_missing=False)
+            if current_order is not None and current_order.items:
+                return None
+
+            rebuilt_order: OrderSnapshot | None = None
+            for menu_item, quantity in parsed_lines:
+                rebuilt_order = await repository.add_item_to_current_order(
+                    customer_id,
+                    conversation_id,
+                    sku=menu_item.sku,
+                    quantity=quantity,
+                )
+            assert rebuilt_order is not None
+
+            store = await repository.get_store_profile(store_id=store_id)
+            delay = await repository.get_estimated_delay(customer_id, conversation_id)
+            reply = self._guide_reply_with_current_order(
+                AssistantReply(
+                    reply_text="Anotado.",
+                    next_step=AssistantNextStep.CHOOSE_ITEMS,
+                    handoff=False,
+                ),
+                customer=customer,
+                current_order=rebuilt_order,
+                message_text=user_text,
+                delay=delay,
+                store=store,
+                order_changed_during_turn=True,
+                item_lines_changed_during_turn=True,
+            )
+            await self._persist_direct_reply(
+                repository=repository,
+                conversation_id=conversation_id,
+                user_text=user_text,
+                reply_text=reply.reply_text,
+            )
+            await session.commit()
+            return AssistantTurnResult(
+                conversation_id=conversation_id,
+                customer=customer,
+                reply=reply,
+                current_order=rebuilt_order,
+            )
+
     async def _recover_missing_confirmation_result(
         self,
         *,
@@ -608,8 +705,10 @@ class OrderingAssistantService:
             if current_order is None or not current_order.items or current_order.status.value != "draft":
                 return await self._build_model_unavailable_result(
                     conversation_id=conversation_id,
+                    customer_id=customer_id,
                     customer=customer,
                     user_text=user_text,
+                    store_id=store_id,
                 )
             reply = AssistantReply(
                 reply_text=self._build_order_review_reply(
@@ -797,16 +896,20 @@ class OrderingAssistantService:
         except TimeoutError:
             return await self._build_model_unavailable_result(
                 conversation_id=conversation_id,
+                customer_id=customer_id,
                 customer=customer,
                 user_text=message_text,
+                store_id=resolved_store_id,
             )
         except Exception as error:
             if isinstance(error, (InformationalTurnMutationError, MissingConfirmationSignalError)):
                 raise
             return await self._build_model_unavailable_result(
                 conversation_id=conversation_id,
+                customer_id=customer_id,
                 customer=customer,
                 user_text=message_text,
+                store_id=resolved_store_id,
             )
 
         async with self.session_factory() as session:
@@ -1275,13 +1378,22 @@ class OrderingAssistantService:
         if (
             self._message_requests_split_across_recent_options(message_text)
             and latest_assistant_text is not None
-            and "tenemos:" in latest_assistant_text.casefold()
-        ):
-            hints.append(
-                "En el turno anterior acabás de ofrecer variantes del mismo producto. "
-                "Si ahora responde 'uno y uno' o 'uno de cada', interpretalo como una "
-                "unidad de cada opción recién ofrecida."
+            and any(
+                hint in latest_assistant_text.casefold() for hint in ("tenemos:", "tenemos ", "opciones", "variantes")
             )
+        ):
+            if self._latest_options_are_ambiguous(latest_assistant_text):
+                hints.append(
+                    "En el turno anterior ofreciste variantes para más de un grupo de productos. "
+                    "Si ahora responde 'uno y uno' o 'uno de cada', sigue siendo ambiguo: "
+                    "pedí que aclare a cuál se refiere antes de tocar el pedido."
+                )
+            else:
+                hints.append(
+                    "En el turno anterior acabás de ofrecer variantes del mismo producto. "
+                    "Si ahora responde 'uno y uno' o 'uno de cada', interpretalo como una "
+                    "unidad de cada opción recién ofrecida."
+                )
         hints.extend(self._build_current_order_context_hints(customer=customer, current_order=current_order))
 
         if not hints:
@@ -1572,6 +1684,25 @@ class OrderingAssistantService:
             )
         )
 
+    def _detect_menu_information_constraints(
+        self,
+        message_text: str,
+        *,
+        previous_user_message: str | None = None,
+    ) -> set[str]:
+        """Infer simple browsing constraints from the latest menu-information turn."""
+        messages = [message_text]
+        if previous_user_message is not None:
+            messages.append(previous_user_message)
+
+        constraints: set[str] = set()
+        for raw_message in messages:
+            lowered = raw_message.casefold()
+            for constraint, hints in MENU_CONSTRAINT_PATTERNS.items():
+                if any(hint in lowered for hint in hints):
+                    constraints.add(constraint)
+        return constraints
+
     def _detect_menu_information_focus(
         self,
         message_text: str,
@@ -1595,11 +1726,140 @@ class OrderingAssistantService:
                 return focus
         return None
 
+    def _menu_item_matches_constraints(self, item: MenuItemSnapshot, *, constraints: set[str]) -> bool:
+        """Return whether one menu item satisfies the requested browsing constraints."""
+        return "non_alcoholic" not in constraints or not self._item_is_alcoholic(item.name)
+
+    def _latest_options_are_ambiguous(self, latest_assistant_text: str) -> bool:
+        """Return whether the latest options mixed multiple product families."""
+        lowered = latest_assistant_text.casefold()
+        mentioned_groups = {
+            focus
+            for focus, config in MENU_INFORMATION_GROUPS.items()
+            if any(hint in lowered for hint in config["message_hints"])
+        }
+        if "lomo" in lowered or "lomito" in lowered:
+            mentioned_groups.add("lomitos")
+        return len(mentioned_groups) > 1
+
+    def _looks_like_large_order_attempt(self, message_text: str) -> bool:
+        """Return whether one message looks like a dense multi-item order."""
+        lowered = self._normalize_menu_text(message_text)
+        if not any(hint in lowered for hint in ORDER_INTENT_HINTS):
+            return False
+        segment_count = len([part for part in re.split(r",|\sy\s", lowered) if part.strip()])
+        quantity_mentions = len(re.findall(r"\b\d+\b", lowered))
+        return segment_count >= MIN_LARGE_ORDER_SEGMENTS or quantity_mentions >= MIN_LARGE_ORDER_QUANTITY_MENTIONS
+
+    def _parse_menu_lines_from_message(
+        self,
+        message_text: str,
+        *,
+        menu_items: list[MenuItemSnapshot],
+    ) -> list[tuple[MenuItemSnapshot, int]]:
+        """Extract simple quantity + menu-item pairs from a dense order message."""
+        normalized_message = self._normalize_menu_text(message_text)
+        raw_segments = [segment.strip() for segment in re.split(r",|\sy\s", normalized_message) if segment.strip()]
+        parsed_lines: list[tuple[MenuItemSnapshot, int]] = []
+        seen_skus: set[str] = set()
+
+        for segment in raw_segments:
+            quantity, item = self._parse_menu_line_segment(segment, menu_items=menu_items)
+            if item is None or item.sku in seen_skus:
+                continue
+            parsed_lines.append((item, quantity))
+            seen_skus.add(item.sku)
+        return parsed_lines
+
+    def _parse_menu_line_segment(
+        self,
+        segment: str,
+        *,
+        menu_items: list[MenuItemSnapshot],
+    ) -> tuple[int, MenuItemSnapshot | None]:
+        """Parse one message segment into a quantity and the best menu match."""
+        quantity = 1
+        cleaned_segment = segment.strip(" .!?")
+        for prefix in (
+            "quiero ",
+            "quisiera ",
+            "dame ",
+            "mandame ",
+            "mandame ",
+            "sumame ",
+            "agregame ",
+            "te pido ",
+        ):
+            if cleaned_segment.startswith(prefix):
+                cleaned_segment = cleaned_segment[len(prefix) :].strip()
+                break
+        if quantity_match := re.match(r"(?P<qty>\d+)\s+", cleaned_segment):
+            quantity = int(quantity_match.group("qty"))
+            cleaned_segment = cleaned_segment[quantity_match.end() :].strip()
+
+        segment_tokens = set(self._tokenize_menu_text(cleaned_segment))
+        if not segment_tokens:
+            return quantity, None
+
+        best_item: MenuItemSnapshot | None = None
+        best_score = 0.0
+        for item in menu_items:
+            aliases = self._menu_item_aliases(item)
+            item_score = max(
+                (self._alias_match_score(segment_tokens, alias_tokens) for alias_tokens in aliases),
+                default=0.0,
+            )
+            if item_score > best_score:
+                best_item = item
+                best_score = item_score
+
+        if best_score < MIN_ALIAS_MATCH_SCORE:
+            return quantity, None
+        return quantity, best_item
+
+    def _menu_item_aliases(self, item: MenuItemSnapshot) -> list[set[str]]:
+        """Build a few normalized aliases for deterministic menu matching."""
+        normalized_name = self._normalize_menu_text(item.name)
+        candidates = {normalized_name, self._normalize_menu_text(item.sku.replace("-", " "))}
+        tokens = normalized_name.split()
+        if len(tokens) > 1:
+            candidates.add(" ".join(tokens[1:]))
+        for source, replacements in COMMON_MENU_SYNONYMS.items():
+            if source in normalized_name:
+                for replacement in replacements:
+                    candidates.add(normalized_name.replace(source, replacement))
+        return [set(self._tokenize_menu_text(candidate)) for candidate in candidates if candidate]
+
+    def _alias_match_score(self, segment_tokens: set[str], alias_tokens: set[str]) -> float:
+        """Score one alias against one normalized message segment."""
+        if not alias_tokens:
+            return 0.0
+        overlap = len(segment_tokens & alias_tokens)
+        return overlap / len(alias_tokens)
+
+    def _tokenize_menu_text(self, text: str) -> list[str]:
+        """Split normalized text into fuzzy-match tokens."""
+        raw_tokens = re.findall(r"[a-z0-9.]+", text)
+        tokens: list[str] = []
+        for token in raw_tokens:
+            if token in {"de", "la", "las", "los", "con", "sin", "por", "para"}:
+                continue
+            singular = token[:-1] if token.endswith("s") and len(token) > MIN_PLURAL_TOKEN_LENGTH else token
+            tokens.append(singular)
+        return tokens
+
+    def _normalize_menu_text(self, text: str) -> str:
+        """Normalize accents and punctuation for deterministic menu parsing."""
+        stripped = unicodedata.normalize("NFKD", text)
+        ascii_text = "".join(char for char in stripped if not unicodedata.combining(char))
+        return ascii_text.casefold()
+
     def _filter_menu_options_for_focus(
         self,
         menu_items: list[MenuItemSnapshot],
         *,
         focus: str,
+        constraints: set[str] | None = None,
     ) -> list[MenuItemSnapshot]:
         """Return menu items matching one informational focus."""
         config = MENU_INFORMATION_GROUPS.get(focus)
@@ -1615,7 +1875,10 @@ class OrderingAssistantService:
                 continue
             if any(hint in lowered_category for hint in config["category_hints"]):
                 category_matches.append(item)
-        return name_matches or category_matches
+        matches = name_matches or category_matches
+        if not constraints:
+            return matches
+        return [item for item in matches if self._menu_item_matches_constraints(item, constraints=constraints)]
 
     async def _answer_menu_information_turn(
         self,
@@ -1638,7 +1901,15 @@ class OrderingAssistantService:
             return reply
 
         menu_items = await repository.list_menu_items()
-        matching_items = self._filter_menu_options_for_focus(menu_items, focus=focus)[:4]
+        constraints = self._detect_menu_information_constraints(
+            message_text,
+            previous_user_message=previous_user_message,
+        )
+        matching_items = self._filter_menu_options_for_focus(
+            menu_items,
+            focus=focus,
+            constraints=constraints,
+        )[:4]
         if not matching_items:
             return reply
 
@@ -1958,7 +2229,13 @@ class OrderingAssistantService:
 
     def _item_is_beverage(self, item_name: str) -> bool:
         """Return whether one line item is a beverage."""
-        return any(keyword in item_name for keyword in ("gaseosa", "agua", "cerveza", "saborizada"))
+        lowered = item_name.casefold()
+        return any(keyword in lowered for keyword in ("gaseosa", "agua", "cerveza", "saborizada"))
+
+    def _item_is_alcoholic(self, item_name: str) -> bool:
+        """Return whether one menu item is alcoholic."""
+        lowered = item_name.casefold()
+        return any(keyword in lowered for keyword in ("cerveza", "ipa", "rubia", "roja"))
 
     def _item_is_dessert(self, item_name: str) -> bool:
         """Return whether one line item is a dessert."""

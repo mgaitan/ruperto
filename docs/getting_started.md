@@ -120,6 +120,12 @@ chooses a main dish.
 Informational menu questions are also grounded more explicitly now, so prompts
 like `¿Tenés gaseosas?` should return concrete options and prices instead of a
 generic yes/no answer.
+Those informational answers also respect simple constraints such as `sin
+alcohol`, and correction messages like `uno de cada` are now treated more
+carefully when the previous assistant turn mixed variants from multiple
+product groups. If the model itself fails on a dense first-turn order, the
+backend can now recover some multi-item drafts deterministically instead of
+always falling back to a generic handoff.
 
 Or launch the built-in PydanticAI web client for development:
 

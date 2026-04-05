@@ -113,6 +113,11 @@ simple add-on suggestions.
 Informational menu questions are also handled more proactively now: if a
 customer asks for a category such as soft drinks, the assistant should list
 concrete options with prices instead of answering with a bare yes/no.
+That browsing layer now also respects simple constraints such as `sin alcohol`
+when suggesting drinks, asks for clarification instead of over-interpreting
+ambiguous follow-ups like `uno de cada` across multiple product groups, and
+can recover some large first-turn multi-item orders deterministically if the
+model fails before building the draft.
 Compact customer messages are also handled more naturally now, so the assistant
 can reuse cues such as a self-introduction, a payment hint like `te pago acá`,
 and a same-turn price question without asking for the same detail twice.
