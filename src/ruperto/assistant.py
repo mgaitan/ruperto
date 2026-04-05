@@ -58,6 +58,8 @@ Reglas operativas:
 - Si el cliente ya eligió una comida y todavía no sumó bebida ni postre,
   podés sugerir una opción de bebida o postre de forma breve y natural.
 - Si el cliente ya expresó una preferencia de pago en el mensaje actual, no la repreguntes.
+- Registrar el medio de pago no alcanza para cerrar el pedido:
+  recién lo confirmás cuando el cliente lo aprueba explícitamente en ese turno.
 - Si el cliente pregunta si hay una categoría o producto, no respondas solo sí o no:
   mencioná opciones concretas y precios.
 - Si el cliente pregunta cuánto sale sobre una categoría o producto, respondé el precio
@@ -589,6 +591,49 @@ class OrderingAssistantService:
             current_order=None,
         )
 
+    async def _recover_missing_confirmation_result(
+        self,
+        *,
+        conversation_id: int,
+        customer_id: int,
+        customer: CustomerSnapshot,
+        store_id: int,
+        user_text: str,
+    ) -> AssistantTurnResult:
+        """Recover gracefully when the model jumps to confirmation too early."""
+        async with self.session_factory() as session:
+            repository = BusinessRepository(session)
+            current_order = await repository.get_latest_order(customer_id, conversation_id)
+            store = await repository.get_store_profile(store_id=store_id)
+            if current_order is None or not current_order.items or current_order.status.value != "draft":
+                return await self._build_model_unavailable_result(
+                    conversation_id=conversation_id,
+                    customer=customer,
+                    user_text=user_text,
+                )
+            reply = AssistantReply(
+                reply_text=self._build_order_review_reply(
+                    customer=customer,
+                    current_order=current_order,
+                    store=store,
+                ),
+                next_step=AssistantNextStep.CONFIRM_ORDER,
+                handoff=False,
+            )
+            await self._persist_direct_reply(
+                repository=repository,
+                conversation_id=conversation_id,
+                user_text=user_text,
+                reply_text=reply.reply_text,
+            )
+            await session.commit()
+        return AssistantTurnResult(
+            conversation_id=conversation_id,
+            customer=customer,
+            reply=reply,
+            current_order=current_order,
+        )
+
     async def _run_agent_with_retries(
         self,
         *,
@@ -639,7 +684,7 @@ class OrderingAssistantService:
         assert last_error is not None
         raise last_error
 
-    async def handle_customer_message(  # noqa: PLR0915
+    async def handle_customer_message(  # noqa: C901, PLR0915
         self,
         *,
         channel: Channel,
@@ -739,6 +784,16 @@ class OrderingAssistantService:
                     conversation_id=conversation_id,
                 ),
             )
+        except MissingConfirmationSignalError:
+            if self._detect_payment_method_hint(message_text) is None or current_order_before_run is None:
+                raise
+            return await self._recover_missing_confirmation_result(
+                conversation_id=conversation_id,
+                customer_id=customer_id,
+                customer=customer,
+                store_id=resolved_store_id,
+                user_text=message_text,
+            )
         except TimeoutError:
             return await self._build_model_unavailable_result(
                 conversation_id=conversation_id,
@@ -811,7 +866,9 @@ class OrderingAssistantService:
                     reply,
                     customer=refreshed_customer,
                     current_order=current_order,
+                    message_text=message_text,
                     delay=delay,
+                    store=store,
                     order_changed_during_turn=self._order_changed_during_turn(
                         previous_order=current_order_before_run,
                         current_order=current_order,
@@ -835,6 +892,13 @@ class OrderingAssistantService:
                     availability=availability,
                     conversation_id=conversation_id,
                     latest_assistant_text=latest_assistant_text,
+                )
+                reply = self._decorate_reply_with_store_availability(
+                    reply,
+                    availability,
+                    conversation_id=conversation_id,
+                    latest_assistant_text=latest_assistant_text,
+                    current_order=current_order,
                 )
             if not turn_policy.allow_order_mutations:
                 current_order = None
@@ -1119,21 +1183,17 @@ class OrderingAssistantService:
         lowered = message_text.casefold()
         has_order_intent = any(hint in lowered for hint in ORDER_INTENT_HINTS)
         asks_menu_information = any(hint in lowered for hint in INFORMATIONAL_MENU_HINTS)
+        asks_delivery_information = self._message_requests_delivery_information(message_text)
         explicit_confirmation = any(hint in lowered for hint in EXPLICIT_CONFIRMATION_HINTS)
-        payment_hint = self._detect_payment_method_hint(message_text)
 
-        allow_order_mutations = has_order_intent or not asks_menu_information
-        allow_order_confirmation = (
-            explicit_confirmation
-            or has_order_intent
-            or (payment_hint is not None and current_order is not None and bool(current_order.items))
-        )
+        allow_order_mutations = has_order_intent or (not asks_menu_information and not asks_delivery_information)
+        allow_order_confirmation = explicit_confirmation
         return TurnPolicy(
             allow_order_mutations=allow_order_mutations,
             allow_order_confirmation=allow_order_confirmation,
         )
 
-    def _build_turn_context_hint(  # noqa: C901, PLR0913
+    def _build_turn_context_hint(  # noqa: C901, PLR0912, PLR0913
         self,
         *,
         customer: CustomerSnapshot,
@@ -1190,6 +1250,11 @@ class OrderingAssistantService:
                     "El cliente quiere saber cuánto sale en este mismo turno. "
                     "Si ya podés calcularlo con herramientas, informá el total o subtotal actual."
                 )
+        if self._message_requests_delivery_information(message_text):
+            hints.append(
+                "El cliente está haciendo una consulta informativa sobre envío o zona. "
+                "Respondé eso sin empujarlo al próximo paso del checkout ni asumir que ya confirmó el pedido."
+            )
         if pending_customer_message is not None:
             hints.append(
                 "Antes de identificarse, el cliente dejó una consulta pendiente: "
@@ -1285,23 +1350,45 @@ class OrderingAssistantService:
             }
         )
 
-    def _guide_reply_with_current_order(  # noqa: PLR0911, PLR0913
+    def _guide_reply_with_current_order(  # noqa: C901, PLR0911, PLR0913
         self,
         reply: AssistantReply,
         *,
         customer: CustomerSnapshot,
         current_order: OrderSnapshot | None,
+        message_text: str,
         delay: DelayEstimateSnapshot | None,
+        store: StoreProfileSnapshot,
         order_changed_during_turn: bool = True,
         item_lines_changed_during_turn: bool = True,
     ) -> AssistantReply:
         """Prefer deterministic checkout guidance once a draft already exists."""
         if current_order is None or not current_order.items or current_order.status.value != "draft":
             return reply
+        if self._message_requests_delivery_information(message_text):
+            if self._reply_is_checkout_prompt(reply):
+                return reply.model_copy(
+                    update={
+                        "reply_text": self._build_delivery_information_reply(message_text),
+                        "next_step": AssistantNextStep.CHOOSE_ITEMS,
+                    }
+                )
+            return reply
         if not order_changed_during_turn and reply.next_step == AssistantNextStep.CHOOSE_ITEMS:
             return reply
 
         timing_text = self._build_timing_prompt_fragment(current_order=current_order, delay=delay)
+        if current_order.payment_method is not None and order_changed_during_turn:
+            return reply.model_copy(
+                update={
+                    "reply_text": self._build_order_review_reply(
+                        customer=customer,
+                        current_order=current_order,
+                        store=store,
+                    ),
+                    "next_step": AssistantNextStep.CONFIRM_ORDER,
+                }
+            )
         if item_lines_changed_during_turn and self._should_offer_add_on(current_order):
             item_summary = ", ".join(f"{item.quantity} x {item.name}" for item in current_order.items)
             template = self._pick_variant(ADD_ON_PROMPT_VARIANTS, seed=current_order.id)
@@ -1447,6 +1534,38 @@ class OrderingAssistantService:
         """Return whether the customer is splitting quantity across recently offered variants."""
         lowered = message_text.casefold()
         return "uno y uno" in lowered or "uno de cada" in lowered
+
+    def _message_requests_delivery_information(self, message_text: str) -> bool:
+        """Return whether the user is asking for delivery coverage or delivery pricing."""
+        lowered = message_text.casefold()
+        if "?" not in message_text and "¿" not in message_text:
+            return False
+        return any(
+            phrase in lowered
+            for phrase in (
+                "hacen envíos",
+                "hacen envios",
+                "tenés para enviar",
+                "tenes para enviar",
+                "envío tiene costo",
+                "envio tiene costo",
+                "costo de envío",
+                "costo de envio",
+                "sale el envío",
+                "sale el envio",
+                "cobran envío",
+                "cobran envio",
+                "por qué zona",
+                "por que zona",
+                "qué zona",
+                "que zona",
+                "llegan",
+                "alcance del envío",
+                "alcance del envio",
+                "hasta dónde",
+                "hasta donde",
+            )
+        )
 
     def _detect_menu_information_focus(
         self,
@@ -1675,7 +1794,83 @@ class OrderingAssistantService:
             return AssistantNextStep.ASK_ADDRESS
         if current_order.payment_method is None:
             return AssistantNextStep.CHOOSE_PAYMENT
-        return AssistantNextStep.COMPLETE
+        if current_order.status.value == "confirmed":
+            return AssistantNextStep.COMPLETE
+        return AssistantNextStep.CONFIRM_ORDER
+
+    def _reply_is_checkout_prompt(self, reply: AssistantReply) -> bool:
+        """Return whether the reply is steering the customer through checkout steps."""
+        if reply.next_step in {
+            AssistantNextStep.CHOOSE_DELIVERY,
+            AssistantNextStep.ASK_ADDRESS,
+            AssistantNextStep.CHOOSE_PAYMENT,
+            AssistantNextStep.CONFIRM_ORDER,
+            AssistantNextStep.COMPLETE,
+        }:
+            return True
+        lowered = reply.reply_text.casefold()
+        return any(
+            phrase in lowered
+            for phrase in (
+                "envío o retirás",
+                "pasame la dirección",
+                "preferís efectivo",
+                "link de pago",
+                "confirmamos el pedido",
+            )
+        )
+
+    def _build_delivery_information_reply(self, message_text: str) -> str:
+        """Build a safe fallback for delivery-fee or coverage questions."""
+        lowered = message_text.casefold()
+        if any(phrase in lowered for phrase in ("costo", "sale", "cobran")):
+            return (
+                "Hacemos envíos, pero desde acá no tengo cargado un costo fijo para decírtelo automáticamente. "
+                "Si querés, pasame la dirección o la zona y lo revisamos antes de cerrar el pedido."
+            )
+        return (
+            "Hacemos envíos. Para decirte si llegamos a tu zona necesito la dirección "
+            "o al menos la referencia del barrio. "
+            "Si me la pasás, lo revisamos antes de cerrar el pedido."
+        )
+
+    def _build_order_review_reply(
+        self,
+        *,
+        customer: CustomerSnapshot,
+        current_order: OrderSnapshot,
+        store: StoreProfileSnapshot,
+    ) -> str:
+        """Render a draft review using the persisted order state before explicit confirmation."""
+        item_lines = "\n".join(f"- {item.quantity} x {item.name}" for item in current_order.items)
+        delivery_text = (
+            f"Envío a {current_order.delivery_address}"
+            if current_order.delivery_type == DeliveryType.DELIVERY
+            else "Retiro por el local"
+        )
+        assert current_order.payment_method is not None
+        payment_text = {
+            PaymentMethod.CASH: "Efectivo",
+            PaymentMethod.CARD_LINK: "Link de pago",
+            PaymentMethod.TRANSFER: "Transferencia",
+        }[current_order.payment_method]
+        if current_order.payment_method is PaymentMethod.TRANSFER and store.transfer_alias:
+            payment_text = f"{payment_text} a `{store.transfer_alias}`"
+        schedule_block = ""
+        if current_order.requested_ready_at is not None:
+            schedule_block = (
+                "\n**Horario**\n"
+                f"Pedido programado para {self._describe_order_ready_time(current_order.requested_ready_at)}."
+            )
+        return (
+            f"Así queda, {customer.name or 'che'}:\n\n"
+            f"**Pedido**\n{item_lines}\n\n"
+            f"**Entrega**\n{delivery_text}\n"
+            f"{schedule_block}\n"
+            f"\n**Pago**\n{payment_text}.\n\n"
+            f"**Total**\n{current_order.total_amount_display}\n\n"
+            "Si está bien así, confirmámelo y lo cierro."
+        )
 
     def _build_timing_prompt_fragment(
         self,

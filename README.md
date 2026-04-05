@@ -77,13 +77,15 @@ You should then have:
 - development chat endpoint at `http://127.0.0.1:8000/api/dev/messages`
 - development web chat at `http://127.0.0.1:7932/`
 
-The current development flow asks for the customer's name before the first
-order unless the customer already introduced themself in the opening message.
-If the first customer message already contains an order or menu question, that
-intent is now remembered and resumed as soon as the customer shares their
-name, instead of resetting the conversation. The assistant also estimates
-kitchen delay from preparation time plus active workload and lets staff move
-orders through operational statuses with `PATCH /api/orders/{order_id}/status`.
+The current development flow no longer blocks purely informational questions
+behind the customer's name. The assistant can answer menu or delivery
+questions first, then ask for the name once it is actually needed to keep
+building or confirming the order. If the first customer message already
+contains an order, that intent is still remembered and resumed as soon as the
+customer shares their name, instead of resetting the conversation. The
+assistant also estimates kitchen delay from preparation time plus active
+workload and lets staff move orders through operational statuses with
+`PATCH /api/orders/{order_id}/status`.
 Store opening hours are now configurable through `GET/PUT /api/store-hours`.
 Each weekday can have zero, one, or many opening slots, so a store can stay
 closed on Mondays, open only at lunch on Sundays, or split the day into as
@@ -93,6 +95,11 @@ If a customer asks for a later ready time such as `para las 12`, the backend
 can now keep the order scheduled for that slot, store when preparation should
 start, and include the configured transfer alias when the payment method is
 `transferencia`.
+After the checkout details are complete, the assistant now shows a deterministic
+review of the persisted draft and only closes the order after an explicit final
+confirmation from the customer. Informational delivery questions such as
+shipping cost or area coverage also stay in informational mode instead of
+forcing the checkout script.
 The backend also serves a simple Tailwind staff dashboard at `/dashboard`.
 Dashboard access now uses a minimal session cookie login backed by a bootstrap
 staff user configured through environment variables. Once signed in, the team

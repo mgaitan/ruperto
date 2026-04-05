@@ -91,9 +91,9 @@ curl -X POST http://127.0.0.1:8000/api/dev/messages \
   -d '{"external_user_id":"cliente-demo","message_text":"Hola, quiero pedir"}'
 ```
 
-For a brand-new customer, the assistant first asks for the person's name before
-continuing with the order flow, unless the opening message already contains a
-self-introduction such as `Hola, soy Martín`. That name is then reused across
+For a brand-new customer, the assistant can answer purely informational menu or
+delivery questions without blocking on the person's name. Once a real order is
+being built, it still asks for the name if needed and then reuses it across
 later messages for the same development identity.
 If the first message already contained an order or menu question, that pending
 intent is remembered while the assistant asks for the name and then resumed as
@@ -106,6 +106,11 @@ If the customer asks for a later ready time such as `Quiero una hamburguesa
 para las 12`, the order can now stay scheduled for that slot instead of being
 treated as immediate. Confirmed summaries also include the configured transfer
 alias whenever the chosen payment method is `transferencia`.
+Once the checkout details are complete, the assistant now shows a deterministic
+review based on the persisted draft and waits for an explicit final
+confirmation before closing the order. Informational delivery questions such as
+shipping cost or area coverage also stay out of the checkout script instead of
+jumping straight to address or payment prompts.
 
 The seeded demo menu now includes a broader synthetic catalog with pizzas,
 hamburgers, lomitos, milanesas, wraps, empanadas, drinks, and desserts. That

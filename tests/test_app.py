@@ -225,15 +225,66 @@ def collect_tool_returns(messages: list[ModelMessage]) -> dict[str, Any]:
     return tool_returns
 
 
+def extract_latest_user_text(messages: list[ModelMessage]) -> str:
+    """Return the latest user prompt text from the deterministic model history."""
+    for message in reversed(messages):
+        if not isinstance(message, ModelRequest):
+            continue
+        for part in reversed(message.parts):
+            content = getattr(part, "content", None)
+            if isinstance(content, str):
+                return content
+    return ""
+
+
 def dev_message_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
     """Deterministic model used to exercise the development chat endpoint."""
     tool_returns = collect_tool_returns(messages)
+    latest_user_text = extract_latest_user_text(messages).casefold().strip()
+    if latest_user_text == "martina":
+        if "update_customer_name" not in tool_returns:
+            return ModelResponse(
+                parts=[ToolCallPart("update_customer_name", {"name": "Martina"})],
+                model_name="function:test-api-dev-message",
+            )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name,
+                    {
+                        "reply_text": "Hola Martina, decime qué te gustaría pedir.",
+                        "next_step": "choose_items",
+                        "handoff": False,
+                    },
+                )
+            ],
+            model_name="function:test-api-dev-message",
+        )
+
+    if "confirm" in latest_user_text:
+        if "confirm_current_order" not in tool_returns:
+            return ModelResponse(
+                parts=[ToolCallPart("confirm_current_order", {})],
+                model_name="function:test-api-dev-message",
+            )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name,
+                    {
+                        "reply_text": "Hola Martina, tu pedido quedó confirmado.",
+                        "next_step": "complete",
+                        "handoff": False,
+                    },
+                )
+            ],
+            model_name="function:test-api-dev-message",
+        )
+
     sequence: list[tuple[str, dict[str, Any]]] = [
-        ("update_customer_name", {"name": "Martina"}),
         ("add_item_to_current_order", {"sku": "hamburguesa-completa", "quantity": 1}),
         ("set_order_delivery_type", {"delivery_type": "pickup"}),
         ("set_order_payment_method", {"payment_method": "cash"}),
-        ("confirm_current_order", {}),
     ]
     for tool_name, arguments in sequence:
         if tool_name not in tool_returns:
@@ -247,8 +298,8 @@ def dev_message_model(messages: list[ModelMessage], info: AgentInfo) -> ModelRes
             ToolCallPart(
                 info.output_tools[0].name,
                 {
-                    "reply_text": "Hola Martina, tu pedido quedó confirmado.",
-                    "next_step": "complete",
+                    "reply_text": "Así queda el pedido. Si está bien, confirmámelo.",
+                    "next_step": "confirm_order",
                     "handoff": False,
                 },
             )
@@ -278,6 +329,10 @@ def test_mvp_api_surface_exposes_dev_chat_and_read_models(tmp_path: Path, monkey
             "/api/dev/messages",
             json={"external_user_id": "cli-user", "message_text": "Quiero una hamburguesa"},
         )
+        confirm_response = client.post(
+            "/api/dev/messages",
+            json={"external_user_id": "cli-user", "message_text": "Confirmá el pedido"},
+        )
         customers_response = client.get("/api/customers", params={"limit": 1})
         orders_response = client.get("/api/orders", params={"limit": 10})
         confirmed_orders_response = client.get("/api/orders", params={"status": "confirmed", "limit": 10})
@@ -294,14 +349,18 @@ def test_mvp_api_surface_exposes_dev_chat_and_read_models(tmp_path: Path, monkey
     assert first_chat_response.json()["reply"]["next_step"] == "ask_name"
     assert second_chat_response.status_code == HTTP_OK
     assert second_chat_response.json()["customer"]["name"] == "Martina"
-    assert second_chat_response.json()["reply"]["next_step"] == "complete"
-    assert second_chat_response.json()["current_order"]["status"] == "confirmed"
+    assert second_chat_response.json()["reply"]["next_step"] == "choose_items"
+    assert second_chat_response.json()["current_order"] is None
 
     assert chat_response.status_code == HTTP_OK
     chat_payload = chat_response.json()
     assert chat_payload["customer"]["name"] == "Martina"
-    assert chat_payload["reply"]["next_step"] == "complete"
-    assert chat_payload["current_order"]["status"] == "confirmed"
+    assert chat_payload["reply"]["next_step"] == "confirm_order"
+    assert chat_payload["current_order"]["status"] == "draft"
+
+    assert confirm_response.status_code == HTTP_OK
+    assert confirm_response.json()["reply"]["next_step"] == "complete"
+    assert confirm_response.json()["current_order"]["status"] == "confirmed"
 
     assert customers_response.status_code == HTTP_OK
     assert customers_response.json()[0]["name"] == "Martina"
@@ -325,6 +384,7 @@ def test_staff_can_update_order_status(tmp_path: Path, monkeypatch: pytest.Monke
             "/api/dev/messages",
             json={"external_user_id": "cli-user", "message_text": "Quiero una hamburguesa"},
         )
+        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Confirmá el pedido"})
         order_id = order_response.json()["current_order"]["id"]
         status_response = client.patch(
             f"/api/orders/{order_id}/status",
@@ -347,6 +407,7 @@ def test_dev_notifications_endpoint_returns_pending_messages(tmp_path: Path, mon
             "/api/dev/messages",
             json={"external_user_id": "cli-user", "message_text": "Quiero una hamburguesa"},
         )
+        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Confirmá el pedido"})
         order_id = order_response.json()["current_order"]["id"]
         client.patch(f"/api/orders/{order_id}/status", json={"status": OrderStatus.ALMOST_READY.value})
         client.patch(f"/api/orders/{order_id}/status", json={"status": OrderStatus.READY_FOR_PICKUP.value})
@@ -598,6 +659,7 @@ def test_dashboard_can_update_order_status_and_handles_missing_orders(tmp_path: 
             "/api/dev/messages",
             json={"external_user_id": "cli-user", "message_text": "Quiero una hamburguesa"},
         )
+        client.post("/api/dev/messages", json={"external_user_id": "cli-user", "message_text": "Confirmá el pedido"})
         order_id = order_response.json()["current_order"]["id"]
         dashboard_response = client.post(
             f"/dashboard/orders/{order_id}/status",
