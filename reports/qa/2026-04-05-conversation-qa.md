@@ -119,7 +119,7 @@ Buenas noches
 
 **Ruperto**
 
-¡Sí, claro! Tenemos estas opciones veggies para vos: 
+¡Sí, claro! Tenemos estas opciones veggies para vos:
 
 🍔 Hamburguesa veggie: Medallón de garbanzos, queso, rúcula, tomate y papas rústicas por $ 10.300.
 🌯 Wrap veggie: Con vegetales salteados, hummus y hojas verdes por $ 8.800.
@@ -235,7 +235,7 @@ Si querés, te sumo una al pedido.
 
 **Ruperto**
 
-Te detallo los precios de las gaseosas: 
+Te detallo los precios de las gaseosas:
 
 🥤 Gaseosa cola 1.5L: $3.200
 🥤 Gaseosa cola cero 1.5L: $3.300

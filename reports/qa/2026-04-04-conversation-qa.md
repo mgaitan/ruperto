@@ -121,7 +121,7 @@ Buenas noches
 
 **Ruperto**
 
-¡Sí, claro! Tenemos estas opciones vegetarianas: 
+¡Sí, claro! Tenemos estas opciones vegetarianas:
 
 🍔 Hamburguesa veggie: Medallón de garbanzos, queso, rúcula, tomate y papas rústicas por $10.300.
 🌯 Wrap veggie: Con vegetales salteados, hummus y hojas verdes por $8.800.
@@ -249,7 +249,7 @@ Si querés, te sumo una al pedido.
 
 **Ruperto**
 
-Te repito las opciones y precios de las gaseosas: 
+Te repito las opciones y precios de las gaseosas:
 
 *   Gaseosa cola 1.5L: $3.200
 *   Gaseosa cola cero 1.5L: $3.300
@@ -672,7 +672,7 @@ Confirmá.
 
 **Ruperto**
 
-¡Tu pedido ya está confirmado, Elena! 😊 Ya está en preparación: 
+¡Tu pedido ya está confirmado, Elena! 😊 Ya está en preparación:
 
 *   1 Pizza Napolitana 🍕
 
@@ -1156,7 +1156,7 @@ Sumame una cervecita.
 
 **Ruperto**
 
-¡Dale! Tenemos varias opciones de cerveza en lata: 
+¡Dale! Tenemos varias opciones de cerveza en lata:
 
 🍺 Cerveza rubia: $2.900
 🍺 Cerveza roja: $3.100
@@ -1252,7 +1252,7 @@ Hola, ¿me pasás la carta?
 
 **Ruperto**
 
-¡Claro! Tenemos dos opciones de wraps: 
+¡Claro! Tenemos dos opciones de wraps:
 
 * **Wrap de pollo** 🌯: pollo grillado, queso crema y vegetales frescos por $9.200.
 * **Wrap veggie** 🥗: vegetales salteados, hummus y hojas verdes por $8.800.

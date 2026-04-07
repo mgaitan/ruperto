@@ -209,7 +209,7 @@ Si querés, te sumo una al pedido.
 
 **Ruperto**
 
-Te detallo los precios de las gaseosas: 
+Te detallo los precios de las gaseosas:
 
 *   **Gaseosa cola 1.5L:** $3.200
 *   **Gaseosa cola cero 1.5L:** $3.300
@@ -958,7 +958,7 @@ Link de pago.
 
 **Ruperto**
 
-¡Bárbaro! El pago sería con link. 
+¡Bárbaro! El pago sería con link.
 
 Te recuerdo tu pedido:
 *   2 Pizzas Muzzarella
