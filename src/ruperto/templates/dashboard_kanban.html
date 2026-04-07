@@ -1,0 +1,368 @@
+{% extends "dashboard_base.html" %} {% block content %}
+<section
+    class="rounded-[2rem] border border-white/70 bg-white/85 p-6 shadow-card backdrop-blur"
+>
+    <div
+        class="flex flex-col gap-4 md:flex-row md:items-center md:justify-between"
+    >
+        <div>
+            <p
+                class="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500"
+            >
+                Operación
+            </p>
+            <h3 class="mt-2 text-2xl font-semibold">Tablero Kanban</h3>
+        </div>
+        <div class="flex items-center gap-3">
+            <div class="relative">
+                <select
+                    id="area-filter"
+                    class="rounded-full border border-slate-300 bg-white px-4 py-2 pr-8 text-sm font-medium text-slate-700 shadow-sm focus:outline-none focus:ring-2 focus:ring-amber-500 focus:ring-offset-2"
+                >
+                    <option value="">Todas las áreas</option>
+                    {% for area in areas %}
+                    <option value="{{ area.id }}">{{ area.name }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <button
+                id="refresh-btn"
+                class="rounded-full bg-amber-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-amber-700 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:ring-offset-2"
+            >
+                Actualizar
+            </button>
+        </div>
+    </div>
+
+    <div class="mt-8">
+        <div
+            id="kanban-board"
+            class="kanban-board flex gap-6 overflow-x-auto pb-4"
+        >
+            <!-- Status columns will be populated by JavaScript -->
+        </div>
+    </div>
+</section>
+
+<script>
+    // Kanban board state
+    const kanbanState = {
+        cases: [],
+        areas: [
+            {%- for area in areas %}
+            {
+                id: {{ area.id }},
+                name: "{{ area.name|escape }}",
+                description: "{{ area.description|escape }}"
+            }{% if not loop.last %},{% endif %}
+            {%- endfor %}
+        ],
+        statuses: {
+            'new': {
+                label: 'Nuevo',
+                chipColor: 'bg-slate-100 text-slate-800',
+                dropZoneColor: 'bg-slate-50/90 border-slate-200',
+            },
+            'triaged': {
+                label: 'En revisión',
+                chipColor: 'bg-amber-100 text-amber-800',
+                dropZoneColor: 'bg-amber-50/90 border-amber-200',
+            },
+            'in_progress': {
+                label: 'En progreso',
+                chipColor: 'bg-sky-100 text-sky-800',
+                dropZoneColor: 'bg-sky-50/90 border-sky-200',
+            },
+            'blocked': {
+                label: 'Bloqueado',
+                chipColor: 'bg-rose-100 text-rose-800',
+                dropZoneColor: 'bg-rose-50/90 border-rose-200',
+            },
+            'resolved': {
+                label: 'Resuelto',
+                chipColor: 'bg-emerald-100 text-emerald-800',
+                dropZoneColor: 'bg-emerald-50/90 border-emerald-200',
+            },
+            'closed': {
+                label: 'Cerrado',
+                chipColor: 'bg-green-100 text-green-800',
+                dropZoneColor: 'bg-green-50/90 border-green-200',
+            },
+            'cancelled': {
+                label: 'Cancelado',
+                chipColor: 'bg-gray-100 text-gray-800',
+                dropZoneColor: 'bg-gray-50/90 border-gray-200',
+            }
+        }
+    };
+
+    function clearDropHighlights() {
+        document.querySelectorAll('.kanban-column').forEach((column) => {
+            column.classList.remove('kanban-column--active-drop');
+        });
+    }
+
+    // Initialize the kanban board
+    async function initKanban() {
+        await loadCases();
+        setupEventListeners();
+    }
+
+    // Load cases from API
+    async function loadCases() {
+        const areaId = document.getElementById('area-filter').value || '';
+        const response = await fetch(`/api/kanban/municipal/cases${areaId ? '?area_id=' + areaId : ''}`, {
+            credentials: 'include'
+        });
+
+        if (response.ok) {
+            kanbanState.cases = await response.json();
+            renderKanbanBoard();
+        }
+    }
+
+    // Render the kanban board
+    function renderKanbanBoard() {
+        const board = document.getElementById('kanban-board');
+        board.innerHTML = '';
+
+        // Create columns for each status
+        Object.entries(kanbanState.statuses).forEach(([statusKey, statusInfo]) => {
+            const column = document.createElement('div');
+            column.className = 'kanban-column min-w-[280px]';
+            column.dataset.status = statusKey;
+            column.dataset.dropZoneColor = statusInfo.dropZoneColor;
+
+            const casesInColumn = kanbanState.cases.filter(c => c.status === statusKey);
+
+            column.innerHTML = `
+                <div class="flex flex-wrap items-center gap-2">
+                    <h4 class="text-lg font-semibold leading-tight">${statusInfo.label}</h4>
+                    <span class="shrink-0 rounded-full px-3 py-1 text-xs font-semibold ${statusInfo.chipColor}">
+                        ${casesInColumn.length}
+                    </span>
+                </div>
+                <div class="mt-4 space-y-3 kanban-cards" data-status="${statusKey}">
+                    ${casesInColumn.map(renderCaseCard).join('')}
+                </div>
+            `;
+
+            board.appendChild(column);
+        });
+
+        setupDragAndDrop();
+    }
+
+    // Render a single case card
+    function renderCaseCard(caseItem) {
+        const area = kanbanState.areas.find(a => a.id === caseItem.area_id) || { name: 'Desconocida' };
+        const statusInfo = kanbanState.statuses[caseItem.status] || { chipColor: 'bg-slate-100 text-slate-800' };
+
+        return `
+            <article class="kanban-card rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
+                     data-case-id="${caseItem.id}" draggable="true">
+                <div class="flex flex-col gap-3">
+                    <div class="flex flex-wrap items-center justify-between gap-2">
+                        <span class="text-sm font-semibold">Caso #${caseItem.id}</span>
+                        <span class="rounded-full px-2 py-1 text-xs font-semibold uppercase tracking-[0.2em] ${statusInfo.chipColor}">
+                            ${statusInfo.label}
+                        </span>
+                    </div>
+                    <div class="space-y-2 text-sm">
+                        <p class="font-medium">${caseItem.title || 'Sin título'}</p>
+                        <p class="text-slate-600">${caseItem.description || 'Sin descripción'}</p>
+                        <div class="mt-2 grid grid-cols-2 gap-2 text-xs text-slate-500">
+                            <div>
+                                <span class="font-medium">Área:</span> ${area.name}
+                            </div>
+                            <div>
+                                <span class="font-medium">Ubicación:</span> ${caseItem.location_text || 'No especificada'}
+                            </div>
+                            <div>
+                                <span class="font-medium">Reportero:</span> ${caseItem.reporter_name || 'Anónimo'}
+                            </div>
+                            <div>
+                                <span class="font-medium">Creado:</span> ${new Date(caseItem.created_at).toLocaleString()}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </article>
+        `;
+    }
+
+    // Setup drag and drop functionality
+    function setupDragAndDrop() {
+        const cards = document.querySelectorAll('.kanban-card');
+        const columns = document.querySelectorAll('.kanban-cards');
+
+        let draggedCard = null;
+        let sourceColumn = null;
+
+        cards.forEach(card => {
+            card.addEventListener('dragstart', (e) => {
+                draggedCard = card;
+                sourceColumn = card.closest('.kanban-cards');
+                e.dataTransfer.setData('text/plain', card.dataset.caseId);
+                e.dataTransfer.effectAllowed = 'move';
+                setTimeout(() => {
+                    card.style.opacity = '0.4';
+                }, 0);
+            });
+
+            card.addEventListener('dragend', () => {
+                if (draggedCard) {
+                    draggedCard.style.opacity = '1';
+                }
+                clearDropHighlights();
+                draggedCard = null;
+                sourceColumn = null;
+            });
+        });
+
+        columns.forEach(column => {
+            column.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'move';
+                clearDropHighlights();
+                column.closest('.kanban-column')?.classList.add('kanban-column--active-drop');
+            });
+
+            column.addEventListener('dragleave', () => {
+                column.closest('.kanban-column')?.classList.remove('kanban-column--active-drop');
+            });
+
+            column.addEventListener('drop', async (e) => {
+                e.preventDefault();
+                clearDropHighlights();
+
+                if (!draggedCard) return;
+
+                const caseId = draggedCard.dataset.caseId;
+                const newStatus = column.dataset.status;
+                const currentStatus = sourceColumn?.dataset.status;
+                if (!caseId || !newStatus || currentStatus === newStatus) return;
+
+                try {
+                    const response = await fetch(`/api/kanban/municipal/cases/${caseId}/status`, {
+                        method: 'PATCH',
+                        credentials: 'include',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({ status: newStatus })
+                    });
+
+                    if (response.ok) {
+                        const updatedCase = await response.json();
+                        kanbanState.cases = kanbanState.cases.map((caseItem) =>
+                            String(caseItem.id) === String(caseId) ? updatedCase : caseItem
+                        );
+                        renderKanbanBoard();
+                        await loadCases();
+                    } else {
+                        alert('Error al actualizar el estado del caso');
+                    }
+                } catch (error) {
+                    console.error('Error:', error);
+                    alert('Error al actualizar el estado del caso');
+                }
+            });
+        });
+    }
+
+    // Setup event listeners
+    function setupEventListeners() {
+        document.getElementById('area-filter').addEventListener('change', loadCases);
+        document.getElementById('refresh-btn').addEventListener('click', loadCases);
+    }
+
+    // Initialize on page load
+    document.addEventListener('DOMContentLoaded', initKanban);
+</script>
+
+<style>
+    .kanban-column {
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+        flex: 0 0 320px;
+        min-width: 320px;
+        max-width: 320px;
+    }
+
+    .kanban-cards {
+        flex: 1;
+        min-height: 200px;
+        border: 1px solid transparent;
+        border-radius: 1.5rem;
+        padding: 0.75rem;
+        transition:
+            background-color 0.18s ease,
+            border-color 0.18s ease,
+            box-shadow 0.18s ease,
+            transform 0.18s ease;
+    }
+
+    .kanban-board {
+        align-items: flex-start;
+        scrollbar-gutter: stable both-edges;
+    }
+
+    .kanban-card {
+        cursor: grab;
+        transition: all 0.2s ease;
+        width: 100%;
+    }
+
+    .kanban-card:active {
+        cursor: grabbing;
+    }
+
+    .kanban-card:hover {
+        box-shadow:
+            0 4px 6px -1px rgb(0 0 0 / 0.1),
+            0 2px 4px -2px rgb(0 0 0 / 0.1);
+    }
+
+    .kanban-column--active-drop .kanban-cards {
+        box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.6);
+        transform: translateY(-2px);
+    }
+
+    .kanban-column[data-drop-zone-color~='bg-slate-50/90'].kanban-column--active-drop .kanban-cards {
+        background-color: rgb(248 250 252 / 0.9);
+        border-color: rgb(226 232 240);
+    }
+
+    .kanban-column[data-drop-zone-color~='bg-amber-50/90'].kanban-column--active-drop .kanban-cards {
+        background-color: rgb(255 251 235 / 0.9);
+        border-color: rgb(253 230 138);
+    }
+
+    .kanban-column[data-drop-zone-color~='bg-sky-50/90'].kanban-column--active-drop .kanban-cards {
+        background-color: rgb(240 249 255 / 0.9);
+        border-color: rgb(186 230 253);
+    }
+
+    .kanban-column[data-drop-zone-color~='bg-rose-50/90'].kanban-column--active-drop .kanban-cards {
+        background-color: rgb(255 241 242 / 0.9);
+        border-color: rgb(254 205 211);
+    }
+
+    .kanban-column[data-drop-zone-color~='bg-emerald-50/90'].kanban-column--active-drop .kanban-cards {
+        background-color: rgb(236 253 245 / 0.9);
+        border-color: rgb(167 243 208);
+    }
+
+    .kanban-column[data-drop-zone-color~='bg-green-50/90'].kanban-column--active-drop .kanban-cards {
+        background-color: rgb(240 253 244 / 0.9);
+        border-color: rgb(187 247 208);
+    }
+
+    .kanban-column[data-drop-zone-color~='bg-gray-50/90'].kanban-column--active-drop .kanban-cards {
+        background-color: rgb(249 250 251 / 0.9);
+        border-color: rgb(209 213 219);
+    }
+</style>
+{% endblock %}
