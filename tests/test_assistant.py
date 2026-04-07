@@ -16,10 +16,14 @@ from ruperto.assistant import (
     MODEL_UNAVAILABLE_REPLY,
     MissingConfirmationSignalError,
     OrderingAssistantService,
+    VagueLocationError,
     add_item_to_current_order,
     build_google_model,
     confirm_current_order,
+    format_location_as_address,
     get_store_availability,
+    is_vague_location,
+    parse_whatsapp_location,
     set_order_delivery_address,
     set_order_delivery_type,
     set_order_payment_method,
@@ -1354,3 +1358,246 @@ async def test_closed_store_text_is_not_prefixed_twice(tmp_path: Path):
     assert decorated == availability.message_text
 
     await runtime.engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Location handling tests
+# ---------------------------------------------------------------------------
+
+
+def test_is_vague_location_detects_common_vague_phrases():
+    """Common vague Spanish-language location descriptions are flagged."""
+    vague = [
+        "la esquina de mi casa",
+        "mi casa",
+        "en mi casa",
+        "acá nomás",
+        "aca nomas",
+        "ahí nomás",
+        "ahi nomas",
+        "acá",
+        "ahí",
+        "la esquina",
+    ]
+    for phrase in vague:
+        assert is_vague_location(phrase), f"Expected {phrase!r} to be detected as vague"
+
+
+def test_is_vague_location_accepts_precise_addresses():
+    """Proper street addresses and GPS coordinates are not flagged as vague."""
+    precise = [
+        "Olegario Andrade 330",
+        "Av. Colón 2345",
+        "Belgrano 150, piso 3",
+        "Ubicación GPS: -31.417300, -64.183300",
+        "Rivadavia 1234",
+    ]
+    for address in precise:
+        assert not is_vague_location(address), f"Expected {address!r} to be accepted as precise"
+
+
+def test_parse_whatsapp_location_returns_coords_for_valid_json():
+    """Valid WhatsApp location JSON is parsed to (latitude, longitude)."""
+    payload = '{"type": "location", "latitude": -31.4173, "longitude": -64.1833}'
+    result = parse_whatsapp_location(payload)
+    assert result is not None
+    lat, lon = result
+    assert lat == pytest.approx(-31.4173)
+    assert lon == pytest.approx(-64.1833)
+
+
+def test_parse_whatsapp_location_returns_none_for_plain_text():
+    """Non-JSON or non-location messages return None."""
+    assert parse_whatsapp_location("hola, quiero una pizza") is None
+    assert parse_whatsapp_location('{"type": "text", "body": "hola"}') is None
+    assert parse_whatsapp_location("") is None
+    # Valid JSON but not a dict
+    assert parse_whatsapp_location("[1, 2, 3]") is None
+
+
+def test_parse_whatsapp_location_returns_none_for_invalid_coords():
+    """Payloads with non-numeric coordinates are rejected."""
+    bad = '{"type": "location", "latitude": "bad", "longitude": -64.1833}'
+    assert parse_whatsapp_location(bad) is None
+
+
+def test_format_location_as_address_produces_expected_string():
+    """GPS coordinates are serialised to a deterministic address string."""
+    result = format_location_as_address(-31.417300, -64.183300)
+    assert result == "Ubicación GPS: -31.417300, -64.183300"
+
+
+async def test_set_order_delivery_address_rejects_vague_location(mocker):
+    """The delivery-address tool refuses vague descriptions with a VagueLocationError."""
+    ctx = mocker.Mock()
+    ctx.deps.allow_order_mutations = True
+
+    with pytest.raises(VagueLocationError, match="demasiado vaga"):
+        await set_order_delivery_address(ctx, "la esquina de mi casa")
+
+    with pytest.raises(VagueLocationError, match="demasiado vaga"):
+        await set_order_delivery_address(ctx, "mi casa")
+
+    with pytest.raises(VagueLocationError, match="demasiado vaga"):
+        await set_order_delivery_address(ctx, "acá nomás")
+
+
+async def test_set_order_delivery_address_accepts_precise_location(mocker):
+    """The delivery-address tool accepts street addresses and GPS coordinates."""
+    ctx = mocker.Mock()
+    ctx.deps.allow_order_mutations = True
+    ctx.deps.session_factory = mocker.AsyncMock()
+
+    dummy_order = OrderSnapshot(
+        id=1,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=DeliveryType.DELIVERY,
+        delivery_address="Olegario Andrade 330",
+        payment_method=None,
+        total_amount_cents=950000,
+        total_amount_display="$ 9.500",
+        items=[],
+    )
+
+    mock_repo = mocker.AsyncMock()
+    mock_repo.set_order_delivery_address = mocker.AsyncMock(return_value=dummy_order)
+
+    original_with_repo = set_order_delivery_address.__globals__["with_repository"]
+    set_order_delivery_address.__globals__["with_repository"] = mocker.AsyncMock(return_value=dummy_order)
+    try:
+        result = await set_order_delivery_address(ctx, "Olegario Andrade 330")
+        assert result.delivery_address == "Olegario Andrade 330"
+    finally:
+        set_order_delivery_address.__globals__["with_repository"] = original_with_repo
+
+
+async def test_whatsapp_location_message_is_converted_to_address(tmp_path: Path):
+    """A WhatsApp location JSON message is parsed and used as the delivery address."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        service,
+        channel=Channel.DEV,
+        external_user_id="cliente-ubicacion",
+        name="Luisa",
+    )
+
+    location_payload = '{"type": "location", "latitude": -31.4173, "longitude": -64.1833}'
+    captured_address: list[str] = []
+
+    def location_address_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        tool_returns = collect_tool_returns(messages)
+        if "set_order_delivery_address" in tool_returns:
+            captured_address.append(tool_returns["set_order_delivery_address"].delivery_address)
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        info.output_tools[0].name,
+                        {"reply_text": "Registrado.", "next_step": "ask_address", "handoff": False},
+                    )
+                ],
+                model_name="function:test-location",
+            )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "set_order_delivery_address",
+                    {"address": "Ubicación GPS: -31.417300, -64.183300"},
+                )
+            ],
+            model_name="function:test-location",
+        )
+
+    # Create an order first so the address tool can be called.
+    async with runtime.session_factory() as session:
+        repo = BusinessRepository(session)
+        customer = await repo.get_or_create_customer(channel=Channel.DEV, external_id="cliente-ubicacion")
+        conversation = await repo.get_or_create_conversation(
+            channel=Channel.DEV,
+            external_id="cliente-ubicacion",
+            customer_id=customer.id,
+        )
+        menu = await repo.list_menu_items()
+        await repo.add_item_to_current_order(customer.id, conversation.id, sku=menu[0].sku, quantity=1)
+        await repo.set_order_delivery_type(customer.id, conversation.id, DeliveryType.DELIVERY)
+        await session.commit()
+
+    result = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-ubicacion",
+        message_text=location_payload,
+        model=FunctionModel(location_address_model),
+    )
+
+    assert result is not None
+    assert captured_address, "Expected set_order_delivery_address to be called with GPS coordinates"
+    assert "GPS" in captured_address[0]
+    assert "-31" in captured_address[0]
+
+    await runtime.engine.dispose()
+
+
+async def test_turn_context_hint_includes_whatsapp_location(tmp_path: Path):
+    """When a WhatsApp location is detected, the context hint directs the model to set the address."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    customer = CustomerSnapshot(id=1, name="Luisa", phone_number=None, default_address=None)
+
+    hint = service._build_turn_context_hint(
+        customer=customer,
+        message_text="Ubicación GPS: -31.417300, -64.183300",
+        current_order=None,
+        whatsapp_location=(-31.4173, -64.1833),
+    )
+
+    assert hint is not None
+    assert "whatsapp" in hint.lower()
+    assert "set_order_delivery_address" in hint
+
+
+async def test_guide_reply_mentions_whatsapp_sharing_when_address_missing(tmp_path: Path):
+    """The address-request reply tells customers they can share their WhatsApp location."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    customer = CustomerSnapshot(id=1, name="Luisa", phone_number=None, default_address=None)
+    delay = DelayEstimateSnapshot(
+        active_orders_ahead=0,
+        base_minutes=15,
+        estimated_minutes=15,
+        display_text="15 minutos",
+    )
+    order = OrderSnapshot(
+        id=1,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=DeliveryType.DELIVERY,
+        delivery_address=None,
+        payment_method=None,
+        total_amount_cents=950000,
+        total_amount_display="$ 9.500",
+        items=[
+            OrderItemSnapshot(
+                menu_item_id=1,
+                name="Hamburguesa completa",
+                quantity=1,
+                unit_price_cents=950000,
+                unit_price_display="$ 9.500",
+                notes=None,
+            )
+        ],
+    )
+
+    reply = service._guide_reply_with_current_order(
+        AssistantReply(reply_text="Texto libre", next_step=AssistantNextStep.CHOOSE_ITEMS),
+        customer=customer,
+        current_order=order,
+        delay=delay,
+    )
+
+    assert reply.next_step == AssistantNextStep.ASK_ADDRESS
+    assert "whatsapp" in reply.reply_text.lower() or "📍" in reply.reply_text
