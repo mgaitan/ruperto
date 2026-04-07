@@ -48,8 +48,7 @@
                         <p class="max-w-3xl text-sm leading-6 text-slate-600">
                             Esta pantalla usa el mismo backend conversacional de
                             Ruperto. Podés crear perfiles con distintos
-                            teléfonos para simular clientes nuevos o clientes
-                            que ya tienen memoria.
+                            teléfonos para simular {{ demo_chat_copy.intro_subject_plural }}.
                         </p>
                     </div>
                     <div
@@ -69,10 +68,10 @@
                         <div class="flex items-start justify-between gap-3">
                             <div>
                                 <h2 class="text-lg font-semibold">
-                                    Clientes demo
+                                    {{ demo_chat_copy.profile_collection_title }}
                                 </h2>
                                 <p class="mt-1 text-sm text-slate-500">
-                                    Elegí un teléfono o cargá uno nuevo.
+                                    {{ demo_chat_copy.profile_collection_description }}
                                 </p>
                             </div>
                             <button
@@ -111,7 +110,7 @@
                                 class="w-full rounded-full bg-ember px-4 py-3 text-sm font-semibold text-white transition hover:bg-orange-600"
                                 type="submit"
                             >
-                                Agregar cliente demo
+                                {{ demo_chat_copy.add_profile_button }}
                             </button>
                         </form>
                         <button
@@ -119,7 +118,7 @@
                             type="button"
                             data-random-profile
                         >
-                            Crear cliente aleatorio
+                            {{ demo_chat_copy.random_profile_button }}
                         </button>
 
                         <div class="mt-5 space-y-2" data-profile-list></div>
@@ -159,20 +158,19 @@
                                 class="mt-1 text-2xl font-semibold"
                                 data-active-label
                             >
-                                Cliente demo
+                                {{ demo_chat_copy.active_profile_fallback }}
                             </h2>
                             <p
                                 class="mt-1 text-sm text-slate-500"
                                 data-active-phone
                             >
-                                Elegí o creá un número para empezar.
+                                {{ demo_chat_copy.active_phone_fallback }}
                             </p>
                         </div>
                         <div
                             class="rounded-3xl bg-mist px-4 py-3 text-sm text-slate-600"
                         >
-                            Si reutilizás el mismo teléfono, el backend recuerda
-                            el contexto de ese cliente.
+                            {{ demo_chat_copy.memory_hint }}
                         </div>
                     </div>
 
@@ -197,7 +195,7 @@
                             <textarea
                                 class="min-h-28 w-full rounded-[1.5rem] border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
                                 name="message"
-                                placeholder="Escribí como si fueras el cliente..."
+                                placeholder="{{ demo_chat_copy.message_placeholder }}"
                             ></textarea>
                         </label>
                         <div
@@ -245,7 +243,8 @@
             {
                 "apiPath": "{{ api_path }}",
                 "notificationsApiPath": "{{ notifications_api_path }}",
-                "profiles": {{ demo_profiles | tojson }}
+                "profiles": {{ demo_profiles | tojson }},
+                "copy": {{ demo_chat_copy | tojson }}
             }
         </script>
         <script>
@@ -381,8 +380,8 @@
                               );
                     wrapper.innerHTML = `
                         <div class="${entry.role === "user" ? "bg-ink text-white" : "bg-white text-slate-800"} max-w-[80%] rounded-[1.4rem] px-4 py-3 shadow-sm">
-                            <p class="text-xs font-semibold uppercase tracking-[0.16em] ${entry.role === "user" ? "text-slate-300" : "text-slate-400"}">
-                                ${entry.role === "user" ? "Cliente" : "{{ bot_name }}"}
+                                <p class="text-xs font-semibold uppercase tracking-[0.16em] ${entry.role === "user" ? "text-slate-300" : "text-slate-400"}">
+                                ${entry.role === "user" ? config.copy.user_bubble_label : "{{ bot_name }}"}
                             </p>
                             <div class="prose prose-sm mt-2 max-w-none leading-6 prose-p:my-2 prose-ul:my-2 prose-ol:my-2 prose-li:my-1 ${entry.role === "user" ? "prose-invert" : ""}">${renderedText}</div>
                         </div>
@@ -444,10 +443,11 @@
                     });
 
                     activeLabel.textContent =
-                        activeProfile?.label || "Cliente demo";
+                        activeProfile?.label ||
+                        config.copy.active_profile_fallback;
                     activePhone.textContent =
                         activeProfile?.phone ||
-                        "Elegí o creá un número para empezar.";
+                        config.copy.active_phone_fallback;
                     renderHistory(activeProfile);
                 };
 
@@ -478,8 +478,7 @@
                             text: notification.message_text,
                         });
                     });
-                    statusText.textContent =
-                        "Llegó una notificación del pedido.";
+                    statusText.textContent = config.copy.notification_text;
                     renderProfiles();
                 };
 
@@ -520,7 +519,7 @@
                     saveProfiles(profiles);
                     saveActiveProfileId(id);
                     statusText.textContent =
-                        "Cliente demo aleatorio listo para usar.";
+                        config.copy.random_profile_ready_text;
                     renderProfiles();
                 });
 
@@ -533,7 +532,8 @@
                         ?.getAttribute("data-select-profile");
                     if (selectedId) {
                         saveActiveProfileId(selectedId);
-                        statusText.textContent = "Cliente demo activo.";
+                        statusText.textContent =
+                            config.copy.profile_active_text;
                         renderProfiles();
                         return;
                     }
@@ -551,7 +551,7 @@
                         if (profiles[0]) saveActiveProfileId(profiles[0].id);
                         else localStorage.removeItem(activeProfileKey);
                     }
-                    statusText.textContent = "Cliente demo eliminado.";
+                    statusText.textContent = config.copy.profile_removed_text;
                     renderProfiles();
                 });
 

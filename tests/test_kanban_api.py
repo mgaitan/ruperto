@@ -20,6 +20,7 @@ pytestmark = pytest.mark.anyio
 
 HTTP_OK = 200
 HTTP_FOUND = 303
+HTTP_NOT_FOUND = 404
 HTTP_UNAUTHORIZED = 401
 ROUTE_COUNT = 2
 
@@ -135,4 +136,62 @@ async def test_kanban_api_update_case_status_persists_for_authenticated_dashboar
         stored_case = await repository.get_municipal_case(created_case.id)
 
     assert stored_case.status == MunicipalCaseStatus.IN_PROGRESS
+    await runtime.engine.dispose()
+
+
+async def test_kanban_api_lists_cases_for_authenticated_dashboard_user(tmp_path):
+    """Authenticated staff can list kanban cases scoped to the active store."""
+    settings = build_kanban_settings(tmp_path, "kanban-list-auth-test.db")
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        store = await repository.get_store_profile()
+        area = next(
+            area
+            for area in await repository.list_municipal_areas(store_id=store.id)
+            if area.name == "Solicitud de agua"
+        )
+        await repository.create_municipal_case(
+            store_id=store.id,
+            payload=MunicipalCaseCreateRequest(
+                area_id=area.id,
+                title="Falta de agua en lote 8",
+                description="La presión bajó por completo.",
+            ),
+        )
+        await session.commit()
+
+    app = create_app(settings)
+    with TestClient(app) as client:
+        client.post(
+            "/dashboard/login",
+            data={"email": "staff@example.com", "password": "super-secret", "next": "/dashboard/kanban"},
+            follow_redirects=False,
+        )
+        response = client.get("/api/kanban/municipal/cases")
+
+    assert response.status_code == HTTP_OK
+    assert len(response.json()) == 1
+    await runtime.engine.dispose()
+
+
+async def test_kanban_api_returns_not_found_when_updating_unknown_case(tmp_path):
+    """Unknown municipal cases return a 404 from the kanban status endpoint."""
+    settings = build_kanban_settings(tmp_path, "kanban-missing-case-test.db")
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+
+    app = create_app(settings)
+    with TestClient(app) as client:
+        client.post(
+            "/dashboard/login",
+            data={"email": "staff@example.com", "password": "super-secret", "next": "/dashboard/kanban"},
+            follow_redirects=False,
+        )
+        response = client.patch("/api/kanban/municipal/cases/999/status", json={"status": "triaged"})
+
+    assert response.status_code == HTTP_NOT_FOUND
+    assert response.json()["detail"] == "Municipal case not found."
     await runtime.engine.dispose()

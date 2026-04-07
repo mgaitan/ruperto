@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     store_description: str = "Rotisería de barrio con pedidos asistidos por chat."
     assistant_personality: str = "Amable, ágil y confiable."
     store_vertical: StoreVertical = StoreVertical.ORDERING
+    store_slug: str | None = None
     store_locale: str = "es-AR"
     store_timezone: str = "America/Argentina/Cordoba"
     store_transfer_alias: str | None = "demo.rotiseria"
@@ -61,6 +62,7 @@ class Settings(BaseSettings):
         "smtp_server",
         "smtp_user",
         "kapso_phone_number_id",
+        "store_slug",
         mode="before",
     )
     @classmethod
@@ -89,6 +91,18 @@ class Settings(BaseSettings):
         stripped = value.strip()
         return stripped or None
 
+    @property
+    def smtp_configured(self) -> bool:
+        """Return whether all SMTP fields required for delivery are available."""
+        return all(
+            (
+                self.smtp_server is not None,
+                self.smtp_port is not None,
+                self.smtp_user is not None,
+                self.smtp_password is not None,
+            )
+        )
+
     def public_settings(self) -> dict[str, str | bool | float | None]:
         """Return a safe snapshot suitable for logs, docs, and diagnostics."""
         return {
@@ -101,6 +115,7 @@ class Settings(BaseSettings):
             "store_description": self.store_description,
             "assistant_personality": self.assistant_personality,
             "store_vertical": self.store_vertical,
+            "store_slug": self.store_slug,
             "store_locale": self.store_locale,
             "store_timezone": self.store_timezone,
             "store_transfer_alias": self.store_transfer_alias,
@@ -113,14 +128,7 @@ class Settings(BaseSettings):
             "smtp_port": self.smtp_port,
             "smtp_user": self.smtp_user,
             "smtp_password_configured": self.smtp_password is not None,
-            "smtp_configured": all(
-                (
-                    self.smtp_server is not None,
-                    self.smtp_port is not None,
-                    self.smtp_user is not None,
-                    self.smtp_password is not None,
-                )
-            ),
+            "smtp_configured": self.smtp_configured,
             "gemini_model": self.gemini_model,
             "gemini_api_key_configured": self.gemini_api_key is not None,
             "assistant_model_timeout_seconds": self.assistant_model_timeout_seconds,

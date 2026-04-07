@@ -926,6 +926,7 @@ class OrderingAssistantService:
             customer = await repository.get_or_create_customer(
                 channel=channel,
                 external_id=external_user_id,
+                store_id=resolved_store_id,
                 phone_number=external_user_id if channel == Channel.WHATSAPP else None,
             )
             conversation = await repository.get_or_create_conversation(

@@ -4,13 +4,13 @@
 <section class="rounded-[2rem] border border-white/70 bg-white/85 p-6 shadow-card backdrop-blur">
     <form class="grid gap-4 lg:grid-cols-[minmax(0,1fr)_180px]" method="get">
         <label class="space-y-2 text-sm font-medium text-slate-700">
-            <span>Buscar cliente</span>
+            <span>{{ customers_query_label }}</span>
             <input
                 class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
                 type="search"
                 name="q"
                 value="{{ customers_query }}"
-                placeholder="Nombre, teléfono o dirección"
+                placeholder="{{ customers_query_placeholder }}"
             />
         </label>
         <div class="flex items-end">
@@ -23,7 +23,7 @@
         </div>
     </form>
     <div class="mt-4 flex items-center justify-between gap-3 rounded-2xl bg-oat px-4 py-3 text-sm text-slate-700">
-        <span>{{ results_count }} clientes encontrados</span>
+        <span>{{ results_count }} {{ customers_results_label }}</span>
         {% if customers_query %}
         <a class="font-semibold text-ember" href="/dashboard/customers">Limpiar búsqueda</a>
         {% endif %}
@@ -35,11 +35,11 @@
     <article class="rounded-[2rem] border border-white/70 bg-white/85 p-5 shadow-card backdrop-blur">
         <div class="flex items-start justify-between gap-4">
             <div>
-                <h3 class="text-xl font-semibold">{{ customer.name or "Cliente sin nombre" }}</h3>
-                <p class="mt-1 text-sm text-slate-500">Cliente #{{ customer.id }}</p>
+                <h3 class="text-xl font-semibold">{{ customer.name or customers_fallback_name }}</h3>
+                <p class="mt-1 text-sm text-slate-500">{{ customers_id_label }} #{{ customer.id }}</p>
             </div>
             <span class="rounded-full bg-slate-950 px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-white">
-                Cliente
+                {{ customers_entity_badge }}
             </span>
         </div>
         <dl class="mt-5 space-y-3 text-sm text-slate-600">
@@ -55,7 +55,7 @@
     </article>
     {% else %}
     <article class="rounded-[2rem] border border-dashed border-slate-300 bg-slate-50 p-6 text-sm text-slate-600 xl:col-span-2">
-        No hay clientes que coincidan con esa búsqueda.
+        {{ customers_empty_message }}
     </article>
     {% endfor %}
 </section>

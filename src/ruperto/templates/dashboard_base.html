@@ -48,7 +48,7 @@
                         </div>
                         <div class="mt-4 space-y-3">
                             <a
-                                href="/demo/chat"
+                                href="/demo/chat/{{ store.slug }}"
                                 class="flex w-full items-center justify-center rounded-full border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-700 transition hover:border-ember hover:text-ember"
                             >
                                 Abrir demo del chat
@@ -56,7 +56,7 @@
                             {% if memberships|length > 1 %}
                             <form action="/dashboard/active-store" method="post" class="space-y-2">
                                 <label class="block text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
-                                    Local activo
+                                    Espacio activo
                                 </label>
                                 <div class="flex gap-2">
                                     <select
@@ -126,7 +126,7 @@
                     <header class="rounded-[2rem] border border-white/70 bg-white/85 px-6 py-6 shadow-card backdrop-blur">
                         <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                             <div class="space-y-2">
-                                <p class="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">Ruperto dashboard</p>
+                                <p class="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">Panel Ruperto</p>
                                 <h2 class="text-3xl font-semibold tracking-tight">{{ page_title }}</h2>
                                 <p class="max-w-3xl text-sm leading-6 text-slate-600">
                                     {{ page_description }}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import AsyncIterator, Mapping
@@ -20,6 +21,7 @@ from pydantic import ValidationError
 from starlette.middleware.sessions import SessionMiddleware
 
 from ruperto import get_version
+from ruperto.api import kanban
 from ruperto.auth import normalize_email
 from ruperto.channels.base import ChannelDeliveryError, InboundCustomerMessage, OutboundCustomerMessage
 from ruperto.channels.service import (
@@ -28,15 +30,28 @@ from ruperto.channels.service import (
     handle_inbound_customer_message,
 )
 from ruperto.config import Settings
-from ruperto.db import DatabaseRuntime, create_database_runtime, init_database, ping_database
-from ruperto.models import Channel, ChannelProvider, DeliveryType, OrderStatus, PaymentMethod, StaffRole, StoreVertical
-from ruperto.repository import BusinessRepository, OrderNotFoundError
+from ruperto.db import DatabaseRuntime, create_database_runtime, init_database, ping_database, seed_store_bootstrap_data
+from ruperto.mail import SignupEmailDeliveryError, send_signup_welcome_email
+from ruperto.models import (
+    Channel,
+    ChannelProvider,
+    DeliveryType,
+    MunicipalRequestKind,
+    OrderStatus,
+    PaymentMethod,
+    StaffRole,
+    StoreVertical,
+)
+from ruperto.repository import BusinessRepository, MunicipalAreaNotFoundError, OrderNotFoundError
 from ruperto.schemas import (
     AssistantTurnResult,
     CustomerSnapshot,
     DevMessageRequest,
     DevNotificationPollRequest,
+    HomeSignupRequest,
     MenuItemSnapshot,
+    MunicipalAreaCreateRequest,
+    MunicipalCategoryCreateRequest,
     OrderSnapshot,
     OrderStatusUpdateRequest,
     OutboundNotificationSnapshot,
@@ -61,11 +76,25 @@ DASHBOARD_FLASH_MESSAGES = {
     "logged-out": "Sesión cerrada.",
     "order-updated": "Estado del pedido actualizado.",
     "profile-updated": "Perfil del local actualizado.",
+    "municipal-area-created": "Area creada.",
+    "municipal-category-created": "Categoria creada.",
     "role-updated": "Rol actualizado.",
     "store-switched": "Local activo actualizado.",
 }
+HOME_SIGNUP_VERTICAL_OPTIONS = [
+    {
+        "value": StoreVertical.ORDERING.value,
+        "label": "Local de comida",
+        "description": "Recibe pedidos, muestra la carta y organiza al equipo en un solo lugar.",
+    },
+    {
+        "value": StoreVertical.MUNICIPAL.value,
+        "label": "Municipio",
+        "description": "Atiende consultas, reclamos y solicitudes de la comunidad por canales digitales.",
+    },
+]
 DASHBOARD_VERTICAL_LABELS = {
-    StoreVertical.ORDERING: "Rotisería",
+    StoreVertical.ORDERING: "Local de comida",
     StoreVertical.MUNICIPAL: "Municipio",
 }
 DASHBOARD_ORDER_STATUS_LABELS = {
@@ -166,7 +195,8 @@ DASHBOARD_NAVIGATION_MUNICIPAL: list[DashboardNavSection] = [
         "section": "Operación",
         "items": [
             {"key": "home", "label": "Inicio", "path": "/dashboard"},
-            {"key": "customers", "label": "Vecinos", "path": "/dashboard/customers"},
+            {"key": "kanban", "label": "Tablero Kanban", "path": "/dashboard/kanban"},
+            {"key": "customers", "label": "Personas", "path": "/dashboard/customers"},
             {"key": "menu", "label": "Áreas y categorías", "path": "/dashboard/settings/menu"},
         ],
     },
@@ -360,25 +390,117 @@ def dashboard_login_context(
     }
 
 
-def demo_chat_page_context(*, request: Request, settings: Settings) -> dict[str, Any]:
-    """Build the template context for the lightweight demo chat page."""
+def request_prefers_html(request: Request) -> bool:
+    """Return whether the client is explicitly asking for an HTML page."""
+    return "text/html" in request.headers.get("accept", "").lower()
+
+
+def home_signup_context(
+    *,
+    request: Request,
+    error_message: str | None = None,
+    status_code: int = 200,
+    form_values: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Build the public landing-page context shared by the home routes."""
+    values = {
+        "store_name": "",
+        "full_name": "",
+        "email": "",
+        "vertical": StoreVertical.ORDERING.value,
+    }
+    if form_values is not None:
+        values.update({key: value for key, value in form_values.items() if key in values})
     return {
         "request": request,
-        "store_name": settings.store_name,
-        "bot_name": settings.bot_name,
-        "store_location": settings.store_location or "Local sin ubicación configurada",
-        "api_path": "/api/dev/messages",
-        "notifications_api_path": "/api/dev/notifications",
-        "demo_profiles": [
-            {"label": "Martín", "phone": "+54 351 555 7788"},
-            {"label": "Ana", "phone": "+54 9 11 3344 5566"},
-        ],
-        "demo_prompts": [
+        "error_message": error_message,
+        "status_code": status_code,
+        "form_values": values,
+        "vertical_options": HOME_SIGNUP_VERTICAL_OPTIONS,
+        "dashboard_login_path": DASHBOARD_LOGIN_PATH,
+        "demo_chat_path": "/demo/chat",
+    }
+
+
+def build_signup_store_defaults(*, store_name: str, vertical: StoreVertical) -> dict[str, str | None]:
+    """Return the initial store profile copy used by the public signup."""
+    resolved_name = store_name.strip()
+    if vertical == StoreVertical.MUNICIPAL:
+        return {
+            "bot_name": "Ruperto",
+            "store_description": f"{resolved_name} atiende consultas, reclamos y solicitudes por chat.",
+            "assistant_personality": "Claro, cercano y resolutivo.",
+            "transfer_alias": None,
+        }
+    return {
+        "bot_name": "Ruperto",
+        "store_description": f"{resolved_name} recibe pedidos asistidos por chat.",
+        "assistant_personality": "Amable, agil y confiable.",
+        "transfer_alias": None,
+    }
+
+
+def demo_chat_page_context(*, request: Request, store: StoreProfileSnapshot) -> dict[str, Any]:
+    """Build the template context for the lightweight demo chat page."""
+    if store.vertical == StoreVertical.MUNICIPAL:
+        demo_prompts = [
+            "Hola, quiero hacer un reclamo",
+            "Es por alumbrado público",
+            "La luz no funciona en la esquina",
+            "San Martín 123 esquina Belgrano",
+        ]
+        demo_chat_copy = {
+            "profile_collection_title": "Personas demo",
+            "profile_collection_description": "Elegí un teléfono o cargá uno nuevo.",
+            "intro_subject_plural": "personas nuevas o personas que ya tienen memoria",
+            "add_profile_button": "Agregar persona demo",
+            "random_profile_button": "Crear persona aleatoria",
+            "active_profile_fallback": "Persona demo",
+            "active_phone_fallback": "Elegí o creá un número para empezar.",
+            "memory_hint": "Si reutilizás el mismo teléfono, el backend recuerda el contexto de esa persona.",
+            "message_placeholder": "Escribí como si fueras la persona...",
+            "user_bubble_label": "Persona",
+            "notification_text": "Llegó una notificación del caso.",
+            "random_profile_ready_text": "Persona demo aleatoria lista para usar.",
+            "profile_active_text": "Persona demo activa.",
+            "profile_removed_text": "Persona demo eliminada.",
+        }
+    else:
+        demo_prompts = [
             "Hola, quiero ver la carta",
             "Soy Martín Gaitán",
             "Una hamburguesa doble cheddar para retirar",
             "¿Me lo podés preparar para las 12?",
+        ]
+        demo_chat_copy = {
+            "profile_collection_title": "Clientes demo",
+            "profile_collection_description": "Elegí un teléfono o cargá uno nuevo.",
+            "intro_subject_plural": "clientes nuevos o clientes que ya tienen memoria",
+            "add_profile_button": "Agregar cliente demo",
+            "random_profile_button": "Crear cliente aleatorio",
+            "active_profile_fallback": "Cliente demo",
+            "active_phone_fallback": "Elegí o creá un número para empezar.",
+            "memory_hint": "Si reutilizás el mismo teléfono, el backend recuerda el contexto de ese cliente.",
+            "message_placeholder": "Escribí como si fueras el cliente...",
+            "user_bubble_label": "Cliente",
+            "notification_text": "Llegó una notificación del pedido.",
+            "random_profile_ready_text": "Cliente demo aleatorio listo para usar.",
+            "profile_active_text": "Cliente demo activo.",
+            "profile_removed_text": "Cliente demo eliminado.",
+        }
+    return {
+        "request": request,
+        "store_name": store.store_name,
+        "bot_name": store.bot_name,
+        "store_location": store.store_location or "Local sin ubicación configurada",
+        "api_path": f"/api/dev/messages/{store.slug}",
+        "notifications_api_path": f"/api/dev/notifications/{store.slug}",
+        "demo_profiles": [
+            {"label": "Martín", "phone": "+54 351 555 7788"},
+            {"label": "Ana", "phone": "+54 9 11 3344 5566"},
         ],
+        "demo_chat_copy": demo_chat_copy,
+        "demo_prompts": demo_prompts,
     }
 
 
@@ -406,8 +528,24 @@ def dashboard_store_scope_note(memberships: list[StoreMembershipSnapshot]) -> st
         return None
     return (
         "El cambio de local ya separa el perfil y los horarios. "
-        "Pedidos, clientes y catálogo siguen compartiendo el modelo MVP mientras avanzamos con el multi-tenant."
+        "Pedidos, contactos y catálogo siguen compartiendo el modelo MVP mientras avanzamos con el multi-local."
     )
+
+
+def build_scoped_dev_external_user_id(*, store_slug: str, external_user_id: str) -> str:
+    """Namespace one dev-chat identity under the public tenant slug."""
+    return f"{store_slug}:{external_user_id.strip()}"
+
+
+async def get_store_profile_by_slug_or_404(*, request: Request, store_slug: str) -> StoreProfileSnapshot:
+    """Load one tenant by its public slug or raise a 404."""
+    runtime = get_runtime(request)
+    async with runtime.database.session_factory() as session:
+        repository = BusinessRepository(session)
+        store = await repository.get_store_profile_by_slug(store_slug)
+    if store is None:
+        raise HTTPException(status_code=404, detail="Store not found.")
+    return store
 
 
 def dashboard_navigation(active_page: str, *, vertical: StoreVertical) -> list[DashboardNavSectionState]:
@@ -498,8 +636,8 @@ def customers_page_copy(store: StoreProfileSnapshot) -> DashboardPageSpec:
     if store.vertical == StoreVertical.MUNICIPAL:
         return DashboardPageSpec(
             active_page="customers",
-            title="Vecinos",
-            description="Base de vecinos conocida por el sistema, con búsqueda por nombre, teléfono o dirección.",
+            title="Personas que escribieron",
+            description="Listado propio de este municipio con búsqueda por nombre, teléfono o referencia.",
         )
     return DashboardPageSpec(
         active_page="customers",
@@ -514,7 +652,7 @@ def menu_page_copy(store: StoreProfileSnapshot) -> DashboardPageSpec:
         return DashboardPageSpec(
             active_page="menu",
             title="Áreas y categorías",
-            description="La configuración de áreas, categorías y subcategorías se habilita en la próxima etapa.",
+            description="Configurá las áreas municipales y las categorías que el asistente va a ofrecer.",
         )
     return DashboardPageSpec(
         active_page="menu",
@@ -529,9 +667,7 @@ def home_page_copy(store: StoreProfileSnapshot) -> DashboardPageSpec:
         return DashboardPageSpec(
             active_page="home",
             title="Inicio",
-            description=(
-                "Vista inicial del vertical municipal. En la próxima etapa vamos a sumar casos, áreas y tablero."
-            ),
+            description="Resumen inicial del municipio. Desde acá vas a ir organizando la atención y los casos.",
         )
     return DashboardPageSpec(
         active_page="home",
@@ -546,9 +682,7 @@ def hours_page_copy(store: StoreProfileSnapshot) -> DashboardPageSpec:
         return DashboardPageSpec(
             active_page="hours",
             title="Agenda semanal",
-            description=(
-                "Este vertical no usa la agenda comercial. Las excepciones y turnos municipales llegan después."
-            ),
+            description="Este municipio no usa la agenda comercial. Las excepciones y turnos llegan después.",
         )
     return DashboardPageSpec(
         active_page="hours",
@@ -625,10 +759,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
         https_only=active_settings.environment == "production",
     )
 
-    @app.get("/")
-    async def read_root(request: Request) -> dict[str, Any]:
+    @app.get("/", response_model=None)
+    async def read_root(request: Request) -> Response | dict[str, Any]:
         runtime = get_runtime(request)
-        return {
+        payload = {
             "app": "ruperto",
             "version": get_version(),
             "environment": runtime.settings.environment,
@@ -636,6 +770,136 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
             "bot_name": runtime.settings.bot_name,
             "store_locale": runtime.settings.store_locale,
         }
+        if not request_prefers_html(request):
+            return payload
+        return TEMPLATES.TemplateResponse(
+            request=request,
+            name="home.html",
+            context=home_signup_context(request=request),
+        )
+
+    @app.post("/signup", response_class=HTMLResponse)
+    async def post_home_signup(request: Request) -> Response:
+        runtime = get_runtime(request)
+        form = await request.form()
+        submitted_values = {
+            "store_name": str(form.get("store_name", "")).strip(),
+            "full_name": str(form.get("full_name", "")).strip(),
+            "email": normalize_email(str(form.get("email", ""))),
+            "vertical": str(form.get("vertical", "")).strip(),
+        }
+        try:
+            payload = HomeSignupRequest(
+                store_name=submitted_values["store_name"],
+                full_name=submitted_values["full_name"],
+                email=submitted_values["email"],
+                password=str(form.get("password", "")),
+                vertical=StoreVertical(str(form.get("vertical", ""))),
+            )
+        except ValidationError as error:
+            if request_prefers_html(request):
+                context = home_signup_context(
+                    request=request,
+                    error_message="Completá nombre, responsable, correo, contraseña y el tipo de organización.",
+                    status_code=422,
+                    form_values=submitted_values,
+                )
+                return TEMPLATES.TemplateResponse(
+                    request=request,
+                    name="home.html",
+                    context=context,
+                    status_code=422,
+                )
+            raise HTTPException(status_code=422, detail=error.errors()) from error
+
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            existing_staff_user = await repository.get_staff_user_by_email(payload.email)
+            if existing_staff_user is not None:
+                context = home_signup_context(
+                    request=request,
+                    error_message="Ya existe una cuenta con ese correo.",
+                    status_code=409,
+                    form_values=submitted_values,
+                )
+                return TEMPLATES.TemplateResponse(
+                    request=request,
+                    name="home.html",
+                    context=context,
+                    status_code=409,
+                )
+
+            store_defaults = build_signup_store_defaults(
+                store_name=payload.store_name,
+                vertical=payload.vertical,
+            )
+            store = await repository.create_store_profile(
+                store_name=payload.store_name,
+                bot_name=cast(str, store_defaults["bot_name"]),
+                store_description=cast(str, store_defaults["store_description"]),
+                assistant_personality=cast(str, store_defaults["assistant_personality"]),
+                vertical=payload.vertical,
+                transfer_alias=store_defaults["transfer_alias"],
+            )
+            staff_user = await repository.ensure_staff_user(
+                email=payload.email,
+                full_name=payload.full_name,
+                password=payload.password,
+                store_id=store.id,
+                role=StaffRole.OWNER,
+            )
+            await seed_store_bootstrap_data(
+                session=session,
+                repository=repository,
+                store_id=store.id,
+                vertical=store.vertical,
+            )
+            if runtime.settings.smtp_configured:
+                assert runtime.settings.smtp_server is not None
+                assert runtime.settings.smtp_port is not None
+                assert runtime.settings.smtp_user is not None
+                assert runtime.settings.smtp_password is not None
+                dashboard_url = str(request.url_for("read_dashboard_home"))
+                demo_chat_url = str(request.url_for("read_demo_chat_for_store", store_slug=store.slug))
+                try:
+                    await asyncio.to_thread(
+                        send_signup_welcome_email,
+                        smtp_server=runtime.settings.smtp_server,
+                        smtp_port=runtime.settings.smtp_port,
+                        smtp_user=runtime.settings.smtp_user,
+                        smtp_password=runtime.settings.smtp_password.get_secret_value(),
+                        recipient_email=payload.email,
+                        recipient_name=payload.full_name,
+                        store_name=store.store_name,
+                        store_slug=store.slug,
+                        vertical=store.vertical,
+                        dashboard_url=dashboard_url,
+                        demo_chat_url=demo_chat_url,
+                    )
+                except SignupEmailDeliveryError as error:
+                    if request_prefers_html(request):
+                        context = home_signup_context(
+                            request=request,
+                            error_message=(
+                                "No pudimos enviar el correo de bienvenida. "
+                                "Revisá la configuración SMTP e intentá de nuevo."
+                            ),
+                            status_code=503,
+                            form_values=submitted_values,
+                        )
+                        return TEMPLATES.TemplateResponse(
+                            request=request,
+                            name="home.html",
+                            context=context,
+                            status_code=503,
+                        )
+                    raise HTTPException(status_code=503, detail="Could not deliver signup email.") from error
+            await session.commit()
+
+        request.session.clear()
+        request.session[SESSION_STAFF_USER_ID_KEY] = staff_user.id
+        request.session[SESSION_STORE_ID_KEY] = store.id
+        return RedirectResponse(url="/dashboard", status_code=303)
 
     @app.get("/healthz")
     async def healthcheck(request: Request) -> dict[str, str]:
@@ -646,7 +910,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
     @app.get("/demo/chat", response_class=HTMLResponse)
     async def read_demo_chat(request: Request) -> Response:
         runtime = get_runtime(request)
-        context = demo_chat_page_context(request=request, settings=runtime.settings)
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            store = await repository.get_store_profile(store_id=runtime.settings.default_store_id)
+        return RedirectResponse(url=f"/demo/chat/{store.slug}", status_code=303)
+
+    @app.get("/demo/chat/{store_slug}", response_class=HTMLResponse)
+    async def read_demo_chat_for_store(request: Request, store_slug: str) -> Response:
+        store = await get_store_profile_by_slug_or_404(request=request, store_slug=store_slug)
+        context = demo_chat_page_context(request=request, store=store)
         return TEMPLATES.TemplateResponse(request=request, name="demo_chat.html", context=context)
 
     @app.get(DASHBOARD_LOGIN_PATH, response_class=HTMLResponse)
@@ -731,7 +1003,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
             repository = BusinessRepository(session)
             store = await repository.get_store_profile(store_id=identity.active_store_id)
             orders = await repository.list_orders(limit=limit, store_id=identity.active_store_id)
-            customers = await repository.list_customers(limit=50)
+            customers = await repository.list_customers(limit=50, store_id=identity.active_store_id)
             menu_items = await repository.list_menu_items(only_available=False)
 
         context = dashboard_page_context(
@@ -743,9 +1015,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
         )
         if store.vertical == StoreVertical.MUNICIPAL:
             context["placeholder_points"] = [
-                "El tenant ya enruta conversaciones al vertical municipal.",
-                "El próximo paso suma áreas, categorías y casos con estado.",
-                "La base compartida de vecinos, canales y usuarios ya está lista.",
+                "Este municipio ya puede recibir conversaciones en su propio espacio.",
+                "Las personas que escriben quedan asociadas solo a este municipio.",
+                "Podés cargar áreas y categorías para empezar a ordenar la atención.",
             ]
             return TEMPLATES.TemplateResponse(
                 request=request, name="dashboard_vertical_placeholder.html", context=context
@@ -781,7 +1053,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
         async with runtime.database.session_factory() as session:
             repository = BusinessRepository(session)
             store = await repository.get_store_profile(store_id=identity.active_store_id)
-            customers = await repository.list_customers(limit=200)
+            customers = await repository.list_customers(limit=200, store_id=identity.active_store_id)
 
         filtered_customers = [
             customer for customer in customers if not query or matches_customer_query(customer, query)
@@ -797,10 +1069,64 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
             {
                 "customers": filtered_customers,
                 "customers_query": q,
+                "customers_empty_message": (
+                    "Todavía no hay personas registradas para este municipio."
+                    if store.vertical == StoreVertical.MUNICIPAL
+                    else "No hay clientes que coincidan con esa búsqueda."
+                ),
+                "customers_entity_badge": "Persona" if store.vertical == StoreVertical.MUNICIPAL else "Cliente",
+                "customers_fallback_name": (
+                    "Persona sin nombre" if store.vertical == StoreVertical.MUNICIPAL else "Cliente sin nombre"
+                ),
+                "customers_id_label": "Registro" if store.vertical == StoreVertical.MUNICIPAL else "Cliente",
+                "customers_query_label": (
+                    "Buscar persona" if store.vertical == StoreVertical.MUNICIPAL else "Buscar cliente"
+                ),
+                "customers_query_placeholder": (
+                    "Nombre, teléfono o referencia"
+                    if store.vertical == StoreVertical.MUNICIPAL
+                    else "Nombre, teléfono o dirección"
+                ),
+                "customers_results_label": (
+                    "personas encontradas" if store.vertical == StoreVertical.MUNICIPAL else "clientes encontrados"
+                ),
                 "results_count": len(filtered_customers),
             }
         )
         return TEMPLATES.TemplateResponse(request=request, name="dashboard_customers.html", context=context)
+
+    @app.get("/dashboard/kanban", response_class=HTMLResponse)
+    async def read_dashboard_kanban(
+        request: Request,
+        flash: str | None = None,
+    ) -> Response:
+        identity = await load_dashboard_identity(request)
+        if identity is None:
+            return dashboard_login_redirect(next_url=request.url.path, flash="login-required")
+
+        runtime = get_runtime(request)
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            store = await repository.get_store_profile(store_id=identity.active_store_id)
+            areas = await repository.list_municipal_areas(store_id=identity.active_store_id, only_active=True)
+
+        context = dashboard_page_context(
+            request=request,
+            identity=identity,
+            flash=flash,
+            page=DashboardPageSpec(
+                active_page="kanban",
+                title="Tablero Kanban",
+                description="Gestioná los casos municipales por estado y área.",
+            ),
+            store=store,
+        )
+        context.update(
+            {
+                "areas": areas,
+            }
+        )
+        return TEMPLATES.TemplateResponse(request=request, name="dashboard_kanban.html", context=context)
 
     @app.get("/dashboard/settings/menu", response_class=HTMLResponse)
     async def read_dashboard_menu_settings(
@@ -819,10 +1145,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
         async with runtime.database.session_factory() as session:
             repository = BusinessRepository(session)
             store = await repository.get_store_profile(store_id=identity.active_store_id)
-            menu_items = await repository.list_menu_items(only_available=False)
+            if store.vertical == StoreVertical.MUNICIPAL:
+                areas = await repository.list_municipal_areas(store_id=identity.active_store_id)
+                categories = await repository.list_municipal_categories(store_id=identity.active_store_id)
+            else:
+                menu_items = await repository.list_menu_items(only_available=False)
 
-        categories = sorted({item.category for item in menu_items})
-        filtered_items = [item for item in menu_items if matches_menu_query(item, query, category=selected_category)]
         context = dashboard_page_context(
             request=request,
             identity=identity,
@@ -831,14 +1159,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
             store=store,
         )
         if store.vertical == StoreVertical.MUNICIPAL:
-            context["placeholder_points"] = [
-                "Cada municipio va a definir sus propias áreas de servicio.",
-                "Después sumamos subcategorías y reglas especiales por área.",
-                "La UI definitiva va a reemplazar esta vista transicional.",
-            ]
-            return TEMPLATES.TemplateResponse(
-                request=request, name="dashboard_vertical_placeholder.html", context=context
+            context.update(
+                {
+                    "municipal_areas": areas,
+                    "municipal_request_kind_options": [
+                        {"value": MunicipalRequestKind.COMPLAINT.value, "label": "Reclamo"},
+                        {"value": MunicipalRequestKind.REQUEST.value, "label": "Solicitud"},
+                    ],
+                    "municipal_area_options": areas,
+                    "municipal_categories_by_area": {
+                        area.id: [item for item in categories if item.area_id == area.id] for area in areas
+                    },
+                }
             )
+            return TEMPLATES.TemplateResponse(
+                request=request,
+                name="dashboard_settings_municipal_catalog.html",
+                context=context,
+            )
+        categories = sorted({item.category for item in menu_items})
+        filtered_items = [item for item in menu_items if matches_menu_query(item, query, category=selected_category)]
         context.update(
             {
                 "menu_categories": categories,
@@ -869,6 +1209,69 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
         )
         return TEMPLATES.TemplateResponse(request=request, name="dashboard_settings_profile.html", context=context)
 
+    @app.post("/dashboard/settings/municipal/areas")
+    async def post_dashboard_municipal_area(request: Request) -> RedirectResponse:
+        identity = await load_dashboard_identity(request)
+        if identity is None:
+            return dashboard_login_redirect(next_url="/dashboard/settings/menu", flash="login-required")
+
+        runtime = get_runtime(request)
+        form = await request.form()
+        display_order = parse_session_int(form.get("display_order"))
+        try:
+            payload = MunicipalAreaCreateRequest(
+                name=str(form.get("name", "")),
+                description=str(form.get("description", "")) or None,
+                display_order=display_order or 0,
+            )
+        except ValidationError as error:
+            raise HTTPException(status_code=422, detail=error.errors()) from error
+
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            store = await repository.get_store_profile(store_id=identity.active_store_id)
+            if store.vertical != StoreVertical.MUNICIPAL:
+                raise HTTPException(status_code=404, detail="Municipal catalog not enabled.")
+            await repository.create_municipal_area(store_id=identity.active_store_id, payload=payload)
+            await session.commit()
+        return dashboard_redirect(path="/dashboard/settings/menu", flash="municipal-area-created")
+
+    @app.post("/dashboard/settings/municipal/categories")
+    async def post_dashboard_municipal_category(request: Request) -> RedirectResponse:
+        identity = await load_dashboard_identity(request)
+        if identity is None:
+            return dashboard_login_redirect(next_url="/dashboard/settings/menu", flash="login-required")
+
+        runtime = get_runtime(request)
+        form = await request.form()
+        area_id = parse_session_int(form.get("area_id"))
+        if area_id is None:
+            raise HTTPException(status_code=422, detail="Invalid municipal area id.")
+        display_order = parse_session_int(form.get("display_order"))
+        try:
+            payload = MunicipalCategoryCreateRequest(
+                name=str(form.get("name", "")),
+                description=str(form.get("description", "")) or None,
+                request_kind=MunicipalRequestKind(str(form.get("request_kind", MunicipalRequestKind.COMPLAINT.value))),
+                display_order=display_order or 0,
+                requires_precise_location=str(form.get("requires_precise_location", "")).lower() == "on",
+                is_fallback=str(form.get("is_fallback", "")).lower() == "on",
+            )
+        except ValidationError as error:
+            raise HTTPException(status_code=422, detail=error.errors()) from error
+
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            store = await repository.get_store_profile(store_id=identity.active_store_id)
+            if store.vertical != StoreVertical.MUNICIPAL:
+                raise HTTPException(status_code=404, detail="Municipal catalog not enabled.")
+            try:
+                await repository.create_municipal_category(area_id=area_id, payload=payload)
+            except MunicipalAreaNotFoundError as error:
+                raise HTTPException(status_code=404, detail="Municipal area not found.") from error
+            await session.commit()
+        return dashboard_redirect(path="/dashboard/settings/menu", flash="municipal-category-created")
+
     @app.post("/dashboard/settings/profile")
     async def post_dashboard_store_profile(request: Request) -> RedirectResponse:
         identity = await load_dashboard_identity(request)
@@ -887,7 +1290,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
                     store_location=str(form.get("store_location", "")) or None,
                     store_description=str(form.get("store_description", "")),
                     assistant_personality=current_store.assistant_personality,
-                    vertical=StoreVertical(str(form.get("vertical", current_store.vertical.value))),
                     transfer_alias=str(form.get("transfer_alias", "")) or None,
                 )
             except ValidationError as error:
@@ -945,7 +1347,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
                     store_location=current_store.store_location,
                     store_description=current_store.store_description,
                     assistant_personality=str(form.get("assistant_personality", "")),
-                    vertical=current_store.vertical,
                     transfer_alias=current_store.transfer_alias,
                 )
             except ValidationError as error:
@@ -1001,7 +1402,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
         )
         if store.vertical == StoreVertical.MUNICIPAL:
             context["placeholder_points"] = [
-                "La agenda comercial queda desactivada para tenants municipales.",
+                "La agenda comercial queda desactivada para municipios.",
                 "Más adelante sumamos excepciones por fecha y turnos presenciales.",
             ]
             return TEMPLATES.TemplateResponse(
@@ -1208,7 +1609,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
         runtime = get_runtime(request)
         async with runtime.database.session_factory() as session:
             repository = BusinessRepository(session)
-            return await repository.list_customers(limit=limit)
+            return await repository.list_customers(limit=limit, store_id=runtime.settings.default_store_id)
 
     @app.get("/api/orders", response_model=list[OrderSnapshot])
     async def read_orders(
@@ -1304,6 +1705,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
             ),
         )
 
+    @app.post("/api/dev/messages/{store_slug}", response_model=AssistantTurnResult)
+    async def post_dev_message_for_store(
+        request: Request,
+        store_slug: str,
+        payload: DevMessageRequest,
+    ) -> AssistantTurnResult:
+        runtime = get_runtime(request)
+        store = await get_store_profile_by_slug_or_404(request=request, store_slug=store_slug)
+        return await handle_inbound_customer_message(
+            session_factory=runtime.database.session_factory,
+            settings=runtime.settings,
+            inbound_message=InboundCustomerMessage(
+                channel=Channel.DEV,
+                external_user_id=build_scoped_dev_external_user_id(
+                    store_slug=store.slug,
+                    external_user_id=payload.external_user_id,
+                ),
+                message_text=payload.message_text,
+            ),
+            store_id=store.id,
+        )
+
     @app.get("/api/dev/notifications", response_model=list[OutboundNotificationSnapshot])
     async def get_dev_notifications(
         request: Request,
@@ -1319,6 +1742,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
             )
             await session.commit()
             return notifications
+
+    @app.get("/api/dev/notifications/{store_slug}", response_model=list[OutboundNotificationSnapshot])
+    async def get_dev_notifications_for_store(
+        request: Request,
+        store_slug: str,
+        external_user_id: str,
+    ) -> list[OutboundNotificationSnapshot]:
+        runtime = get_runtime(request)
+        store = await get_store_profile_by_slug_or_404(request=request, store_slug=store_slug)
+        payload = DevNotificationPollRequest.model_validate({"external_user_id": external_user_id})
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            notifications = await repository.list_pending_notifications(
+                channel=Channel.DEV,
+                external_id=build_scoped_dev_external_user_id(
+                    store_slug=store.slug,
+                    external_user_id=payload.external_user_id,
+                ),
+            )
+            await session.commit()
+            return notifications
+
+    # Include API routers
+    app.include_router(kanban.router)
 
     return app
 

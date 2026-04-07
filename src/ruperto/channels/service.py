@@ -86,6 +86,7 @@ async def seed_customer_name_from_inbound_message(
     *,
     session_factory: SessionFactory,
     inbound_message: InboundCustomerMessage,
+    store_id: int,
 ) -> None:
     """Persist a channel-provided customer name when the customer is still unnamed."""
     if not inbound_message.sender_name:
@@ -95,6 +96,7 @@ async def seed_customer_name_from_inbound_message(
         customer = await repository.get_or_create_customer(
             channel=inbound_message.channel,
             external_id=inbound_message.external_user_id,
+            store_id=store_id,
             phone_number=inbound_message.external_user_id if inbound_message.channel == Channel.WHATSAPP else None,
         )
         if customer.name:
@@ -111,9 +113,11 @@ async def handle_inbound_customer_message(
     store_id: int | None = None,
 ) -> AssistantTurnResult:
     """Process one inbound text message through the tenant-selected assistant."""
+    resolved_store_id = store_id or settings.default_store_id
     await seed_customer_name_from_inbound_message(
         session_factory=session_factory,
         inbound_message=inbound_message,
+        store_id=resolved_store_id,
     )
     return await handle_customer_message_for_store(
         session_factory=session_factory,
@@ -121,7 +125,7 @@ async def handle_inbound_customer_message(
         channel=inbound_message.channel,
         external_user_id=inbound_message.external_user_id,
         message_text=inbound_message.message_text,
-        store_id=store_id,
+        store_id=resolved_store_id,
     )
 
 

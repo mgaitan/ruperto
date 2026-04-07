@@ -50,8 +50,14 @@ RUPERTO_DEFAULT_STORE_ID
 RUPERTO_STORE_VERTICAL
   Bootstrap business vertical for the default tenant.
   Accepted values are `ordering` and `municipal`.
-  The dashboard store profile remains the normal per-tenant place to change
-  the active vertical after initialization.
+  The value is applied when the tenant is created and should stay fixed
+  afterwards.
+
+RUPERTO_STORE_SLUG
+  Optional public slug used for tenant-specific demo routes such as
+  `/demo/chat/<slug>`.
+  If omitted, the bootstrap process derives one from
+  {term}`RUPERTO_STORE_NAME`.
 
 RUPERTO_DASHBOARD_SESSION_SECRET
   Secret used to sign the dashboard session cookie.

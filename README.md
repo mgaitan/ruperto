@@ -55,6 +55,8 @@ settings are now also recognized through `RUPERTO_SMTP_SERVER`,
 The bootstrap store can also start on another business vertical through
 `RUPERTO_STORE_VERTICAL`. The current accepted values are `ordering`
 and `municipal`, with `ordering` as the default.
+You can also set `RUPERTO_STORE_SLUG` to control the public tenant slug used
+by the embedded browser demo.
 
 For Kapso-backed WhatsApp, configure:
 
@@ -70,17 +72,18 @@ uv run ruperto web-chat
 
 Or open the browser demo page served by the main app:
 
-- `http://127.0.0.1:8000/demo/chat`
+- `http://127.0.0.1:8000/demo/chat/<tenant-slug>`
 
-This page is intentionally simple and talks to `/api/dev/messages` directly.
+This page is intentionally simple and talks to `/api/dev/messages/<tenant-slug>`
+directly.
 It lets you switch between multiple demo phone numbers so you can emulate
-returning customers with remembered context.
+returning customers with remembered context inside one tenant.
 
 You should then have:
 
 - API root at `http://127.0.0.1:8000/`
 - health check at `http://127.0.0.1:8000/healthz`
-- browser demo chat at `http://127.0.0.1:8000/demo/chat`
+- browser demo chat at `http://127.0.0.1:8000/demo/chat/<tenant-slug>`
 - staff dashboard at `http://127.0.0.1:8000/dashboard`
 - store profile at `http://127.0.0.1:8000/api/store-profile`
 - menu listing at `http://127.0.0.1:8000/api/menu-items`
@@ -138,16 +141,28 @@ today as one configurable store by default. Dashboard users can already belong
 to more than one store and switch the active store for profile and opening-hour
 management, while orders, customers, and the catalog still use the shared MVP
 data model for now.
-That store profile now also carries a `vertical`, so different tenants can
-route the shared channel/core infrastructure to different assistant domains.
-Today the municipal vertical is still a scaffold, but the dashboard can
-already switch the active tenant between `ordering` and `municipal` without
-changing the rotisería behavior.
+Each tenant now carries a fixed `vertical`, so different tenants can route the
+shared channel/core infrastructure to different assistant domains without
+changing identity from the dashboard later.
+The municipal vertical now routes the shared chat endpoint to a dedicated
+intake assistant that guides neighbors through area selection, category
+selection, request description, location capture, and final confirmation
+without changing the rotisería behavior.
+Each tenant also has a public `slug`, which is used by the embedded browser
+demo and keeps routes such as `/demo/chat/mi-muni` and `/demo/chat/mi-roti`
+bound to the right tenant.
 Municipal tenants now also have a first domain model of their own: service
 areas, optional categories, and cases with status, assignment, and precise
 location fields. Local development bootstraps a demo municipal catalog with
 areas such as public lighting, street maintenance, water requests, and urban
-hygiene so the next agent iteration has realistic data to work with.
+hygiene so the intake flow has realistic data to work with from day one.
+Each municipal category can also be marked as either a complaint or a request,
+so the assistant can phrase confirmation and completion messages with the right
+operational nuance for cases such as water delivery.
+The municipal intake also keeps a few guardrails in the chat layer: it asks
+for a more precise location before submitting a case, nudges the citizen to
+rephrase if the message contains insults, and uses the person's first name in
+the final confirmation to keep the tone concise and natural.
 There is now also a first production-shaped WhatsApp integration path through
 Kapso: the backend can receive inbound text messages from the
 `/webhooks/whatsapp/kapso` endpoint, answer through the Kapso proxy, and send

@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import time
 
+from ruperto.models import MunicipalRequestKind
+
 
 @dataclass(frozen=True, slots=True)
 class MenuSeed:
@@ -46,6 +48,7 @@ class MunicipalCategorySeed:
     area_key: str
     name: str
     description: str
+    request_kind: MunicipalRequestKind = MunicipalRequestKind.COMPLAINT
     display_order: int = 0
     requires_precise_location: bool = False
     is_fallback: bool = False
@@ -463,6 +466,7 @@ DEMO_MUNICIPAL_CATEGORIES: tuple[MunicipalCategorySeed, ...] = (
         area_key="street_maintenance",
         name="Solicitud de lomo de burro",
         description="Pedido de reductor de velocidad o señalización complementaria.",
+        request_kind=MunicipalRequestKind.REQUEST,
         display_order=1,
         requires_precise_location=True,
     ),
@@ -477,6 +481,7 @@ DEMO_MUNICIPAL_CATEGORIES: tuple[MunicipalCategorySeed, ...] = (
         area_key="water_services",
         name="Falta de agua",
         description="Pedido por faltante o baja presión de agua.",
+        request_kind=MunicipalRequestKind.REQUEST,
         display_order=0,
     ),
     MunicipalCategorySeed(
@@ -490,6 +495,7 @@ DEMO_MUNICIPAL_CATEGORIES: tuple[MunicipalCategorySeed, ...] = (
         area_key="water_services",
         name="Otro",
         description="Otra solicitud o reclamo vinculada al servicio de agua.",
+        request_kind=MunicipalRequestKind.REQUEST,
         display_order=99,
         is_fallback=True,
     ),
@@ -504,6 +510,7 @@ DEMO_MUNICIPAL_CATEGORIES: tuple[MunicipalCategorySeed, ...] = (
         area_key="urban_hygiene",
         name="Poda o ramas",
         description="Pedido de poda, retiro de ramas o despeje de vereda.",
+        request_kind=MunicipalRequestKind.REQUEST,
         display_order=1,
         requires_precise_location=True,
     ),

@@ -1,0 +1,178 @@
+{% extends "dashboard_base.html" %}
+
+{% block content %}
+<section class="grid gap-6 xl:grid-cols-2">
+    <article class="rounded-[2rem] border border-white/70 bg-white/85 p-6 shadow-card backdrop-blur">
+        <div class="space-y-2">
+            <p class="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">Configuración</p>
+            <h3 class="text-2xl font-semibold">Crear área</h3>
+            <p class="text-sm text-slate-600">Sumá las áreas que atienden consultas, reclamos y solicitudes en este municipio.</p>
+        </div>
+        <form action="/dashboard/settings/municipal/areas" method="post" class="mt-5 space-y-4">
+            <label class="block space-y-2 text-sm font-medium text-slate-700">
+                <span>Nombre del área</span>
+                <input
+                    class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                    name="name"
+                    placeholder="Ej. Alumbrado público"
+                    required
+                />
+            </label>
+            <label class="block space-y-2 text-sm font-medium text-slate-700">
+                <span>Descripción</span>
+                <textarea
+                    class="min-h-28 w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                    name="description"
+                    placeholder="Qué temas resuelve esta área"
+                ></textarea>
+            </label>
+            <label class="block space-y-2 text-sm font-medium text-slate-700">
+                <span>Orden</span>
+                <input
+                    class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                    type="number"
+                    min="0"
+                    name="display_order"
+                    value="0"
+                />
+            </label>
+            <button
+                class="w-full rounded-full bg-ink px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-800"
+                type="submit"
+            >
+                Guardar área
+            </button>
+        </form>
+    </article>
+
+    <article class="rounded-[2rem] border border-white/70 bg-white/85 p-6 shadow-card backdrop-blur">
+        <div class="space-y-2">
+            <p class="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">Configuración</p>
+            <h3 class="text-2xl font-semibold">Crear categoría</h3>
+            <p class="text-sm text-slate-600">Organizá cada área con categorías que el asistente pueda reconocer.</p>
+        </div>
+        <form action="/dashboard/settings/municipal/categories" method="post" class="mt-5 space-y-4">
+            <label class="block space-y-2 text-sm font-medium text-slate-700">
+                <span>Área</span>
+                <select
+                    class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                    name="area_id"
+                    {% if not municipal_area_options %}disabled{% endif %}
+                >
+                    {% for area in municipal_area_options %}
+                    <option value="{{ area.id }}">{{ area.name }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label class="block space-y-2 text-sm font-medium text-slate-700">
+                <span>Nombre de la categoría</span>
+                <input
+                    class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                    name="name"
+                    placeholder="Ej. Lámpara apagada"
+                    required
+                    {% if not municipal_area_options %}disabled{% endif %}
+                />
+            </label>
+            <label class="block space-y-2 text-sm font-medium text-slate-700">
+                <span>Descripción</span>
+                <textarea
+                    class="min-h-28 w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                    name="description"
+                    placeholder="Cuándo conviene usar esta categoría"
+                    {% if not municipal_area_options %}disabled{% endif %}
+                ></textarea>
+            </label>
+            <label class="block space-y-2 text-sm font-medium text-slate-700">
+                <span>Tipo de gestión</span>
+                <select
+                    class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                    name="request_kind"
+                    {% if not municipal_area_options %}disabled{% endif %}
+                >
+                    {% for option in municipal_request_kind_options %}
+                    <option value="{{ option.value }}">{{ option.label }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <div class="grid gap-4 sm:grid-cols-2">
+                <label class="block space-y-2 text-sm font-medium text-slate-700">
+                    <span>Orden</span>
+                    <input
+                        class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                        type="number"
+                        min="0"
+                        name="display_order"
+                        value="0"
+                        {% if not municipal_area_options %}disabled{% endif %}
+                    />
+                </label>
+                <div class="space-y-3 rounded-2xl bg-oat px-4 py-4 text-sm text-slate-700">
+                    <label class="flex items-center gap-3">
+                        <input class="h-4 w-4 accent-ember" type="checkbox" name="requires_precise_location" />
+                        <span>Pedir ubicación precisa</span>
+                    </label>
+                    <label class="flex items-center gap-3">
+                        <input class="h-4 w-4 accent-ember" type="checkbox" name="is_fallback" />
+                        <span>Usar como categoría por defecto</span>
+                    </label>
+                </div>
+            </div>
+            <button
+                class="w-full rounded-full bg-ember px-5 py-3 text-sm font-semibold text-white transition hover:bg-orange-600 disabled:cursor-not-allowed disabled:bg-slate-300"
+                type="submit"
+                {% if not municipal_area_options %}disabled{% endif %}
+            >
+                Guardar categoría
+            </button>
+            {% if not municipal_area_options %}
+            <p class="text-sm text-slate-500">Primero necesitás crear al menos un área.</p>
+            {% endif %}
+        </form>
+    </article>
+</section>
+
+<section class="grid gap-4">
+    {% for area in municipal_areas %}
+    <article class="rounded-[2rem] border border-white/70 bg-white/85 p-6 shadow-card backdrop-blur">
+        <div class="flex flex-wrap items-start justify-between gap-4">
+            <div>
+                <p class="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">Área municipal</p>
+                <h3 class="mt-2 text-2xl font-semibold">{{ area.name }}</h3>
+                <p class="mt-2 text-sm text-slate-600">{{ area.description or "Sin descripción todavía." }}</p>
+            </div>
+            <span class="rounded-full bg-oat px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-slate-700">
+                Orden {{ area.display_order }}
+            </span>
+        </div>
+        <div class="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+            {% for category in municipal_categories_by_area.get(area.id, []) %}
+            <div class="rounded-3xl border border-slate-200 bg-white p-4">
+                <p class="text-sm font-semibold text-slate-900">{{ category.name }}</p>
+                <p class="mt-1 text-sm text-slate-600">{{ category.description or "Sin descripción." }}</p>
+                <div class="mt-3 flex flex-wrap gap-2 text-xs font-medium text-slate-600">
+                    <span class="rounded-full bg-slate-100 px-3 py-1 text-slate-900">
+                        {{ "Solicitud" if category.request_kind == "request" else "Reclamo" }}
+                    </span>
+                    {% if category.requires_precise_location %}
+                    <span class="rounded-full bg-amber-100 px-3 py-1 text-amber-900">Ubicación precisa</span>
+                    {% endif %}
+                    {% if category.is_fallback %}
+                    <span class="rounded-full bg-emerald-100 px-3 py-1 text-emerald-900">Por defecto</span>
+                    {% endif %}
+                </div>
+            </div>
+            {% else %}
+            <div class="rounded-3xl border border-dashed border-slate-300 bg-slate-50 p-4 text-sm text-slate-600 md:col-span-2 xl:col-span-3">
+                Esta área todavía no tiene categorías.
+            </div>
+            {% endfor %}
+        </div>
+    </article>
+    {% else %}
+    <article class="rounded-[2rem] border border-dashed border-slate-300 bg-slate-50 p-6 text-sm text-slate-600">
+        Todavía no hay áreas creadas para este municipio.
+    </article>
+    {% endfor %}
+</section>
+{% endblock %}

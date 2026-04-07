@@ -66,6 +66,7 @@ async def test_seeded_sender_name_is_persisted_before_whatsapp_turn(tmp_path: Pa
     await seed_customer_name_from_inbound_message(
         session_factory=runtime.session_factory,
         inbound_message=inbound_message,
+        store_id=settings.default_store_id,
     )
 
     async with runtime.session_factory() as session:
@@ -106,6 +107,7 @@ async def test_seeded_sender_name_does_not_override_existing_customer_name(tmp_p
     await seed_customer_name_from_inbound_message(
         session_factory=runtime.session_factory,
         inbound_message=inbound_message,
+        store_id=settings.default_store_id,
     )
 
     async with runtime.session_factory() as session:

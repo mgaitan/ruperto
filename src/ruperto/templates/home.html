@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="es">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Ruperto · Katupyry</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <script>
+            tailwind.config = {
+                theme: {
+                    extend: {
+                        colors: {
+                            ink: "#1b1c1e",
+                            ember: "#ff6b35",
+                            oat: "#f7f2e8",
+                        },
+                    },
+                },
+            };
+        </script>
+    </head>
+    <body
+        class="min-h-screen bg-[radial-gradient(circle_at_top_left,_rgba(255,107,53,0.16),_transparent_28%),linear-gradient(180deg,_#fffaf5_0%,_#f7f2e8_100%)] text-ink"
+    >
+        <main class="mx-auto flex min-h-screen max-w-6xl flex-col gap-10 px-4 py-10 lg:flex-row lg:items-center">
+            <section class="max-w-2xl space-y-6">
+                <span
+                    class="inline-flex rounded-full bg-ember/10 px-3 py-1 text-xs font-semibold uppercase tracking-[0.25em] text-ember"
+                    >Katupyry</span
+                >
+                <div class="space-y-4">
+                    <h1 class="text-4xl font-semibold tracking-tight sm:text-5xl">
+                        Probá Ruperto y armá tu espacio de atención en minutos.
+                    </h1>
+                    <p class="max-w-xl text-base leading-7 text-slate-600 sm:text-lg">
+                        Ruperto es un agente de demostración de Katupyry:
+                        <strong>Inteligencia Artificial para la vida Real</strong>.
+                        Creá tu cuenta, elegí el tipo de organización y entrá directo al panel.
+                    </p>
+                </div>
+                <div class="grid gap-4 sm:grid-cols-2">
+                    {% for option in vertical_options %}
+                    <article class="rounded-[1.75rem] border border-white/70 bg-white/80 p-5 shadow-lg shadow-slate-200/50 backdrop-blur">
+                        <p class="text-sm font-semibold uppercase tracking-[0.22em] text-ember">{{ option.label }}</p>
+                        <p class="mt-3 text-sm leading-6 text-slate-600">{{ option.description }}</p>
+                    </article>
+                    {% endfor %}
+                </div>
+                <div class="flex flex-wrap gap-3 text-sm font-medium">
+                    <a
+                        href="{{ demo_chat_path }}"
+                        class="inline-flex rounded-full border border-slate-300 px-4 py-2 text-slate-700 transition hover:border-slate-400 hover:bg-white/70"
+                        >Ver demo</a
+                    >
+                    <a
+                        href="{{ dashboard_login_path }}"
+                        class="inline-flex rounded-full border border-slate-300 px-4 py-2 text-slate-700 transition hover:border-slate-400 hover:bg-white/70"
+                        >Ingresar al panel</a
+                    >
+                </div>
+            </section>
+
+            <section class="w-full max-w-xl rounded-[2rem] border border-white/70 bg-white/90 p-8 shadow-2xl backdrop-blur">
+                <div class="space-y-3">
+                    <h2 class="text-2xl font-semibold tracking-tight">Crear cuenta</h2>
+                    <p class="text-sm leading-6 text-slate-600">
+                        Te preparamos el acceso, el panel inicial y la configuración base para empezar a probar.
+                    </p>
+                </div>
+
+                {% if error_message %}
+                <div
+                    class="mt-6 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-medium text-rose-900"
+                >
+                    {{ error_message }}
+                </div>
+                {% endif %}
+
+                <form action="/signup" method="post" class="mt-6 space-y-4">
+                    <label class="block space-y-2 text-sm font-medium text-slate-700">
+                        <span>Nombre de tu organización</span>
+                        <input
+                            class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                            type="text"
+                            name="store_name"
+                            value="{{ form_values.store_name }}"
+                            placeholder="Ej. Sabores del Centro o Municipalidad de Ejemplo"
+                            required
+                        />
+                    </label>
+
+                    <div class="grid gap-4 sm:grid-cols-2">
+                        <label class="block space-y-2 text-sm font-medium text-slate-700">
+                            <span>Responsable</span>
+                            <input
+                                class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                                type="text"
+                                name="full_name"
+                                value="{{ form_values.full_name }}"
+                                required
+                            />
+                        </label>
+                        <label class="block space-y-2 text-sm font-medium text-slate-700">
+                            <span>Correo</span>
+                            <input
+                                class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                                type="email"
+                                name="email"
+                                autocomplete="username"
+                                value="{{ form_values.email }}"
+                                required
+                            />
+                        </label>
+                    </div>
+
+                    <label class="block space-y-2 text-sm font-medium text-slate-700">
+                        <span>Contraseña</span>
+                        <input
+                            class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                            type="password"
+                            name="password"
+                            autocomplete="new-password"
+                            minlength="8"
+                            required
+                        />
+                    </label>
+
+                    <fieldset class="space-y-3">
+                        <legend class="text-sm font-medium text-slate-700">¿Qué tipo de organización querés atender?</legend>
+                        <div class="grid gap-3 sm:grid-cols-2">
+                            {% for option in vertical_options %}
+                            <label
+                                class="flex cursor-pointer items-start gap-3 rounded-2xl border border-slate-200 px-4 py-4 transition hover:border-ember/60 hover:bg-ember/5"
+                            >
+                                <input
+                                    class="mt-1 h-4 w-4 accent-ember"
+                                    type="radio"
+                                    name="vertical"
+                                    value="{{ option.value }}"
+                                    {% if form_values.vertical == option.value %}checked{% endif %}
+                                />
+                                <span class="space-y-1">
+                                    <span class="block text-sm font-semibold text-slate-900">{{ option.label }}</span>
+                                    <span class="block text-sm leading-6 text-slate-600">{{ option.description }}</span>
+                                </span>
+                            </label>
+                            {% endfor %}
+                        </div>
+                    </fieldset>
+
+                    <button
+                        class="w-full rounded-full bg-ink px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-800"
+                        type="submit"
+                    >
+                        Crear cuenta y entrar al panel
+                    </button>
+                </form>
+            </section>
+        </main>
+    </body>
+</html>

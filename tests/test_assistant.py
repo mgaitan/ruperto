@@ -81,6 +81,7 @@ def build_store_profile() -> StoreProfileSnapshot:
     """Return a minimal store profile snapshot for deterministic helper tests."""
     return StoreProfileSnapshot(
         id=1,
+        slug="rotiseria-test",
         store_name="Rotisería Test",
         bot_name="Ruperto Test",
         store_location="Córdoba",
@@ -1673,6 +1674,24 @@ async def test_turn_context_hint_mentions_requested_ready_time(tmp_path: Path):
     await runtime.engine.dispose()
 
 
+async def test_turn_context_hint_warns_against_repeating_closed_store_notice(tmp_path: Path):
+    """Turn hints should mention when the assistant already warned about closed hours."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+
+    hint = service._build_turn_context_hint(
+        customer=CustomerSnapshot(id=1, name="Martín", phone_number=None, default_address=None),
+        message_text="¿Y hacen envíos?",
+        current_order=None,
+        latest_assistant_text="Ahora estamos cerrados 😴 Abrimos mañana a las 11:00. ¿Qué querés pedir?",
+    )
+
+    assert hint is not None
+    assert "No repitas ese aviso" in hint
+
+    await runtime.engine.dispose()
+
+
 async def test_turn_policy_blocks_order_mutations_for_menu_only_questions(tmp_path: Path):
     """Pure menu questions should not be allowed to mutate or confirm orders."""
     runtime = create_database_runtime(build_settings(tmp_path))
@@ -3078,6 +3097,58 @@ async def test_strip_redundant_closed_store_notice_keeps_original_without_safe_s
     )
 
     assert stripped == "Recordá que estamos cerrados y abrimos mañana a las 11:00"
+
+    await runtime.engine.dispose()
+
+
+async def test_decorate_reply_with_store_availability_strips_repeated_notice(tmp_path: Path):
+    """Repeated closed-store prefixes should be removed before returning the reply."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    availability = StoreAvailabilitySnapshot(
+        is_open=False,
+        message_text="Ahora estamos cerrados 😴 Abrimos mañana a las 11:00.",
+        next_open_text="mañana a las 11:00",
+    )
+
+    reply = service._decorate_reply_with_store_availability(
+        AssistantReply(
+            reply_text="Ahora estamos cerrados 😴 Abrimos mañana a las 11:00. Dale, tengo una pizza napolitana.",
+            next_step=AssistantNextStep.CHOOSE_ITEMS,
+        ),
+        availability,
+        conversation_id=1,
+        latest_assistant_text="Ahora estamos cerrados 😴 Abrimos mañana a las 11:00. ¿Qué querés pedir?",
+        current_order=None,
+    )
+
+    assert reply.reply_text == "Dale, tengo una pizza napolitana."
+
+    await runtime.engine.dispose()
+
+
+async def test_decorate_reply_with_store_availability_keeps_reply_after_recent_notice(tmp_path: Path):
+    """Closed stores should not prepend the schedule again when it was just said."""
+    runtime = create_database_runtime(build_settings(tmp_path))
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=build_settings(tmp_path))
+    availability = StoreAvailabilitySnapshot(
+        is_open=False,
+        message_text="Ahora estamos cerrados 😴 Abrimos mañana a las 11:00.",
+        next_open_text="mañana a las 11:00",
+    )
+
+    reply = service._decorate_reply_with_store_availability(
+        AssistantReply(
+            reply_text="Seguimos con el pedido.",
+            next_step=AssistantNextStep.CHOOSE_ITEMS,
+        ),
+        availability,
+        conversation_id=1,
+        latest_assistant_text="Ahora estamos cerrados 😴 Abrimos mañana a las 11:00. ¿Qué querés pedir?",
+        current_order=None,
+    )
+
+    assert reply.reply_text == "Seguimos con el pedido."
 
     await runtime.engine.dispose()
 

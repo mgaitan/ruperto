@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from collections import Counter
 from datetime import UTC, datetime, time, timedelta
+from typing import cast
 from zoneinfo import ZoneInfo
 
 from pydantic_ai import ModelMessage
@@ -27,6 +29,7 @@ from ruperto.models import (
     MenuItem,
     MunicipalArea,
     MunicipalCase,
+    MunicipalCaseDraft,
     MunicipalCaseStatus,
     MunicipalCategory,
     Order,
@@ -52,6 +55,7 @@ from ruperto.schemas import (
     MunicipalAreaCreateRequest,
     MunicipalAreaSnapshot,
     MunicipalCaseCreateRequest,
+    MunicipalCaseDraftSnapshot,
     MunicipalCaseSnapshot,
     MunicipalCaseStatusUpdateRequest,
     MunicipalCategoryCreateRequest,
@@ -111,6 +115,7 @@ STORE_MEMBERSHIP_NOT_FOUND_MESSAGE = "Store membership not found."
 STORE_HOURS_SLOT_REQUIRES_BOTH_TIMES_MESSAGE = "Each business-hours slot requires both open and close times."
 STORE_HOURS_SLOT_ORDER_MESSAGE = "Business-hours slots must close after they open."
 STORE_HOURS_SLOT_OVERLAP_MESSAGE = "Business-hours slots cannot overlap on the same day."
+UNSET = object()
 WEEKDAY_LABELS_ES = {
     0: "lunes",
     1: "martes",
@@ -260,6 +265,13 @@ class BusinessRepository:
         assert row is not None
         return StoreProfileSnapshot.model_validate(row)
 
+    async def get_store_profile_by_slug(self, slug: str) -> StoreProfileSnapshot | None:
+        """Return one store profile by public slug when it exists."""
+        row = await self.session.scalar(select(StoreProfile).where(StoreProfile.slug == slug.strip().lower()))
+        if row is None:
+            return None
+        return StoreProfileSnapshot.model_validate(row)
+
     async def create_store_profile(  # noqa: PLR0913
         self,
         *,
@@ -268,12 +280,15 @@ class BusinessRepository:
         store_description: str,
         assistant_personality: str,
         vertical: StoreVertical = StoreVertical.ORDERING,
+        slug: str | None = None,
         store_location: str | None = None,
         locale: str = "es-AR",
         transfer_alias: str | None = None,
     ) -> StoreProfileSnapshot:
         """Create a new store profile for staff membership tests and future tenancy."""
+        resolved_slug = await self._build_unique_store_slug(slug or store_name)
         row = StoreProfile(
+            slug=resolved_slug,
             store_name=store_name.strip(),
             bot_name=bot_name.strip(),
             store_location=self._normalize_optional_text(store_location),
@@ -301,7 +316,6 @@ class BusinessRepository:
         row.store_location = self._normalize_optional_text(payload.store_location)
         row.store_description = payload.store_description.strip()
         row.assistant_personality = payload.assistant_personality.strip()
-        row.vertical = payload.vertical
         row.transfer_alias = self._normalize_optional_text(payload.transfer_alias)
         row.updated_at = utc_now()
         await self.session.flush()
@@ -666,12 +680,14 @@ class BusinessRepository:
         *,
         channel: Channel,
         external_id: str,
+        store_id: int = 1,
         phone_number: str | None = None,
     ) -> CustomerSnapshot:
         """Resolve an existing customer or create one for the given identity."""
         normalized_phone = normalize_phone_number(phone_number)
         identity = await self.session.scalar(
             select(CustomerIdentity).where(
+                CustomerIdentity.store_id == store_id,
                 CustomerIdentity.channel == channel,
                 CustomerIdentity.external_id == external_id,
             )
@@ -686,15 +702,18 @@ class BusinessRepository:
 
         customer = None
         if normalized_phone is not None:
-            customer = await self.session.scalar(select(Customer).where(Customer.phone_number == normalized_phone))
+            customer = await self.session.scalar(
+                select(Customer).where(Customer.store_id == store_id, Customer.phone_number == normalized_phone)
+            )
 
         if customer is None:
-            customer = Customer(phone_number=normalized_phone)
+            customer = Customer(store_id=store_id, phone_number=normalized_phone)
             self.session.add(customer)
             await self.session.flush()
 
         self.session.add(
             CustomerIdentity(
+                store_id=store_id,
                 customer_id=customer.id,
                 channel=channel,
                 external_id=external_id,
@@ -709,11 +728,14 @@ class BusinessRepository:
         assert customer is not None
         return CustomerSnapshot.model_validate(customer)
 
-    async def list_customers(self, *, limit: int = 50) -> list[CustomerSnapshot]:
+    async def list_customers(self, *, limit: int = 50, store_id: int = 1) -> list[CustomerSnapshot]:
         """List customers ordered by recent activity."""
         rows = (
             await self.session.scalars(
-                select(Customer).order_by(Customer.updated_at.desc(), Customer.id.desc()).limit(limit)
+                select(Customer)
+                .where(Customer.store_id == store_id)
+                .order_by(Customer.updated_at.desc(), Customer.id.desc())
+                .limit(limit)
             )
         ).all()
         return [CustomerSnapshot.model_validate(row) for row in rows]
@@ -747,6 +769,7 @@ class BusinessRepository:
         """Return the persisted conversation for one external identity."""
         conversation = await self.session.scalar(
             select(Conversation).where(
+                Conversation.store_id == store_id,
                 Conversation.channel == channel,
                 Conversation.external_id == external_id,
             )
@@ -764,8 +787,6 @@ class BusinessRepository:
 
         if conversation.customer_id != customer_id:
             conversation.customer_id = customer_id
-        if conversation.store_id != store_id:
-            conversation.store_id = store_id
         conversation.updated_at = utc_now()
         await self.session.flush()
         return conversation
@@ -866,6 +887,7 @@ class BusinessRepository:
             area_id=area_id,
             name=payload.name.strip(),
             description=self._normalize_optional_text(payload.description),
+            request_kind=payload.request_kind,
             requires_precise_location=payload.requires_precise_location,
             is_fallback=payload.is_fallback,
             display_order=payload.display_order,
@@ -900,6 +922,93 @@ class BusinessRepository:
             statement = statement.where(MunicipalCategory.is_active.is_(True), MunicipalArea.is_active.is_(True))
         rows = (await self.session.scalars(statement)).all()
         return [self._municipal_category_snapshot(row) for row in rows]
+
+    async def get_municipal_case_draft(
+        self,
+        *,
+        conversation_id: int,
+        create_if_missing: bool = False,
+        store_id: int | None = None,
+        customer_id: int | None = None,
+    ) -> MunicipalCaseDraftSnapshot | None:
+        """Return the intake draft for one municipal conversation."""
+        row = await self.session.scalar(
+            select(MunicipalCaseDraft).where(MunicipalCaseDraft.conversation_id == conversation_id)
+        )
+        if row is None and create_if_missing:
+            assert store_id is not None
+            assert customer_id is not None
+            row = MunicipalCaseDraft(
+                conversation_id=conversation_id,
+                store_id=store_id,
+                customer_id=customer_id,
+            )
+            self.session.add(row)
+            await self.session.flush()
+        if row is None:
+            return None
+        return self._municipal_case_draft_snapshot(row)
+
+    async def update_municipal_case_draft(  # noqa: PLR0913
+        self,
+        *,
+        conversation_id: int,
+        store_id: int,
+        customer_id: int,
+        area_id: object = UNSET,
+        category_id: object = UNSET,
+        request_summary: object = UNSET,
+        location_text: object = UNSET,
+        location_reference: object = UNSET,
+        latitude: object = UNSET,
+        longitude: object = UNSET,
+        awaiting_confirmation: bool | None = None,
+    ) -> MunicipalCaseDraftSnapshot:
+        """Persist mutable municipal intake state for one conversation."""
+        row = await self.session.scalar(
+            select(MunicipalCaseDraft).where(MunicipalCaseDraft.conversation_id == conversation_id)
+        )
+        if row is None:
+            row = MunicipalCaseDraft(
+                conversation_id=conversation_id,
+                store_id=store_id,
+                customer_id=customer_id,
+            )
+            self.session.add(row)
+            await self.session.flush()
+
+        row.store_id = store_id
+        row.customer_id = customer_id
+        if area_id is not UNSET:
+            row.area_id = cast("int | None", area_id)
+        if category_id is not UNSET:
+            row.category_id = cast("int | None", category_id)
+        if request_summary is not UNSET:
+            row.request_summary = self._normalize_optional_text(cast("str | None", request_summary))
+        if location_text is not UNSET:
+            row.location_text = self._normalize_optional_text(cast("str | None", location_text))
+        if location_reference is not UNSET:
+            row.location_reference = self._normalize_optional_text(cast("str | None", location_reference))
+        if latitude is not UNSET:
+            row.latitude = cast("float | None", latitude)
+        if longitude is not UNSET:
+            row.longitude = cast("float | None", longitude)
+        if awaiting_confirmation is not None:
+            row.awaiting_confirmation = awaiting_confirmation
+        row.updated_at = utc_now()
+        await self.session.flush()
+        return self._municipal_case_draft_snapshot(row)
+
+    async def clear_municipal_case_draft(self, *, conversation_id: int) -> bool:
+        """Delete the municipal intake draft for one conversation when it exists."""
+        row = await self.session.scalar(
+            select(MunicipalCaseDraft).where(MunicipalCaseDraft.conversation_id == conversation_id)
+        )
+        if row is None:
+            return False
+        await self.session.delete(row)
+        await self.session.flush()
+        return True
 
     async def create_municipal_case(
         self,
@@ -949,6 +1058,37 @@ class BusinessRepository:
         self.session.add(row)
         await self.session.flush()
         return self._municipal_case_snapshot(row)
+
+    async def create_municipal_case_from_draft(self, *, conversation_id: int) -> MunicipalCaseSnapshot:
+        """Promote one municipal intake draft into a persisted case."""
+        draft = await self.session.scalar(
+            select(MunicipalCaseDraft).where(MunicipalCaseDraft.conversation_id == conversation_id)
+        )
+        if draft is None:
+            raise MunicipalCaseNotFoundError
+        customer = await self.session.get(Customer, draft.customer_id)
+        assert draft.area_id is not None
+        assert draft.request_summary is not None
+        case = await self.create_municipal_case(
+            store_id=draft.store_id,
+            payload=MunicipalCaseCreateRequest(
+                area_id=draft.area_id,
+                category_id=draft.category_id,
+                customer_id=draft.customer_id,
+                conversation_id=draft.conversation_id,
+                title=self._build_municipal_case_title(draft.request_summary),
+                description=draft.request_summary,
+                reporter_name=customer.name if customer is not None else None,
+                reporter_phone_number=customer.phone_number if customer is not None else None,
+                location_text=draft.location_text,
+                location_reference=draft.location_reference,
+                latitude=draft.latitude,
+                longitude=draft.longitude,
+            ),
+        )
+        await self.session.delete(draft)
+        await self.session.flush()
+        return case
 
     async def get_municipal_case(self, case_id: int) -> MunicipalCaseSnapshot:
         """Return one municipal case snapshot by identifier."""
@@ -1466,6 +1606,7 @@ class BusinessRepository:
             area_id=category.area_id,
             name=category.name,
             description=category.description,
+            request_kind=category.request_kind,
             requires_precise_location=category.requires_precise_location,
             is_fallback=category.is_fallback,
             display_order=category.display_order,
@@ -1493,6 +1634,25 @@ class BusinessRepository:
             status=case.status,
             created_at=self._as_utc_datetime(case.created_at) or case.created_at,
             updated_at=self._as_utc_datetime(case.updated_at) or case.updated_at,
+        )
+
+    def _municipal_case_draft_snapshot(self, draft: MunicipalCaseDraft) -> MunicipalCaseDraftSnapshot:
+        """Build a serializable municipal-case draft snapshot."""
+        return MunicipalCaseDraftSnapshot(
+            id=draft.id,
+            conversation_id=draft.conversation_id,
+            store_id=draft.store_id,
+            customer_id=draft.customer_id,
+            area_id=draft.area_id,
+            category_id=draft.category_id,
+            request_summary=draft.request_summary,
+            location_text=draft.location_text,
+            location_reference=draft.location_reference,
+            latitude=draft.latitude,
+            longitude=draft.longitude,
+            awaiting_confirmation=draft.awaiting_confirmation,
+            created_at=self._as_utc_datetime(draft.created_at) or draft.created_at,
+            updated_at=self._as_utc_datetime(draft.updated_at) or draft.updated_at,
         )
 
     def _store_business_hours_snapshot(self, row: StoreBusinessHours) -> StoreBusinessHoursSnapshot:
@@ -1921,3 +2081,23 @@ class BusinessRepository:
             return None
         cleaned = value.strip()
         return cleaned or None
+
+    def _build_municipal_case_title(self, request_summary: str) -> str:
+        """Build a short municipal-case title from the stored summary."""
+        return request_summary.strip()[:160]
+
+    async def _build_unique_store_slug(self, source_text: str) -> str:
+        """Generate a unique public slug for a tenant."""
+        base_slug = self._slugify_text(source_text)
+        candidate = base_slug
+        suffix = 2
+        while await self.session.scalar(select(StoreProfile.id).where(StoreProfile.slug == candidate)) is not None:
+            candidate = f"{base_slug}-{suffix}"
+            suffix += 1
+        return candidate
+
+    def _slugify_text(self, value: str) -> str:
+        """Convert arbitrary text into a stable lowercase slug."""
+        lowered = unicodedata.normalize("NFKD", value.strip()).encode("ascii", "ignore").decode("ascii").lower()
+        slug = re.sub(r"[^a-z0-9]+", "-", lowered).strip("-")
+        return slug or "tenant"

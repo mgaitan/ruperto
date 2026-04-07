@@ -69,6 +69,8 @@ active by default today.
 If you want to bootstrap a different tenant domain from the start, you can
 also set {term}`RUPERTO_STORE_VERTICAL` to `municipal`. Otherwise the default
 remains `ordering`.
+You can also set {term}`RUPERTO_STORE_SLUG` if you want a predictable public
+slug for tenant-specific demo routes.
 
 ## 3. Run the API locally
 
@@ -161,11 +163,11 @@ different numbers.
 If you want a simpler browser harness that ships inside the main FastAPI app,
 open:
 
-- `http://127.0.0.1:8000/demo/chat`
+- `http://127.0.0.1:8000/demo/chat/<tenant-slug>`
 
-This demo page sends requests to `/api/dev/messages` and lets you switch
-between multiple phone numbers, which makes it handy for simulating known
-customers with existing conversation memory.
+This demo page sends requests to `/api/dev/messages/<tenant-slug>` and lets you
+switch between multiple phone numbers, which makes it handy for simulating
+known customers with existing conversation memory inside that tenant.
 
 Staff can also move an order through operational statuses from the API, for
 example to mark a pickup order as almost ready:
@@ -199,12 +201,15 @@ signed session cookie. The current version is intentionally small: it shows
 an operational home page with recent orders and metrics, a dedicated customers
 screen with search, and separate settings pages for the menu, store profile,
 agent behavior, flexible weekly opening hours, and user roles.
-The store profile page now also exposes the tenant vertical selector, so the
-same installation can switch the active tenant between the ordering flow and
-the municipal scaffold without changing the shared channel or auth layers.
+The store profile page shows the tenant vertical and public slug as read-only
+identity fields, so the same installation can host different tenant types
+without converting one tenant into another from the dashboard.
 If you bootstrap a municipal tenant, `init-db` now also seeds a first service
-catalog with municipal areas and categories so the PoC can evolve from a
-realistic dataset instead of an empty placeholder.
+catalog with municipal areas and categories, and the shared chat endpoint
+guides neighbors through a first complaint/request intake before creating the
+municipal case. That intake only accepts a usable location before submission,
+asks for a respectful rephrase if the message becomes insulting, and keeps the
+final confirmation brief by addressing the citizen by first name.
 
 If one dashboard user belongs to more than one store, the header lets staff
 switch the active store. That switch already scopes the editable store profile

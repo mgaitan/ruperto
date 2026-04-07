@@ -92,12 +92,20 @@ class MunicipalCaseStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class MunicipalRequestKind(StrEnum):
+    """Semantic kind of one municipal category."""
+
+    COMPLAINT = "complaint"
+    REQUEST = "request"
+
+
 class StoreProfile(Base):
     """Persist the configurable public profile of the business."""
 
     __tablename__ = "store_profile"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    slug: Mapped[str] = mapped_column(String(length=120), unique=True)
     store_name: Mapped[str] = mapped_column(String(length=120))
     bot_name: Mapped[str] = mapped_column(String(length=120))
     store_location: Mapped[str | None] = mapped_column(String(length=255), nullable=True)
@@ -162,10 +170,12 @@ class Customer(Base):
     """A customer known by the ordering system."""
 
     __tablename__ = "customer"
+    __table_args__ = (UniqueConstraint("store_id", "phone_number", name="uq_customer_store_phone"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("store_profile.id", ondelete="CASCADE"), default=1)
     name: Mapped[str | None] = mapped_column(String(length=120), nullable=True)
-    phone_number: Mapped[str | None] = mapped_column(String(length=32), nullable=True, unique=True)
+    phone_number: Mapped[str | None] = mapped_column(String(length=32), nullable=True)
     default_address: Mapped[str | None] = mapped_column(String(length=255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(default=utc_now, onupdate=utc_now)
@@ -175,9 +185,10 @@ class CustomerIdentity(Base):
     """External identities that point to a known customer."""
 
     __tablename__ = "customer_identity"
-    __table_args__ = (UniqueConstraint("channel", "external_id", name="uq_customer_identity"),)
+    __table_args__ = (UniqueConstraint("store_id", "channel", "external_id", name="uq_customer_identity_store"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("store_profile.id", ondelete="CASCADE"), default=1)
     customer_id: Mapped[int] = mapped_column(ForeignKey("customer.id", ondelete="CASCADE"))
     channel: Mapped[Channel] = mapped_column(SqlEnum(Channel, native_enum=False, length=32))
     external_id: Mapped[str] = mapped_column(String(length=120))
@@ -205,7 +216,7 @@ class Conversation(Base):
     """A persisted conversation stream for one external identity."""
 
     __tablename__ = "conversation"
-    __table_args__ = (UniqueConstraint("channel", "external_id", name="uq_conversation_identity"),)
+    __table_args__ = (UniqueConstraint("store_id", "channel", "external_id", name="uq_conversation_identity_store"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     channel: Mapped[Channel] = mapped_column(SqlEnum(Channel, native_enum=False, length=32))
@@ -295,6 +306,10 @@ class MunicipalCategory(Base):
     area_id: Mapped[int] = mapped_column(ForeignKey("municipal_area.id", ondelete="CASCADE"))
     name: Mapped[str] = mapped_column(String(length=120))
     description: Mapped[str | None] = mapped_column(String(length=300), nullable=True)
+    request_kind: Mapped[MunicipalRequestKind] = mapped_column(
+        SqlEnum(MunicipalRequestKind, native_enum=False, length=32, values_callable=enum_values),
+        default=MunicipalRequestKind.COMPLAINT,
+    )
     requires_precise_location: Mapped[bool] = mapped_column(default=False)
     is_fallback: Mapped[bool] = mapped_column(default=False)
     display_order: Mapped[int] = mapped_column(default=0)
@@ -339,6 +354,34 @@ class MunicipalCase(Base):
         SqlEnum(MunicipalCaseStatus, native_enum=False, length=32, values_callable=enum_values),
         default=MunicipalCaseStatus.NEW,
     )
+    created_at: Mapped[datetime] = mapped_column(default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(default=utc_now, onupdate=utc_now)
+
+
+class MunicipalCaseDraft(Base):
+    """Mutable intake draft for one municipal conversation before submission."""
+
+    __tablename__ = "municipal_case_draft"
+    __table_args__ = (UniqueConstraint("conversation_id", name="uq_municipal_case_draft_conversation"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    conversation_id: Mapped[int] = mapped_column(ForeignKey("conversation.id", ondelete="CASCADE"))
+    store_id: Mapped[int] = mapped_column(ForeignKey("store_profile.id", ondelete="CASCADE"))
+    customer_id: Mapped[int] = mapped_column(ForeignKey("customer.id", ondelete="CASCADE"))
+    area_id: Mapped[int | None] = mapped_column(
+        ForeignKey("municipal_area.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    category_id: Mapped[int | None] = mapped_column(
+        ForeignKey("municipal_category.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    request_summary: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    location_text: Mapped[str | None] = mapped_column(String(length=255), nullable=True)
+    location_reference: Mapped[str | None] = mapped_column(String(length=255), nullable=True)
+    latitude: Mapped[float | None] = mapped_column(Float(), nullable=True)
+    longitude: Mapped[float | None] = mapped_column(Float(), nullable=True)
+    awaiting_confirmation: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(default=utc_now, onupdate=utc_now)
 

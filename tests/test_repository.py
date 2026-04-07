@@ -21,6 +21,7 @@ from ruperto.models import (
     DeliveryType,
     MenuItem,
     MunicipalCaseStatus,
+    MunicipalRequestKind,
     Order,
     OrderStatus,
     OutboundNotification,
@@ -153,7 +154,6 @@ async def test_store_profile_can_be_updated_with_empty_optional_fields(tmp_path:
             store_location=None,
             store_description="Updated from the dashboard.",
             assistant_personality="Steady and direct.",
-            vertical=StoreVertical.MUNICIPAL,
             transfer_alias=None,
         )
     )
@@ -161,7 +161,7 @@ async def test_store_profile_can_be_updated_with_empty_optional_fields(tmp_path:
     assert updated.store_name == "Panel Rotisería"
     assert updated.store_location is None
     assert updated.transfer_alias is None
-    assert updated.vertical == StoreVertical.MUNICIPAL
+    assert updated.vertical == StoreVertical.ORDERING
 
     await close_repository(repository, runtime)
 
@@ -244,7 +244,7 @@ async def test_reset_current_order_rebuilds_a_draft_from_scratch(tmp_path: Path)
 
 
 async def test_get_or_create_conversation_updates_store_scope(tmp_path: Path):
-    """Existing conversations can be reassigned to another store when the active local changes."""
+    """Conversations are isolated per store even for the same external identity."""
     repository, runtime = await build_repository(tmp_path)
     customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="tenant-switch-user")
     second_store = await repository.create_store_profile(
@@ -267,7 +267,8 @@ async def test_get_or_create_conversation_updates_store_scope(tmp_path: Path):
         store_id=second_store.id,
     )
 
-    assert conversation.id == reassigned.id
+    assert conversation.id != reassigned.id
+    assert conversation.store_id == 1
     assert reassigned.store_id == second_store.id
 
     await close_repository(repository, runtime)
@@ -820,8 +821,8 @@ async def test_init_database_backfills_schedule_and_transfer_columns_for_legacy_
     await runtime.engine.dispose()
 
 
-async def test_init_database_updates_existing_store_vertical_from_settings(tmp_path: Path):
-    """Bootstrap updates the default store vertical when settings request a different tenant type."""
+async def test_init_database_preserves_existing_store_vertical_from_settings(tmp_path: Path):
+    """Bootstrap keeps the existing tenant vertical even if settings later request another one."""
     database_path = tmp_path / "vertical-sync.db"
     base_settings = Settings(
         environment="test",
@@ -840,7 +841,137 @@ async def test_init_database_updates_existing_store_vertical_from_settings(tmp_p
         repository = BusinessRepository(session)
         store = await repository.get_store_profile()
 
-    assert store.vertical == StoreVertical.MUNICIPAL
+    assert store.vertical == StoreVertical.ORDERING
+    await runtime.engine.dispose()
+
+
+async def test_create_store_profile_generates_unique_ascii_slugs(tmp_path: Path):
+    """New tenants receive unique public slugs derived from their display name."""
+    repository, runtime = await build_repository(tmp_path)
+
+    first_store = await repository.create_store_profile(
+        store_name="Municipio Ñandú",
+        bot_name="Ruperto Ñandú",
+        store_description="Primer tenant con slug derivado.",
+        assistant_personality="Calm and direct.",
+    )
+    second_store = await repository.create_store_profile(
+        store_name="Municipio Ñandú",
+        bot_name="Ruperto Ñandú 2",
+        store_description="Segundo tenant con slug derivado.",
+        assistant_personality="Calm and direct.",
+    )
+
+    assert first_store.slug == "municipio-nandu"
+    assert second_store.slug == "municipio-nandu-2"
+
+    await close_repository(repository, runtime)
+
+
+async def test_get_store_profile_by_slug_returns_none_for_unknown_slug(tmp_path: Path):
+    """Slug lookups should return None when the tenant does not exist."""
+    repository, runtime = await build_repository(tmp_path)
+
+    missing_store = await repository.get_store_profile_by_slug("slug-inexistente")
+
+    assert missing_store is None
+
+    await close_repository(repository, runtime)
+
+
+async def test_init_database_backfills_missing_slug_with_unique_suffix(tmp_path: Path):
+    """Bootstrap should derive a unique slug when the preferred one is already taken."""
+    database_path = tmp_path / "slug-bootstrap.db"
+    sync_engine = create_engine(f"sqlite:///{database_path}")
+    with sync_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE store_profile (
+                    id INTEGER PRIMARY KEY,
+                    store_name VARCHAR(120) NOT NULL,
+                    bot_name VARCHAR(120) NOT NULL,
+                    store_location VARCHAR(255),
+                    store_description VARCHAR(500) NOT NULL,
+                    assistant_personality VARCHAR(255) NOT NULL,
+                    vertical VARCHAR(32) NOT NULL DEFAULT 'ordering',
+                    locale VARCHAR(32) NOT NULL DEFAULT 'es-AR',
+                    currency_code VARCHAR(8) NOT NULL DEFAULT 'ARS',
+                    transfer_alias VARCHAR(120),
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO store_profile (
+                    id,
+                    store_name,
+                    bot_name,
+                    store_location,
+                    store_description,
+                    assistant_personality,
+                    vertical,
+                    locale,
+                    currency_code,
+                    transfer_alias,
+                    created_at,
+                    updated_at
+                ) VALUES (
+                    1,
+                    'Demo',
+                    'Ruperto Demo',
+                    'Córdoba',
+                    'Tenant legado para probar slug.',
+                    'Calm and direct.',
+                    'ordering',
+                    'es-AR',
+                    'ARS',
+                    NULL,
+                    CURRENT_TIMESTAMP,
+                    CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+    settings = Settings(
+        environment="test",
+        database_url=f"sqlite+aiosqlite:///{database_path}",
+        store_name="Demo",
+        bot_name="Ruperto Demo",
+    )
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+
+    with sqlite3.connect(database_path) as sqlite_connection:
+        sqlite_connection.execute(
+            "UPDATE store_profile SET slug = NULL WHERE id = ?",
+            (settings.default_store_id,),
+        )
+        sqlite_connection.commit()
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        await repository.create_store_profile(
+            store_name="Tenant con slug ocupado",
+            bot_name="Ruperto Extra",
+            store_description="Ocupa el slug preferido.",
+            assistant_personality="Calm and direct.",
+            slug="demo",
+        )
+        await session.commit()
+
+    await init_database(settings=settings, runtime=runtime)
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        store = await repository.get_store_profile(store_id=settings.default_store_id)
+
+    assert store.slug == "demo-2"
+
     await runtime.engine.dispose()
 
 
@@ -1028,6 +1159,151 @@ async def test_legacy_conversation_table_gains_store_id_column(tmp_path: Path):
 
     assert "store_id" in columns
     assert migrated_row == (1,)
+
+
+async def test_legacy_municipal_categories_gain_request_kind_column(tmp_path: Path):
+    """Legacy municipal catalogs gain request-kind semantics during schema checks."""
+    database_path = tmp_path / "legacy-municipal-category.db"
+    sync_engine = create_engine(f"sqlite:///{database_path}")
+    with sync_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE municipal_area (
+                    id INTEGER PRIMARY KEY,
+                    name VARCHAR(120) NOT NULL
+                )
+                """
+            )
+        )
+        connection.execute(text("INSERT INTO municipal_area (id, name) VALUES (1, 'Solicitud de agua')"))
+        connection.execute(
+            text(
+                """
+                CREATE TABLE municipal_category (
+                    id INTEGER PRIMARY KEY,
+                    area_id INTEGER NOT NULL,
+                    name VARCHAR(120) NOT NULL
+                )
+                """
+            )
+        )
+        connection.execute(text("INSERT INTO municipal_category (id, area_id, name) VALUES (1, 1, 'Falta de agua')"))
+        _ensure_schema_columns(connection)
+    sync_engine.dispose()
+
+    with sqlite3.connect(database_path) as sqlite_connection:
+        columns = {row[1] for row in sqlite_connection.execute("PRAGMA table_info(municipal_category)")}
+        migrated_row = sqlite_connection.execute(
+            """
+            SELECT request_kind
+            FROM municipal_category
+            WHERE id = 1
+            """
+        ).fetchone()
+
+    assert "request_kind" in columns
+    assert migrated_row == ("request",)
+
+
+async def test_legacy_customer_tables_gain_store_id_columns(tmp_path: Path):
+    """Legacy customer tables are backfilled with the default store id during bootstrap."""
+    database_path = tmp_path / "legacy-customer-tenancy.db"
+    sync_engine = create_engine(f"sqlite:///{database_path}")
+    with sync_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE store_profile (
+                    id INTEGER PRIMARY KEY,
+                    store_name VARCHAR(120),
+                    bot_name VARCHAR(120),
+                    store_location VARCHAR(255),
+                    store_description VARCHAR(500),
+                    assistant_personality VARCHAR(255),
+                    locale VARCHAR(32),
+                    currency_code VARCHAR(8),
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO store_profile (
+                    id, store_name, bot_name, store_location, store_description,
+                    assistant_personality, locale, currency_code, created_at, updated_at
+                ) VALUES (
+                    1, 'Legacy Rotisería', 'Legacy Bot', NULL, 'Perfil viejo',
+                    'Amable', 'es-AR', 'ARS', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE customer (
+                    id INTEGER PRIMARY KEY,
+                    name VARCHAR(120),
+                    phone_number VARCHAR(32),
+                    default_address VARCHAR(255),
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO customer (
+                    id, name, phone_number, default_address, created_at, updated_at
+                ) VALUES (
+                    1, 'Cliente viejo', '3515550000', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE customer_identity (
+                    id INTEGER PRIMARY KEY,
+                    customer_id INTEGER,
+                    channel VARCHAR(32),
+                    external_id VARCHAR(120),
+                    created_at DATETIME
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO customer_identity (
+                    id, customer_id, channel, external_id, created_at
+                ) VALUES (
+                    1, 1, 'dev', 'legacy-user', CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        _ensure_schema_columns(connection)
+    sync_engine.dispose()
+
+    with sqlite3.connect(database_path) as sqlite_connection:
+        customer_columns = {row[1] for row in sqlite_connection.execute("PRAGMA table_info(customer)")}
+        identity_columns = {row[1] for row in sqlite_connection.execute("PRAGMA table_info(customer_identity)")}
+        customer_row = sqlite_connection.execute("SELECT store_id FROM customer WHERE id = 1").fetchone()
+        identity_row = sqlite_connection.execute("SELECT store_id FROM customer_identity WHERE id = 1").fetchone()
+
+    assert "store_id" in customer_columns
+    assert "store_id" in identity_columns
+    assert customer_row == (1,)
+    assert identity_row == (1,)
 
 
 async def test_schedule_validation_helpers_cover_past_missing_prep_and_relative_day_text(tmp_path: Path):
@@ -1758,6 +2034,7 @@ async def test_municipal_bootstrap_seeds_demo_areas_and_categories(tmp_path: Pat
     }
     assert any(category.is_fallback for category in categories)
     assert any(category.requires_precise_location for category in categories)
+    assert any(category.request_kind == MunicipalRequestKind.REQUEST for category in categories)
 
     await close_repository(repository, runtime)
 
@@ -2125,6 +2402,51 @@ async def test_get_customer_and_list_customers_roundtrip(tmp_path: Path):
 
     assert loaded.id == first.id
     assert {customer.id for customer in customers} >= {first.id, second.id}
+
+    await close_repository(repository, runtime)
+
+
+async def test_customers_and_conversations_are_scoped_per_store(tmp_path: Path):
+    """The same external identity can exist in different stores without leaking contacts."""
+    repository, runtime = await build_repository(tmp_path)
+    second_store = await repository.create_store_profile(
+        store_name="Sucursal Norte",
+        bot_name="Ruperto Norte",
+        store_description="Segundo local para pruebas.",
+        assistant_personality="Amable y claro.",
+    )
+    first_customer = await repository.get_or_create_customer(
+        channel=Channel.WHATSAPP,
+        external_id="3515550000",
+        store_id=1,
+        phone_number="3515550000",
+    )
+    second_customer = await repository.get_or_create_customer(
+        channel=Channel.WHATSAPP,
+        external_id="3515550000",
+        store_id=second_store.id,
+        phone_number="3515550000",
+    )
+    first_conversation = await repository.get_or_create_conversation(
+        channel=Channel.WHATSAPP,
+        external_id="3515550000",
+        customer_id=first_customer.id,
+        store_id=1,
+    )
+    second_conversation = await repository.get_or_create_conversation(
+        channel=Channel.WHATSAPP,
+        external_id="3515550000",
+        customer_id=second_customer.id,
+        store_id=second_store.id,
+    )
+
+    first_customers = await repository.list_customers(limit=10, store_id=1)
+    second_customers = await repository.list_customers(limit=10, store_id=second_store.id)
+
+    assert first_customer.id != second_customer.id
+    assert first_conversation.id != second_conversation.id
+    assert {customer.id for customer in first_customers} == {first_customer.id}
+    assert {customer.id for customer in second_customers} == {second_customer.id}
 
     await close_repository(repository, runtime)
 

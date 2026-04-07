@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from dataclasses import dataclass
 
 from sqlalchemy import func, inspect, select, text
@@ -62,8 +64,12 @@ async def init_database(*, settings: Settings, runtime: DatabaseRuntime | None =
         repository = BusinessRepository(session)
         profile = await _ensure_default_store_profile(session=session, settings=settings)
         await _seed_demo_menu_if_needed(session=session)
-        await _seed_default_business_hours_if_needed(session=session, settings=settings)
-        await _seed_municipal_catalog_if_needed(session=session, repository=repository, store=profile)
+        await seed_store_bootstrap_data(
+            session=session,
+            repository=repository,
+            store_id=profile.id,
+            vertical=profile.vertical,
+        )
         await _seed_dashboard_admin_if_needed(repository=repository, settings=settings)
         await _seed_default_channel_connection_if_needed(repository=repository, settings=settings)
         await session.commit()
@@ -74,9 +80,11 @@ async def _ensure_default_store_profile(*, session: AsyncSession, settings: Sett
     """Create or refresh the default tenant profile for local development."""
     result = await session.execute(select(StoreProfile).where(StoreProfile.id == settings.default_store_id))
     profile = result.scalar_one_or_none()
+    requested_slug = _slugify_tenant_name(settings.store_slug or settings.store_name)
     if profile is None:
         profile = StoreProfile(
             id=settings.default_store_id,
+            slug=requested_slug,
             store_name=settings.store_name,
             bot_name=settings.bot_name,
             store_location=settings.store_location,
@@ -92,8 +100,12 @@ async def _ensure_default_store_profile(*, session: AsyncSession, settings: Sett
 
     if profile.transfer_alias is None and settings.store_transfer_alias is not None:
         profile.transfer_alias = settings.store_transfer_alias
-    if profile.vertical == StoreVertical.ORDERING and settings.store_vertical != StoreVertical.ORDERING:
-        profile.vertical = settings.store_vertical
+    if not profile.slug:
+        profile.slug = await _build_unique_bootstrap_slug(
+            session=session,
+            preferred_slug=requested_slug,
+            store_id=profile.id,
+        )
     return profile
 
 
@@ -119,16 +131,35 @@ async def _seed_demo_menu_if_needed(*, session: AsyncSession) -> None:
     )
 
 
-async def _seed_default_business_hours_if_needed(*, session: AsyncSession, settings: Settings) -> None:
-    """Insert the default weekly schedule when the table is still empty."""
-    hours_count = await session.scalar(select(func.count(StoreBusinessHours.id)))
+async def seed_store_bootstrap_data(
+    *,
+    session: AsyncSession,
+    repository: BusinessRepository,
+    store_id: int,
+    vertical: StoreVertical,
+) -> None:
+    """Insert the store-scoped defaults required by a freshly created tenant."""
+    await _seed_store_business_hours_if_needed(session=session, store_id=store_id)
+    await _seed_municipal_catalog_if_needed(
+        session=session,
+        repository=repository,
+        store_id=store_id,
+        vertical=vertical,
+    )
+
+
+async def _seed_store_business_hours_if_needed(*, session: AsyncSession, store_id: int) -> None:
+    """Insert the default weekly schedule when one tenant still has no rows."""
+    hours_count = await session.scalar(
+        select(func.count(StoreBusinessHours.id)).where(StoreBusinessHours.store_id == store_id)
+    )
     if hours_count != 0:
         return
 
     session.add_all(
         [
             StoreBusinessHours(
-                store_id=settings.default_store_id,
+                store_id=store_id,
                 weekday=row.weekday,
                 slot_index=row.slot_index,
                 opens_at=row.opens_at,
@@ -144,20 +175,21 @@ async def _seed_municipal_catalog_if_needed(
     *,
     session: AsyncSession,
     repository: BusinessRepository,
-    store: StoreProfile,
+    store_id: int,
+    vertical: StoreVertical,
 ) -> None:
     """Insert a demo municipal catalog for municipal tenants with an empty catalog."""
-    if store.vertical != StoreVertical.MUNICIPAL:
+    if vertical != StoreVertical.MUNICIPAL:
         return
 
-    areas_count = await session.scalar(select(func.count(MunicipalArea.id)).where(MunicipalArea.store_id == store.id))
+    areas_count = await session.scalar(select(func.count(MunicipalArea.id)).where(MunicipalArea.store_id == store_id))
     if areas_count != 0:
         return
 
     area_rows_by_key: dict[str, MunicipalArea] = {}
     for area_seed in DEMO_MUNICIPAL_AREAS:
         area_row = MunicipalArea(
-            store_id=store.id,
+            store_id=store_id,
             name=area_seed.name,
             description=area_seed.description,
             display_order=area_seed.display_order,
@@ -173,6 +205,7 @@ async def _seed_municipal_catalog_if_needed(
             payload=MunicipalCategoryCreateRequest(
                 name=category_seed.name,
                 description=category_seed.description,
+                request_kind=category_seed.request_kind,
                 requires_precise_location=category_seed.requires_precise_location,
                 is_fallback=category_seed.is_fallback,
                 display_order=category_seed.display_order,
@@ -237,10 +270,12 @@ def _ensure_schema_columns(connection: Connection) -> None:
     inspector = inspect(connection)
     _ensure_store_profile_columns(connection, inspector=inspector)
     _ensure_customer_order_columns(connection, inspector=inspector)
+    _ensure_customer_tenancy_columns(connection, inspector=inspector)
     _ensure_outbound_notification_table(connection, inspector=inspector)
     _ensure_conversation_columns(connection, inspector=inspector)
     _ensure_store_channel_connection_table(connection, inspector=inspector)
     _ensure_store_business_hours_shape(connection, inspector=inspector)
+    _ensure_municipal_category_columns(connection, inspector=inspector)
 
 
 def _ensure_store_profile_columns(connection: Connection, *, inspector: Inspector) -> None:
@@ -253,6 +288,9 @@ def _ensure_store_profile_columns(connection: Connection, *, inspector: Inspecto
             connection.execute(
                 text("ALTER TABLE store_profile ADD COLUMN vertical VARCHAR(32) NOT NULL DEFAULT 'ordering'")
             )
+        if "slug" not in store_profile_columns:
+            connection.execute(text("ALTER TABLE store_profile ADD COLUMN slug VARCHAR(120)"))
+            connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_store_profile_slug ON store_profile (slug)"))
 
 
 def _ensure_customer_order_columns(connection: Connection, *, inspector: Inspector) -> None:
@@ -267,6 +305,27 @@ def _ensure_customer_order_columns(connection: Connection, *, inspector: Inspect
             connection.execute(text("ALTER TABLE customer_order ADD COLUMN requested_ready_at DATETIME"))
         if "preparation_starts_at" not in order_columns:
             connection.execute(text("ALTER TABLE customer_order ADD COLUMN preparation_starts_at DATETIME"))
+
+
+def _ensure_customer_tenancy_columns(connection: Connection, *, inspector: Inspector) -> None:
+    """Backfill store scoping columns for customers and identities."""
+    if "customer" in inspector.get_table_names():
+        customer_columns = {column["name"] for column in inspector.get_columns("customer")}
+        if "store_id" not in customer_columns:
+            connection.execute(text("ALTER TABLE customer ADD COLUMN store_id INTEGER REFERENCES store_profile (id)"))
+            connection.execute(text("UPDATE customer SET store_id = 1 WHERE store_id IS NULL"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_customer_store_id ON customer (store_id)"))
+
+    if "customer_identity" in inspector.get_table_names():
+        identity_columns = {column["name"] for column in inspector.get_columns("customer_identity")}
+        if "store_id" not in identity_columns:
+            connection.execute(
+                text("ALTER TABLE customer_identity ADD COLUMN store_id INTEGER REFERENCES store_profile (id)")
+            )
+            connection.execute(text("UPDATE customer_identity SET store_id = 1 WHERE store_id IS NULL"))
+            connection.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_customer_identity_store_id ON customer_identity (store_id)")
+            )
 
 
 def _ensure_outbound_notification_table(connection: Connection, *, inspector: Inspector) -> None:
@@ -338,6 +397,39 @@ def _ensure_store_business_hours_shape(connection: Connection, *, inspector: Ins
             _migrate_store_business_hours_table(connection)
 
 
+def _ensure_municipal_category_columns(connection: Connection, *, inspector: Inspector) -> None:
+    """Additive migration for municipal category semantics."""
+    if "municipal_category" in inspector.get_table_names():
+        municipal_category_columns = {column["name"] for column in inspector.get_columns("municipal_category")}
+        if "request_kind" not in municipal_category_columns:
+            connection.execute(
+                text("ALTER TABLE municipal_category ADD COLUMN request_kind VARCHAR(32) NOT NULL DEFAULT 'complaint'")
+            )
+        connection.execute(
+            text(
+                """
+                UPDATE municipal_category
+                SET request_kind = 'request'
+                WHERE name IN ('Solicitud de lomo de burro', 'Falta de agua', 'Poda o ramas')
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                UPDATE municipal_category
+                SET request_kind = 'request'
+                WHERE name = 'Otro'
+                  AND area_id IN (
+                      SELECT id
+                      FROM municipal_area
+                      WHERE name IN ('Solicitud de agua', 'Higiene urbana')
+                  )
+                """
+            )
+        )
+
+
 def _migrate_store_business_hours_table(connection: Connection) -> None:
     """Migrate business hours to support multiple daily slots."""
     connection.execute(text("ALTER TABLE store_business_hours RENAME TO store_business_hours_legacy"))
@@ -389,3 +481,27 @@ def _migrate_store_business_hours_table(connection: Connection) -> None:
         )
     )
     connection.execute(text("DROP TABLE store_business_hours_legacy"))
+
+
+async def _build_unique_bootstrap_slug(
+    *,
+    session: AsyncSession,
+    preferred_slug: str,
+    store_id: int,
+) -> str:
+    """Return a unique slug for a bootstrapped tenant, allowing the current row."""
+    candidate = preferred_slug
+    suffix = 2
+    while True:
+        existing = await session.scalar(select(StoreProfile.id).where(StoreProfile.slug == candidate))
+        if existing is None or existing == store_id:
+            return candidate
+        candidate = f"{preferred_slug}-{suffix}"
+        suffix += 1
+
+
+def _slugify_tenant_name(value: str) -> str:
+    """Convert a configured tenant name into a stable public slug."""
+    normalized = unicodedata.normalize("NFKD", value.strip()).encode("ascii", "ignore").decode("ascii")
+    compact = re.sub(r"[^a-z0-9]+", "-", normalized.lower()).strip("-")
+    return compact or "tenant"

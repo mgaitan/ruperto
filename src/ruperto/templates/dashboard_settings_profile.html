@@ -13,14 +13,24 @@
             />
         </label>
         <label class="space-y-2 text-sm font-medium text-slate-700">
-            <span>Vertical</span>
-            <select
-                class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
-                name="vertical"
-            >
-                <option value="ordering" {% if store.vertical == "ordering" %}selected{% endif %}>Rotisería</option>
-                <option value="municipal" {% if store.vertical == "municipal" %}selected{% endif %}>Municipio</option>
-            </select>
+            <span>Tipo de organización</span>
+            <input
+                class="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-slate-500 outline-none"
+                value="{% if store.vertical == 'municipal' %}Municipio{% else %}Local de comida{% endif %}"
+                readonly
+            />
+        </label>
+        <label class="space-y-2 text-sm font-medium text-slate-700">
+            <span>Slug público</span>
+            <input
+                class="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-slate-500 outline-none"
+                name="slug"
+                value="{{ store.slug }}"
+                readonly
+            />
+            <span class="block text-xs font-normal text-slate-500">
+                Disponible en <code>/demo/chat/{{ store.slug }}</code>. El tipo de organización y el slug se definen al crear la cuenta.
+            </span>
         </label>
         <label class="space-y-2 text-sm font-medium text-slate-700">
             <span>Alias de transferencia</span>

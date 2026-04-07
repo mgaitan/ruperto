@@ -9,13 +9,14 @@ from base64 import b64encode
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import anyio
 import pytest
 from fastapi.testclient import TestClient
 from itsdangerous import TimestampSigner
 from pydantic import SecretStr
-from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from sqlalchemy import select
 
@@ -28,9 +29,10 @@ from ruperto.app import (
 )
 from ruperto.config import Settings
 from ruperto.db import create_database_runtime, init_database
+from ruperto.mail import SignupEmailDeliveryError
 from ruperto.models import Channel, DeliveryType, OrderStatus, PaymentMethod, StaffRole, StoreMembership, StoreVertical
 from ruperto.repository import BusinessRepository
-from ruperto.schemas import AssistantTurnResult, StoreBusinessHoursSnapshot, StoreProfileUpdateRequest
+from ruperto.schemas import AssistantTurnResult, StoreBusinessHoursSnapshot
 
 HTTP_OK = 200
 HTTP_NOT_FOUND = 404
@@ -39,6 +41,7 @@ HTTP_FORBIDDEN = 403
 HTTP_UNAUTHORIZED = 401
 HTTP_UNPROCESSABLE_ENTITY = 422
 HTTP_BAD_REQUEST = 400
+HTTP_CONFLICT = 409
 HTTP_SERVICE_UNAVAILABLE = 503
 MIN_MENU_ITEMS = 35
 DEFAULT_WEEKLY_HOURS = 7
@@ -46,7 +49,13 @@ TENANT_STORE_ID = 7
 SMTP_PORT = 587
 
 
-def build_settings(tmp_path: Path, *, auto_init_db: bool = True) -> Settings:
+def build_settings(
+    tmp_path: Path,
+    *,
+    auto_init_db: bool = True,
+    store_vertical: StoreVertical = StoreVertical.ORDERING,
+    store_slug: str = "test-rotiseria",
+) -> Settings:
     """Create isolated settings for application tests."""
     return Settings(
         environment="test",
@@ -55,6 +64,8 @@ def build_settings(tmp_path: Path, *, auto_init_db: bool = True) -> Settings:
         store_name="Test Rotisería",
         bot_name="Test Bot",
         store_location="Córdoba",
+        store_vertical=store_vertical,
+        store_slug=store_slug,
         dashboard_session_secret="test-session-secret",
         dashboard_admin_email="staff@example.com",
         dashboard_admin_password=SecretStr("super-secret"),
@@ -148,29 +159,6 @@ async def add_staff_user_to_default_store(settings: Settings):
     await runtime.engine.dispose()
 
 
-async def set_default_store_vertical(settings: Settings, vertical: StoreVertical):
-    """Switch the default tenant to the requested business vertical."""
-    runtime = create_database_runtime(settings)
-    await init_database(settings=settings, runtime=runtime)
-    async with runtime.session_factory() as session:
-        repository = BusinessRepository(session)
-        current_store = await repository.get_store_profile(store_id=1)
-        await repository.update_store_profile(
-            payload=StoreProfileUpdateRequest(
-                store_name=current_store.store_name,
-                bot_name=current_store.bot_name,
-                store_location=current_store.store_location,
-                store_description=current_store.store_description,
-                assistant_personality=current_store.assistant_personality,
-                vertical=vertical,
-                transfer_alias=current_store.transfer_alias,
-            ),
-            store_id=1,
-        )
-        await session.commit()
-    await runtime.engine.dispose()
-
-
 async def create_whatsapp_confirmed_order(settings: Settings) -> int:
     """Create one confirmed WhatsApp order ready for status transitions."""
     runtime = create_database_runtime(settings)
@@ -234,22 +222,318 @@ def test_root_endpoint_without_auto_init(tmp_path: Path):
     assert response.json()["environment"] == "test"
 
 
+def test_root_endpoint_renders_homepage_for_browser(tmp_path: Path):
+    """Browser requests to the root path render the public landing page."""
+    app = create_app(build_settings(tmp_path))
+    with TestClient(app) as client:
+        response = client.get("/", headers={"accept": "text/html"})
+
+    assert response.status_code == HTTP_OK
+    assert "Crear cuenta" in response.text
+    assert 'value="ordering"' in response.text
+    assert 'value="municipal"' in response.text
+    assert "Katupyry" in response.text
+    assert "Inteligencia Artificial para la vida Real" in response.text
+    assert "Crear cuenta y entrar al panel" in response.text
+
+
 def test_demo_chat_page_renders_the_browser_harness(tmp_path: Path):
     """The lightweight demo chat page is available from the main app."""
-    app = create_app(build_settings(tmp_path))
+    settings = build_settings(tmp_path)
+    app = create_app(settings)
 
     with TestClient(app) as client:
-        response = client.get("/demo/chat")
+        redirect_response = client.get("/demo/chat", follow_redirects=False)
+        response = client.get(f"/demo/chat/{settings.store_slug}")
 
+    assert redirect_response.status_code == HTTP_FOUND
+    assert redirect_response.headers["location"] == f"/demo/chat/{settings.store_slug}"
     assert response.status_code == HTTP_OK
     assert "Demo online" in response.text
     assert "Clientes demo" in response.text
-    assert "/api/dev/messages" in response.text
-    assert "/api/dev/notifications" in response.text
+    assert f"/api/dev/messages/{settings.store_slug}" in response.text
+    assert f"/api/dev/notifications/{settings.store_slug}" in response.text
     assert "Martín" in response.text
     assert "Crear cliente aleatorio" in response.text
-    assert "marked.min.js" in response.text
-    assert "purify.min.js" in response.text
+
+
+def test_home_signup_creates_ordering_tenant_and_logs_into_dashboard(tmp_path: Path):
+    """The public signup form can create an ordering tenant and start a session."""
+    settings = build_settings(tmp_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/signup",
+            data={
+                "store_name": "Rotisería Centro",
+                "full_name": "Dueña Centro",
+                "email": "owner-centro@example.com",
+                "password": "super-secret-123",
+                "vertical": StoreVertical.ORDERING.value,
+            },
+            follow_redirects=False,
+        )
+        dashboard_response = client.get("/dashboard")
+
+    assert response.status_code == HTTP_FOUND
+    assert response.headers["location"] == "/dashboard"
+    assert dashboard_response.status_code == HTTP_OK
+    assert "Rotisería Centro" in dashboard_response.text
+
+    async def assert_signup_result():
+        runtime = create_database_runtime(settings)
+        async with runtime.session_factory() as session:
+            repository = BusinessRepository(session)
+            store = await repository.get_store_profile_by_slug("rotiseria-centro")
+            staff_user = await repository.get_staff_user_by_email("owner-centro@example.com")
+            assert store is not None
+            assert store.vertical == StoreVertical.ORDERING
+            assert staff_user is not None
+            memberships = await repository.list_store_memberships_for_staff_user(staff_user.id)
+            hours = await repository.list_store_business_hours(store_id=store.id)
+            assert any(membership.store_id == store.id for membership in memberships)
+            assert len(hours) == DEFAULT_WEEKLY_HOURS
+        await runtime.engine.dispose()
+
+    anyio.run(assert_signup_result)
+
+
+def test_home_signup_creates_municipal_tenant_with_seeded_catalog(tmp_path: Path):
+    """The public signup form seeds the municipal vertical and logs the owner in."""
+    settings = build_settings(tmp_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/signup",
+            data={
+                "store_name": "Municipalidad Demo",
+                "full_name": "Ana Vecina",
+                "email": "ana@example.com",
+                "password": "super-secret-123",
+                "vertical": StoreVertical.MUNICIPAL.value,
+            },
+            follow_redirects=False,
+        )
+        dashboard_response = client.get("/dashboard")
+
+    assert response.status_code == HTTP_FOUND
+    assert response.headers["location"] == "/dashboard"
+    assert dashboard_response.status_code == HTTP_OK
+    assert "Municipio" in dashboard_response.text
+    assert "Personas" in dashboard_response.text
+
+    async def assert_signup_result():
+        runtime = create_database_runtime(settings)
+        async with runtime.session_factory() as session:
+            repository = BusinessRepository(session)
+            store = await repository.get_store_profile_by_slug("municipalidad-demo")
+            assert store is not None
+            assert store.vertical == StoreVertical.MUNICIPAL
+            areas = await repository.list_municipal_areas(store_id=store.id)
+            hours = await repository.list_store_business_hours(store_id=store.id)
+            assert len(areas) > 0
+            assert len(hours) == DEFAULT_WEEKLY_HOURS
+        await runtime.engine.dispose()
+
+    anyio.run(assert_signup_result)
+
+
+def test_home_signup_rejects_existing_email(tmp_path: Path):
+    """The public signup form surfaces duplicate owner emails without overwriting users."""
+    settings = build_settings(tmp_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/signup",
+            data={
+                "store_name": "Otro Tenant",
+                "full_name": "Staff Duplicado",
+                "email": "staff@example.com",
+                "password": "super-secret-123",
+                "vertical": StoreVertical.ORDERING.value,
+            },
+            headers={"accept": "text/html"},
+        )
+
+    assert response.status_code == HTTP_CONFLICT
+    assert "Ya existe una cuenta con ese correo." in response.text
+
+
+def test_home_signup_sends_welcome_email_when_smtp_is_configured(tmp_path: Path):
+    """Configured SMTP sends a welcome email after signup succeeds."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "smtp_server": "smtp.example.com",
+            "smtp_port": SMTP_PORT,
+            "smtp_user": "mailer@example.com",
+            "smtp_password": SecretStr("smtp-secret"),
+        }
+    )
+    app = create_app(settings)
+
+    with patch("ruperto.app.send_signup_welcome_email") as send_signup_email, TestClient(app) as client:
+        response = client.post(
+            "/signup",
+            data={
+                "store_name": "Rotiseria Norte",
+                "full_name": "Nora Owner",
+                "email": "nora@example.com",
+                "password": "super-secret-123",
+                "vertical": StoreVertical.ORDERING.value,
+            },
+            follow_redirects=False,
+        )
+
+    assert response.status_code == HTTP_FOUND
+    assert response.headers["location"] == "/dashboard"
+    send_signup_email.assert_called_once()
+    call = send_signup_email.call_args.kwargs
+    assert call["smtp_server"] == "smtp.example.com"
+    assert call["smtp_port"] == SMTP_PORT
+    assert call["smtp_user"] == "mailer@example.com"
+    assert call["recipient_email"] == "nora@example.com"
+    assert call["store_name"] == "Rotiseria Norte"
+    assert call["vertical"] == StoreVertical.ORDERING
+
+
+def test_home_signup_reports_smtp_delivery_errors_and_rolls_back(tmp_path: Path):
+    """Configured SMTP failures abort the signup instead of hiding the error."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "smtp_server": "smtp.example.com",
+            "smtp_port": SMTP_PORT,
+            "smtp_user": "mailer@example.com",
+            "smtp_password": SecretStr("smtp-secret"),
+        }
+    )
+    app = create_app(settings)
+
+    with (
+        patch(
+            "ruperto.app.send_signup_welcome_email",
+            side_effect=SignupEmailDeliveryError(),
+        ),
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            "/signup",
+            data={
+                "store_name": "Tenant Fallido",
+                "full_name": "Falla Mail",
+                "email": "falla@example.com",
+                "password": "super-secret-123",
+                "vertical": StoreVertical.ORDERING.value,
+            },
+            headers={"accept": "text/html"},
+        )
+
+    assert response.status_code == HTTP_SERVICE_UNAVAILABLE
+    assert "No pudimos enviar el correo de bienvenida." in response.text
+
+    async def assert_signup_rolled_back():
+        runtime = create_database_runtime(settings)
+        async with runtime.session_factory() as session:
+            repository = BusinessRepository(session)
+            assert await repository.get_staff_user_by_email("falla@example.com") is None
+            assert await repository.get_store_profile_by_slug("tenant-fallido") is None
+        await runtime.engine.dispose()
+
+    anyio.run(assert_signup_rolled_back)
+
+
+def test_home_signup_returns_html_validation_errors_for_incomplete_form(tmp_path: Path):
+    """Browser signups keep the landing page and validation hint on bad input."""
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/signup",
+            data={"store_name": "", "full_name": "", "email": "", "password": "", "vertical": "ordering"},
+            headers={"accept": "text/html"},
+        )
+
+    assert response.status_code == HTTP_UNPROCESSABLE_ENTITY
+    assert "Completá nombre, responsable, correo, contraseña y el tipo de organización." in response.text
+
+
+def test_home_signup_returns_json_validation_errors_for_incomplete_form(tmp_path: Path):
+    """API signups return structured validation errors when fields are missing."""
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/signup",
+            data={"store_name": "", "full_name": "", "email": "", "password": "", "vertical": "ordering"},
+        )
+
+    assert response.status_code == HTTP_UNPROCESSABLE_ENTITY
+    assert response.json()["detail"]
+
+
+def test_home_signup_reports_smtp_delivery_errors_as_json(tmp_path: Path):
+    """API signups surface SMTP delivery failures as JSON errors too."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "smtp_server": "smtp.example.com",
+            "smtp_port": SMTP_PORT,
+            "smtp_user": "mailer@example.com",
+            "smtp_password": SecretStr("smtp-secret"),
+        }
+    )
+    app = create_app(settings)
+
+    with (
+        patch(
+            "ruperto.app.send_signup_welcome_email",
+            side_effect=SignupEmailDeliveryError(),
+        ),
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            "/signup",
+            data={
+                "store_name": "Tenant JSON Fallido",
+                "full_name": "Falla JSON",
+                "email": "falla-json@example.com",
+                "password": "super-secret-123",
+                "vertical": StoreVertical.ORDERING.value,
+            },
+        )
+
+    assert response.status_code == HTTP_SERVICE_UNAVAILABLE
+    assert response.json() == {"detail": "Could not deliver signup email."}
+
+
+def test_demo_chat_page_renders_municipal_prompts_per_slug(tmp_path: Path):
+    """Municipal demo pages expose complaint-oriented quick prompts."""
+    settings = build_settings(tmp_path, store_vertical=StoreVertical.MUNICIPAL, store_slug="mi-muni")
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.get("/demo/chat/mi-muni")
+
+    assert response.status_code == HTTP_OK
+    assert "Hola, quiero hacer un reclamo" in response.text
+    assert "/api/dev/messages/mi-muni" in response.text
+    assert "Personas demo" in response.text
+    assert "Agregar persona demo" in response.text
+    assert "Crear persona aleatoria" in response.text
+    assert "Cliente demo" not in response.text
+    assert "cliente demo" not in response.text
+
+
+def test_demo_chat_page_returns_not_found_for_unknown_slug(tmp_path: Path):
+    """Unknown tenant slugs fail closed instead of rendering the default demo."""
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.get("/demo/chat/slug-inexistente")
+
+    assert response.status_code == HTTP_NOT_FOUND
+    assert response.json()["detail"] == "Store not found."
 
 
 def test_extract_kapso_phone_number_id_supports_direct_and_nested_payloads():
@@ -698,6 +982,40 @@ def test_dev_notifications_endpoint_returns_pending_messages(tmp_path: Path, mon
     assert second_poll.json() == []
 
 
+def test_dev_notifications_endpoint_supports_slug_scoped_demo_routes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Slug-scoped demo notifications stay bound to the selected tenant."""
+    settings = build_settings(tmp_path)
+    monkeypatch.setattr("ruperto.assistant.build_google_model", lambda settings: FunctionModel(dev_message_model))
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        client.post(
+            f"/api/dev/messages/{settings.store_slug}",
+            json={"external_user_id": "cli-user", "message_text": "Hola, quiero pedir"},
+        )
+        client.post(
+            f"/api/dev/messages/{settings.store_slug}",
+            json={"external_user_id": "cli-user", "message_text": "Martina"},
+        )
+        order_response = client.post(
+            f"/api/dev/messages/{settings.store_slug}",
+            json={"external_user_id": "cli-user", "message_text": "Quiero una hamburguesa"},
+        )
+        client.post(
+            f"/api/dev/messages/{settings.store_slug}",
+            json={"external_user_id": "cli-user", "message_text": "Confirmá el pedido"},
+        )
+        order_id = order_response.json()["current_order"]["id"]
+        client.patch(f"/api/orders/{order_id}/status", json={"status": OrderStatus.ALMOST_READY.value})
+        poll_response = client.get(
+            f"/api/dev/notifications/{settings.store_slug}",
+            params={"external_user_id": "cli-user"},
+        )
+
+    assert poll_response.status_code == HTTP_OK
+    assert [notification["event_type"] for notification in poll_response.json()] == ["order_almost_ready"]
+
+
 def test_staff_update_order_status_returns_not_found_for_unknown_order(tmp_path: Path):
     """The staff status endpoint returns 404 when the order is missing."""
     app = create_app(build_settings(tmp_path))
@@ -791,7 +1109,7 @@ def test_dashboard_renders_sections_with_tailwind(tmp_path: Path):
     assert login_response.status_code == HTTP_OK
     assert "Cerrar sesión" in login_response.text
     assert response.status_code == HTTP_OK
-    assert "Rotisería" in response.text
+    assert "Local de comida" in response.text
     assert "tailwindcss.com" in response.text
     assert "Inicio" in response.text
     assert "Clientes" in response.text
@@ -879,7 +1197,6 @@ def test_dashboard_forms_can_update_profile_agent_and_hours(tmp_path: Path):
             "/dashboard/settings/profile",
             data={
                 "store_name": "Panel Rotisería",
-                "vertical": "municipal",
                 "store_location": "Anisacate",
                 "store_description": "Simple dashboard edits.",
                 "transfer_alias": "panel.rotiseria",
@@ -930,7 +1247,7 @@ def test_dashboard_forms_can_update_profile_agent_and_hours(tmp_path: Path):
     assert store_response.json()["store_name"] == "Panel Rotisería"
     assert store_response.json()["bot_name"] == "Panel Bot"
     assert store_response.json()["transfer_alias"] == "panel.rotiseria"
-    assert store_response.json()["vertical"] == "municipal"
+    assert store_response.json()["vertical"] == "ordering"
     assert store_hours_response.json()[0]["closed"] is True
     assert store_hours_response.json()[1]["opens_at"] == "11:30"
     assert store_hours_response.json()[2]["opens_at"] == "19:00"
@@ -1054,7 +1371,7 @@ def test_dashboard_shell_links_to_demo_chat(tmp_path: Path):
 
     assert response.status_code == HTTP_OK
     assert "Abrir demo del chat" in response.text
-    assert 'href="/demo/chat"' in response.text
+    assert 'href="/demo/chat/test-rotiseria"' in response.text
 
 
 def test_dashboard_logout_clears_the_session(tmp_path: Path):
@@ -1187,7 +1504,9 @@ def test_dashboard_settings_pages_render_menu_filters_and_profile_data(tmp_path:
     assert "Pizza muzzarella" not in menu_response.text
     assert profile_response.status_code == HTTP_OK
     assert "Alias de transferencia" in profile_response.text
-    assert 'name="vertical"' in profile_response.text
+    assert 'name="vertical"' not in profile_response.text
+    assert 'name="slug"' in profile_response.text
+    assert "/demo/chat/test-rotiseria" in profile_response.text
     assert agent_response.status_code == HTTP_OK
     assert "Modelo" in agent_response.text
     assert "WhatsApp vía Kapso" in agent_response.text
@@ -1199,8 +1518,7 @@ def test_dashboard_settings_pages_render_menu_filters_and_profile_data(tmp_path:
 
 def test_dashboard_switches_navigation_and_placeholders_for_municipal_vertical(tmp_path: Path):
     """Municipal tenants reuse the shell but show municipal navigation and placeholder content."""
-    settings = build_settings(tmp_path)
-    anyio.run(set_default_store_vertical, settings, StoreVertical.MUNICIPAL)
+    settings = build_settings(tmp_path, store_vertical=StoreVertical.MUNICIPAL, store_slug="mi-muni")
     app = create_app(settings)
 
     with TestClient(app) as client:
@@ -1213,39 +1531,211 @@ def test_dashboard_switches_navigation_and_placeholders_for_municipal_vertical(t
 
     assert home_response.status_code == HTTP_OK
     assert "Municipio" in home_response.text
-    assert "Vecinos" in home_response.text
+    assert "Personas" in home_response.text
     assert "Áreas y categorías" in home_response.text
-    assert "El tenant ya enruta conversaciones al vertical municipal." in home_response.text
+    assert "Este municipio ya puede recibir conversaciones en su propio espacio." in home_response.text
     assert customers_response.status_code == HTTP_OK
-    assert "Vecinos" in customers_response.text
-    assert "Buscar cliente" in customers_response.text
+    assert "Personas que escribieron" in customers_response.text
+    assert "Buscar persona" in customers_response.text
     assert menu_response.status_code == HTTP_OK
-    assert (
-        "La configuración de áreas, categorías y subcategorías se habilita en la próxima etapa." in menu_response.text
-    )
+    assert "Crear área" in menu_response.text
+    assert "Crear categoría" in menu_response.text
     assert hours_response.status_code == HTTP_OK
-    assert "La agenda comercial queda desactivada para tenants municipales." in hours_response.text
+    assert "La agenda comercial queda desactivada para municipios." in hours_response.text
     assert profile_response.status_code == HTTP_OK
     assert "Nombre del municipio" in profile_response.text
+    assert "/demo/chat/mi-muni" in profile_response.text
+
+
+def test_dashboard_kanban_page_renders_for_municipal_staff(tmp_path: Path):
+    """Municipal staff can open the kanban board from the dashboard."""
+    settings = build_settings(tmp_path, store_vertical=StoreVertical.MUNICIPAL, store_slug="mi-muni")
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        response = client.get("/dashboard/kanban")
+
+    assert response.status_code == HTTP_OK
+    assert "Tablero Kanban" in response.text
+    assert "Todas las áreas" in response.text
+
+
+def test_dashboard_municipal_catalog_forms_can_create_areas_and_categories(tmp_path: Path):
+    """Municipal dashboard settings can create areas and categories for the active store."""
+    settings = build_settings(tmp_path, store_vertical=StoreVertical.MUNICIPAL, store_slug="mi-muni")
+    app = create_app(settings)
+
+    async def list_area_ids() -> list[int]:
+        runtime = create_database_runtime(settings)
+        await init_database(settings=settings, runtime=runtime)
+        async with runtime.session_factory() as session:
+            repository = BusinessRepository(session)
+            areas = await repository.list_municipal_areas(store_id=settings.default_store_id)
+        await runtime.engine.dispose()
+        return [area.id for area in areas]
+
+    initial_area_ids = set(anyio.run(list_area_ids))
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        create_area_response = client.post(
+            "/dashboard/settings/municipal/areas",
+            data={
+                "name": "Arbolado",
+                "description": "Consultas sobre poda y arboles",
+                "display_order": "12",
+            },
+            follow_redirects=False,
+        )
+
+    assert create_area_response.status_code == HTTP_FOUND
+    assert create_area_response.headers["location"] == "/dashboard/settings/menu?flash=municipal-area-created"
+
+    updated_area_ids = set(anyio.run(list_area_ids))
+    created_area_ids = updated_area_ids - initial_area_ids
+    assert len(created_area_ids) == 1
+    created_area_id = next(iter(created_area_ids))
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        create_category_response = client.post(
+            "/dashboard/settings/municipal/categories",
+            data={
+                "area_id": str(created_area_id),
+                "name": "Ramas caidas",
+                "description": "Ramas o restos sobre la via publica",
+                "request_kind": "request",
+                "display_order": "3",
+                "requires_precise_location": "on",
+            },
+            follow_redirects=False,
+        )
+        menu_response = client.get("/dashboard/settings/menu")
+
+    assert create_category_response.status_code == HTTP_FOUND
+    assert create_category_response.headers["location"] == "/dashboard/settings/menu?flash=municipal-category-created"
+    assert "Arbolado" in menu_response.text
+    assert "Ramas caidas" in menu_response.text
+    assert "Solicitud" in menu_response.text
+    assert "Ubicación precisa" in menu_response.text
+
+
+def test_dashboard_municipal_area_form_requires_authentication(tmp_path: Path):
+    """Municipal area creation redirects anonymous staff to login."""
+    settings = build_settings(tmp_path, store_vertical=StoreVertical.MUNICIPAL, store_slug="mi-muni")
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.post("/dashboard/settings/municipal/areas", data={"name": "Arbolado"}, follow_redirects=False)
+
+    assert response.status_code == HTTP_FOUND
+    assert "/dashboard/login" in response.headers["location"]
+
+
+def test_dashboard_municipal_area_form_rejects_invalid_payloads_and_non_municipal_stores(tmp_path: Path):
+    """Municipal area creation validates input and is disabled for ordering stores."""
+    municipal_tmp_path = tmp_path / "municipal"
+    municipal_tmp_path.mkdir()
+    municipal_app = create_app(
+        build_settings(municipal_tmp_path, store_vertical=StoreVertical.MUNICIPAL, store_slug="municipal-test")
+    )
+    with TestClient(municipal_app) as client:
+        login_dashboard(client)
+        invalid_response = client.post("/dashboard/settings/municipal/areas", data={"name": ""}, follow_redirects=False)
+
+    assert invalid_response.status_code == HTTP_UNPROCESSABLE_ENTITY
+
+    ordering_tmp_path = tmp_path / "ordering"
+    ordering_tmp_path.mkdir()
+    ordering_app = create_app(
+        build_settings(ordering_tmp_path, store_vertical=StoreVertical.ORDERING, store_slug="ordering-test")
+    )
+    with TestClient(ordering_app) as client:
+        login_dashboard(client)
+        disabled_response = client.post(
+            "/dashboard/settings/municipal/areas", data={"name": "Arbolado"}, follow_redirects=False
+        )
+
+    assert disabled_response.status_code == HTTP_NOT_FOUND
+
+
+def test_dashboard_municipal_category_form_handles_auth_validation_and_missing_area(tmp_path: Path):
+    """Municipal category creation covers auth, validation and missing-area errors."""
+    settings = build_settings(tmp_path, store_vertical=StoreVertical.MUNICIPAL, store_slug="mi-muni")
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        anonymous_response = client.post(
+            "/dashboard/settings/municipal/categories", data={"area_id": "1"}, follow_redirects=False
+        )
+    assert anonymous_response.status_code == HTTP_FOUND
+    assert "/dashboard/login" in anonymous_response.headers["location"]
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        invalid_area_response = client.post(
+            "/dashboard/settings/municipal/categories",
+            data={"area_id": "x", "name": "Ramas caídas"},
+            follow_redirects=False,
+        )
+        invalid_payload_response = client.post(
+            "/dashboard/settings/municipal/categories",
+            data={"area_id": "1", "name": "", "request_kind": "complaint"},
+            follow_redirects=False,
+        )
+        missing_area_response = client.post(
+            "/dashboard/settings/municipal/categories",
+            data={"area_id": "999", "name": "Ramas caídas", "request_kind": "complaint"},
+            follow_redirects=False,
+        )
+
+    assert invalid_area_response.status_code == HTTP_UNPROCESSABLE_ENTITY
+    assert invalid_payload_response.status_code == HTTP_UNPROCESSABLE_ENTITY
+    assert missing_area_response.status_code == HTTP_NOT_FOUND
+
+
+def test_dashboard_municipal_category_form_is_disabled_for_ordering_stores(tmp_path: Path):
+    """Ordering stores do not expose the municipal category creator."""
+    app = create_app(build_settings(tmp_path, store_vertical=StoreVertical.ORDERING))
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        response = client.post(
+            "/dashboard/settings/municipal/categories",
+            data={"area_id": "1", "name": "Ramas caídas", "request_kind": "complaint"},
+            follow_redirects=False,
+        )
+
+    assert response.status_code == HTTP_NOT_FOUND
 
 
 def test_dev_messages_route_switches_to_municipal_vertical_without_creating_orders(tmp_path: Path):
     """The shared chat API routes municipal tenants away from the ordering flow."""
-    settings = build_settings(tmp_path)
-    anyio.run(set_default_store_vertical, settings, StoreVertical.MUNICIPAL)
+    settings = build_settings(tmp_path, store_vertical=StoreVertical.MUNICIPAL, store_slug="mi-muni")
     app = create_app(settings)
 
-    with TestClient(app) as client:
+    def municipal_dev_message_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content='{"asks_for_catalog": true}')], model_name="municipal-test")
+
+    with (
+        TestClient(app) as client,
+        patch(
+            "ruperto.municipal.build_google_model",
+            lambda settings: FunctionModel(municipal_dev_message_model),
+        ),
+    ):
         response = client.post(
-            "/api/dev/messages",
+            "/api/dev/messages/mi-muni",
             json={"external_user_id": "municipal-user", "message_text": "Hola, quiero hacer un reclamo"},
         )
         orders_response = client.get("/api/orders", params={"limit": 10})
 
     payload = response.json()
     assert response.status_code == HTTP_OK
-    assert payload["reply"]["next_step"] == "handoff"
-    assert "asistente municipal" in payload["reply"]["reply_text"]
+    assert payload["reply"]["next_step"] == "choose_area"
+    assert "Puedo ayudarte a cargar un reclamo o una solicitud" in payload["reply"]["reply_text"]
     assert payload["current_order"] is None
     assert orders_response.json() == []
 

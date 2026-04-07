@@ -12,6 +12,7 @@ from ruperto.models import (
     ChannelProvider,
     DeliveryType,
     MunicipalCaseStatus,
+    MunicipalRequestKind,
     OrderStatus,
     PaymentMethod,
     StaffRole,
@@ -36,6 +37,7 @@ class StoreProfileSnapshot(BaseSchema):
     """Public store information useful to the assistant and admin surfaces."""
 
     id: int
+    slug: str
     store_name: str
     bot_name: str
     store_location: str | None
@@ -130,6 +132,7 @@ class MunicipalCategorySnapshot(BaseSchema):
     area_id: int
     name: str
     description: str | None
+    request_kind: MunicipalRequestKind
     requires_precise_location: bool
     is_fallback: bool
     display_order: int
@@ -155,6 +158,25 @@ class MunicipalCaseSnapshot(BaseSchema):
     latitude: float | None
     longitude: float | None
     status: MunicipalCaseStatus
+    created_at: datetime
+    updated_at: datetime
+
+
+class MunicipalCaseDraftSnapshot(BaseSchema):
+    """Mutable municipal intake draft tied to one conversation."""
+
+    id: int
+    conversation_id: int
+    store_id: int
+    customer_id: int
+    area_id: int | None
+    category_id: int | None
+    request_summary: str | None
+    location_text: str | None
+    location_reference: str | None
+    latitude: float | None
+    longitude: float | None
+    awaiting_confirmation: bool
     created_at: datetime
     updated_at: datetime
 
@@ -244,9 +266,14 @@ class AssistantNextStep(StrEnum):
 
     ASK_NAME = "ask_name"
     CHOOSE_ITEMS = "choose_items"
+    CHOOSE_AREA = "choose_area"
+    CHOOSE_CATEGORY = "choose_category"
+    DESCRIBE_REQUEST = "describe_request"
+    SHARE_LOCATION = "share_location"
     CHOOSE_DELIVERY = "choose_delivery"
     ASK_ADDRESS = "ask_address"
     CHOOSE_PAYMENT = "choose_payment"
+    CONFIRM_CASE = "confirm_case"
     CONFIRM_ORDER = "confirm_order"
     COMPLETE = "complete"
     HANDOFF = "handoff"
@@ -332,8 +359,17 @@ class StoreProfileUpdateRequest(BaseModel):
     store_location: str | None = None
     store_description: str = Field(min_length=1)
     assistant_personality: str = Field(min_length=1)
-    vertical: StoreVertical = StoreVertical.ORDERING
     transfer_alias: str | None = None
+
+
+class HomeSignupRequest(BaseModel):
+    """Payload accepted by the public home-page signup form."""
+
+    store_name: str = Field(min_length=1)
+    full_name: str = Field(min_length=1)
+    email: str = Field(min_length=1)
+    password: str = Field(min_length=8)
+    vertical: StoreVertical
 
 
 class StoreChannelConnectionUpdateRequest(BaseModel):
@@ -360,6 +396,7 @@ class MunicipalCategoryCreateRequest(BaseModel):
 
     name: str = Field(min_length=1)
     description: str | None = None
+    request_kind: MunicipalRequestKind = MunicipalRequestKind.COMPLAINT
     requires_precise_location: bool = False
     is_fallback: bool = False
     display_order: int = Field(default=0, ge=0)
