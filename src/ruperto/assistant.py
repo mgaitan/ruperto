@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from collections.abc import Awaitable, Callable
@@ -143,6 +144,56 @@ NAME_PROMPT_VARIANTS = (
     "👋 Hola, soy {bot_name}, el asistente de pedidos de {store_name}. Antes de seguir, ¿me decís tu nombre?",
     "🍽️ Hola, te habla {bot_name}, el asistente de pedidos de {store_name}. Para arrancar, ¿cómo te llamás?",
 )
+WHATSAPP_LOCATION_TYPE = "location"
+VAGUE_LOCATION_PATTERNS = (
+    re.compile(r"\bmi\s+casa\b", re.IGNORECASE),
+    # "esquina de mi casa" / "esquina de casa" (with or without "mi")
+    re.compile(r"\besquina\s+de\s+(mi\s+)?casa\b", re.IGNORECASE),
+    re.compile(r"\bac[aá]\s*nom[aá]s\b", re.IGNORECASE),
+    re.compile(r"\bah[ií]\s*nom[aá]s\b", re.IGNORECASE),
+    re.compile(r"\ben\s+mi\s+casa\b", re.IGNORECASE),
+    re.compile(r"^ac[aá]\s*$", re.IGNORECASE),
+    re.compile(r"^ah[ií]\s*$", re.IGNORECASE),
+    # "la esquina" alone or followed by any landmark (e.g. "la esquina del parque")
+    re.compile(r"^la\s+esquina\b", re.IGNORECASE),
+    re.compile(r"\bnom[aá]s\s*$", re.IGNORECASE),
+)
+
+
+def parse_whatsapp_location(message_text: str) -> tuple[float, float] | None:
+    """Parse a WhatsApp location message and return `(latitude, longitude)`.
+
+    Expects a JSON payload of the form
+    `{"type": "location", "latitude": <float>, "longitude": <float>}`.
+    Returns `None` for any other input.
+    """
+    try:
+        data = json.loads(message_text.strip())
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("type") != WHATSAPP_LOCATION_TYPE:
+        return None
+    lat = data.get("latitude")
+    lon = data.get("longitude")
+    if not isinstance(lat, int | float) or not isinstance(lon, int | float):
+        return None
+    return float(lat), float(lon)
+
+
+def format_location_as_address(lat: float, lon: float) -> str:
+    """Format GPS coordinates as a delivery address string."""
+    return f"Ubicación GPS: {lat:.6f}, {lon:.6f}"
+
+
+def is_vague_location(address: str) -> bool:
+    """Return `True` if *address* is too imprecise for delivery.
+
+    Matches common Spanish-language vague references such as
+    "mi casa", "la esquina de mi casa", or "acá nomás".
+    """
+    return any(pattern.search(address) for pattern in VAGUE_LOCATION_PATTERNS)
 
 
 @dataclass(slots=True)
@@ -209,6 +260,17 @@ class MissingConfirmationSignalError(ValueError):
 
     def __init__(self) -> None:
         super().__init__("No confirmes el pedido sin una señal explícita del cliente en este turno.")
+
+
+class VagueLocationError(ValueError):
+    """Raised when a delivery address is too imprecise to accept."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "La dirección es demasiado vaga para hacer el envío. "
+            "Pedile al cliente una dirección precisa con calle y número, "
+            "o que comparta su ubicación desde WhatsApp 📍."
+        )
 
 
 async def with_repository[RepositoryResult](
@@ -377,9 +439,16 @@ async def set_order_delivery_address(
     ctx: RunContext[AssistantDeps],
     address: str,
 ) -> OrderSnapshot:
-    """Set the delivery address for the active order."""
+    """Set the delivery address for the active order.
+
+    Raises `VagueLocationError` when *address* is too vague (e.g. "mi casa" or
+    "la esquina de mi casa").  Ask the customer for a precise street address
+    or GPS coordinates shared via WhatsApp 📍.
+    """
     if not ctx.deps.allow_order_mutations:
         raise InformationalTurnMutationError
+    if is_vague_location(address):
+        raise VagueLocationError
     return await with_repository(
         ctx,
         lambda repository: repository.set_order_delivery_address(
@@ -536,6 +605,12 @@ class OrderingAssistantService:
     ) -> AssistantTurnResult:
         """Process one customer message and persist the resulting turn."""
         resolved_store_id = store_id if store_id is not None else self.settings.default_store_id
+
+        # Pre-process WhatsApp location messages before any other handling.
+        whatsapp_location = parse_whatsapp_location(message_text)
+        if whatsapp_location is not None:
+            message_text = format_location_as_address(*whatsapp_location)
+
         async with self.session_factory() as session:
             repository = BusinessRepository(session)
             customer = await repository.get_or_create_customer(
@@ -595,6 +670,7 @@ class OrderingAssistantService:
                     message_text=message_text,
                     current_order=current_order_before_run,
                     pending_customer_message=resumed_pending_message,
+                    whatsapp_location=whatsapp_location,
                 ),
                 allow_order_mutations=turn_policy.allow_order_mutations,
                 allow_order_confirmation=turn_policy.allow_order_confirmation,
@@ -922,6 +998,7 @@ class OrderingAssistantService:
         message_text: str,
         current_order: OrderSnapshot | None,
         pending_customer_message: str | None = None,
+        whatsapp_location: tuple[float, float] | None = None,
     ) -> str | None:
         """Build safe guidance for dense first-turn customer messages."""
         hints: list[str] = []
@@ -929,6 +1006,13 @@ class OrderingAssistantService:
         if customer.name is not None and introduced_name == customer.name:
             hints.append(
                 f"El cliente ya se presentó en este mensaje como {customer.name}. No vuelvas a pedirle el nombre."
+            )
+
+        if whatsapp_location is not None:
+            lat, lon = whatsapp_location
+            hints.append(
+                f"El cliente compartió su ubicación desde WhatsApp (lat={lat:.6f}, lon={lon:.6f}). "
+                "Registrá esta ubicación como dirección de envío usando set_order_delivery_address."
             )
 
         payment_hint = self._detect_payment_method_hint(message_text)
@@ -988,7 +1072,10 @@ class OrderingAssistantService:
                     f"Dirección conocida del cliente: {customer.default_address}."
                 )
             else:
-                hints.append("Falta pedir la dirección de envío antes de confirmar.")
+                hints.append(
+                    "Falta pedir la dirección de envío antes de confirmar. "
+                    "Pedí una dirección precisa con calle y número, o que comparta su ubicación desde WhatsApp 📍."
+                )
             return hints
 
         if current_order.payment_method is None:
@@ -1058,10 +1145,14 @@ class OrderingAssistantService:
         if current_order.delivery_type == DeliveryType.DELIVERY and current_order.delivery_address is None:
             if customer.default_address:
                 reply_text = (
-                    f"Perfecto. ¿Te lo envío a {customer.default_address}? Si preferís otra dirección, pasámela."
+                    f"Perfecto. ¿Te lo envío a {customer.default_address}? "
+                    "Si preferís otra dirección, pasámela o compartí tu ubicación 📍."
                 )
             else:
-                reply_text = "Perfecto. Pasame la dirección de envío, por favor."
+                reply_text = (
+                    "Perfecto. Pasame la dirección de envío con calle y número, "
+                    "o compartí tu ubicación desde WhatsApp 📍."
+                )
             return reply.model_copy(
                 update={
                     "reply_text": reply_text,
