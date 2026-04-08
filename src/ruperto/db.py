@@ -336,19 +336,30 @@ def _ensure_outbound_notification_table(connection: Connection, *, inspector: In
                 """
                 CREATE TABLE outbound_notification (
                     id INTEGER NOT NULL PRIMARY KEY,
-                    order_id INTEGER NOT NULL,
+                    order_id INTEGER,
+                    municipal_case_id INTEGER,
                     conversation_id INTEGER NOT NULL,
                     event_type VARCHAR(64) NOT NULL,
                     message_text TEXT NOT NULL,
                     delivered_at DATETIME,
                     created_at DATETIME NOT NULL,
                     FOREIGN KEY(order_id) REFERENCES customer_order (id) ON DELETE CASCADE,
+                    FOREIGN KEY(municipal_case_id) REFERENCES municipal_case (id) ON DELETE CASCADE,
                     FOREIGN KEY(conversation_id) REFERENCES conversation (id) ON DELETE CASCADE,
-                    CONSTRAINT uq_outbound_notification_order_event UNIQUE (order_id, event_type)
+                    CONSTRAINT uq_outbound_notification_order_event UNIQUE (order_id, event_type),
+                    CONSTRAINT uq_outbound_notification_case_event UNIQUE (municipal_case_id, event_type)
                 )
                 """
             )
         )
+        return
+
+    notification_columns = {column["name"] for column in inspector.get_columns("outbound_notification")}
+    order_id_column = next(
+        column for column in inspector.get_columns("outbound_notification") if column["name"] == "order_id"
+    )
+    if "municipal_case_id" not in notification_columns or not order_id_column.get("nullable", True):
+        _migrate_outbound_notification_table(connection)
 
 
 def _ensure_conversation_columns(connection: Connection, *, inspector: Inspector) -> None:
@@ -481,6 +492,59 @@ def _migrate_store_business_hours_table(connection: Connection) -> None:
         )
     )
     connection.execute(text("DROP TABLE store_business_hours_legacy"))
+
+
+def _migrate_outbound_notification_table(connection: Connection) -> None:
+    """Migrate outbound notifications to support municipal case events."""
+    connection.execute(text("ALTER TABLE outbound_notification RENAME TO outbound_notification_legacy"))
+    connection.execute(
+        text(
+            """
+            CREATE TABLE outbound_notification (
+                id INTEGER NOT NULL PRIMARY KEY,
+                order_id INTEGER,
+                municipal_case_id INTEGER,
+                conversation_id INTEGER NOT NULL,
+                event_type VARCHAR(64) NOT NULL,
+                message_text TEXT NOT NULL,
+                delivered_at DATETIME,
+                created_at DATETIME NOT NULL,
+                FOREIGN KEY(order_id) REFERENCES customer_order (id) ON DELETE CASCADE,
+                FOREIGN KEY(municipal_case_id) REFERENCES municipal_case (id) ON DELETE CASCADE,
+                FOREIGN KEY(conversation_id) REFERENCES conversation (id) ON DELETE CASCADE,
+                CONSTRAINT uq_outbound_notification_order_event UNIQUE (order_id, event_type),
+                CONSTRAINT uq_outbound_notification_case_event UNIQUE (municipal_case_id, event_type)
+            )
+            """
+        )
+    )
+    connection.execute(
+        text(
+            """
+            INSERT INTO outbound_notification (
+                id,
+                order_id,
+                municipal_case_id,
+                conversation_id,
+                event_type,
+                message_text,
+                delivered_at,
+                created_at
+            )
+            SELECT
+                id,
+                order_id,
+                NULL,
+                conversation_id,
+                event_type,
+                message_text,
+                delivered_at,
+                created_at
+            FROM outbound_notification_legacy
+            """
+        )
+    )
+    connection.execute(text("DROP TABLE outbound_notification_legacy"))
 
 
 async def _build_unique_bootstrap_slug(

@@ -435,10 +435,17 @@ class OutboundNotification(Base):
     """One outbound notification queued for delivery on a conversation channel."""
 
     __tablename__ = "outbound_notification"
-    __table_args__ = (UniqueConstraint("order_id", "event_type", name="uq_outbound_notification_order_event"),)
+    __table_args__ = (
+        UniqueConstraint("order_id", "event_type", name="uq_outbound_notification_order_event"),
+        UniqueConstraint("municipal_case_id", "event_type", name="uq_outbound_notification_case_event"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    order_id: Mapped[int] = mapped_column(ForeignKey("customer_order.id", ondelete="CASCADE"))
+    order_id: Mapped[int | None] = mapped_column(ForeignKey("customer_order.id", ondelete="CASCADE"), nullable=True)
+    municipal_case_id: Mapped[int | None] = mapped_column(
+        ForeignKey("municipal_case.id", ondelete="CASCADE"),
+        nullable=True,
+    )
     conversation_id: Mapped[int] = mapped_column(ForeignKey("conversation.id", ondelete="CASCADE"))
     event_type: Mapped[str] = mapped_column(String(length=64))
     message_text: Mapped[str] = mapped_column(Text())

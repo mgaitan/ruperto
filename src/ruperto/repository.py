@@ -32,6 +32,7 @@ from ruperto.models import (
     MunicipalCaseDraft,
     MunicipalCaseStatus,
     MunicipalCategory,
+    MunicipalRequestKind,
     Order,
     OrderItem,
     OrderStatus,
@@ -110,6 +111,14 @@ READY_NOTIFICATION_EVENT_BY_STATUS = {
     OrderStatus.ALMOST_READY: "order_almost_ready",
     OrderStatus.READY_FOR_PICKUP: "order_ready",
     OrderStatus.OUT_FOR_DELIVERY: "order_out_for_delivery",
+}
+MUNICIPAL_NOTIFICATION_EVENT_BY_STATUS = {
+    MunicipalCaseStatus.TRIAGED: "municipal_case_triaged",
+    MunicipalCaseStatus.IN_PROGRESS: "municipal_case_in_progress",
+    MunicipalCaseStatus.BLOCKED: "municipal_case_blocked",
+    MunicipalCaseStatus.RESOLVED: "municipal_case_resolved",
+    MunicipalCaseStatus.CLOSED: "municipal_case_closed",
+    MunicipalCaseStatus.CANCELLED: "municipal_case_cancelled",
 }
 STORE_MEMBERSHIP_NOT_FOUND_MESSAGE = "Store membership not found."
 STORE_HOURS_SLOT_REQUIRES_BOTH_TIMES_MESSAGE = "Each business-hours slot requires both open and close times."
@@ -1131,9 +1140,11 @@ class BusinessRepository:
         row = await self.session.get(MunicipalCase, case_id)
         if row is None:
             raise MunicipalCaseNotFoundError
+        previous_status = row.status
         row.status = payload.status
         row.updated_at = utc_now()
         await self.session.flush()
+        await self._queue_municipal_status_notification_if_needed(row, previous_status=previous_status)
         return self._municipal_case_snapshot(row)
 
     async def assign_municipal_case(
@@ -1296,6 +1307,7 @@ class BusinessRepository:
             OutboundNotificationSnapshot(
                 id=row.id,
                 order_id=row.order_id,
+                municipal_case_id=row.municipal_case_id,
                 conversation_id=row.conversation_id,
                 event_type=row.event_type,
                 message_text=row.message_text,
@@ -1324,6 +1336,24 @@ class BusinessRepository:
             select(Conversation.id, Conversation.channel, Conversation.store_id, Conversation.external_id)
             .join(Order, Order.conversation_id == Conversation.id)
             .where(Order.id == order_id)
+        )
+        target = row.one_or_none()
+        if target is None:
+            return None
+        conversation_id, channel, store_id, external_id = target
+        return ConversationTargetSnapshot(
+            conversation_id=conversation_id,
+            channel=channel,
+            store_id=store_id,
+            external_id=external_id,
+        )
+
+    async def get_municipal_case_conversation_target(self, case_id: int) -> ConversationTargetSnapshot | None:
+        """Return the outbound conversation target for one municipal case when available."""
+        row = await self.session.execute(
+            select(Conversation.id, Conversation.channel, Conversation.store_id, Conversation.external_id)
+            .join(MunicipalCase, MunicipalCase.conversation_id == Conversation.id)
+            .where(MunicipalCase.id == case_id)
         )
         target = row.one_or_none()
         if target is None:
@@ -1853,6 +1883,40 @@ class BusinessRepository:
         )
         await self.session.flush()
 
+    async def _queue_municipal_status_notification_if_needed(
+        self,
+        case: MunicipalCase,
+        *,
+        previous_status: MunicipalCaseStatus,
+    ) -> None:
+        """Queue one outbound notification when a municipal case reaches a citizen-facing status."""
+        if previous_status == case.status:
+            return
+        event_type = MUNICIPAL_NOTIFICATION_EVENT_BY_STATUS.get(case.status)
+        if event_type is None:
+            return
+        existing = await self.session.scalar(
+            select(OutboundNotification).where(
+                OutboundNotification.municipal_case_id == case.id,
+                OutboundNotification.event_type == event_type,
+            )
+        )
+        if existing is not None:
+            return
+        if case.conversation_id is None:
+            return
+        category = None if case.category_id is None else await self.session.get(MunicipalCategory, case.category_id)
+        self.session.add(
+            OutboundNotification(
+                order_id=None,
+                municipal_case_id=case.id,
+                conversation_id=case.conversation_id,
+                event_type=event_type,
+                message_text=self._build_municipal_status_notification_text(case, category=category),
+            )
+        )
+        await self.session.flush()
+
     def _as_utc_datetime(self, value: datetime | None) -> datetime | None:
         """Normalize SQLite-loaded timestamps into aware UTC datetimes."""
         if value is None:
@@ -1868,6 +1932,26 @@ class BusinessRepository:
         if order.status == OrderStatus.OUT_FOR_DELIVERY:
             return "Tu pedido ya salió y va en camino 🚚"
         return "Tu pedido ya está listo para retirar 🙌"
+
+    def _build_municipal_status_notification_text(
+        self,
+        case: MunicipalCase,
+        *,
+        category: MunicipalCategory | None,
+    ) -> str:
+        """Build the outbound message shown when a municipal case reaches a citizen-facing status."""
+        noun = "solicitud" if category and category.request_kind == MunicipalRequestKind.REQUEST else "reclamo"
+        if case.status == MunicipalCaseStatus.TRIAGED:
+            return f"Tu {noun} #{case.id} ya está en revisión 👀"
+        if case.status == MunicipalCaseStatus.IN_PROGRESS:
+            return f"Tu {noun} #{case.id} ya está en gestión 🛠️"
+        if case.status == MunicipalCaseStatus.BLOCKED:
+            return f"Tu {noun} #{case.id} quedó bloqueado por el momento."
+        if case.status == MunicipalCaseStatus.RESOLVED:
+            return f"Tu {noun} #{case.id} fue resuelto ✅"
+        if case.status == MunicipalCaseStatus.CLOSED:
+            return f"Tu {noun} #{case.id} fue cerrado."
+        return f"Tu {noun} #{case.id} fue cancelado."
 
     def _estimate_delay_from_snapshot(
         self,

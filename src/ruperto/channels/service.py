@@ -194,3 +194,26 @@ async def deliver_order_notifications(
         channel=target.channel,
         external_user_id=target.external_id,
     )
+
+
+async def deliver_municipal_case_notifications(
+    *,
+    session_factory: SessionFactory,
+    settings: Settings,
+    case_id: int,
+) -> int:
+    """Deliver queued notifications for the conversation attached to one municipal case."""
+    async with session_factory() as session:
+        repository = BusinessRepository(session)
+        target = await repository.get_municipal_case_conversation_target(case_id)
+
+    if target is None:
+        return 0
+
+    return await deliver_pending_notifications(
+        session_factory=session_factory,
+        settings=settings,
+        store_id=target.store_id,
+        channel=target.channel,
+        external_user_id=target.external_id,
+    )

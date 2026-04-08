@@ -327,6 +327,8 @@ class DevNotificationPollRequest(BaseModel):
     """Query payload used to fetch pending demo notifications."""
 
     external_user_id: str = Field(min_length=1)
+    phone_number: str | None = None
+    use_phone_identity: bool = False
 
 
 class OrderStatusUpdateRequest(BaseModel):

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ruperto.channels.base import ChannelDeliveryError
+from ruperto.channels.service import deliver_municipal_case_notifications
 from ruperto.dashboard_utils import load_dashboard_identity
 from ruperto.models import MunicipalCaseStatus
 from ruperto.repository import BusinessRepository, MunicipalCaseNotFoundError
@@ -63,4 +67,11 @@ async def update_case_status(
         except MunicipalCaseNotFoundError as error:
             raise HTTPException(status_code=404, detail="Municipal case not found.") from error
         await session.commit()
-        return updated_case
+    runtime = request.app.state.runtime
+    with suppress(ChannelDeliveryError):
+        await deliver_municipal_case_notifications(
+            session_factory=runtime.database.session_factory,
+            settings=runtime.settings,
+            case_id=case_id,
+        )
+    return updated_case
