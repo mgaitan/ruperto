@@ -42,7 +42,12 @@ from ruperto.models import (
     StaffRole,
     StoreVertical,
 )
-from ruperto.repository import BusinessRepository, MunicipalAreaNotFoundError, OrderNotFoundError
+from ruperto.repository import (
+    BusinessRepository,
+    MunicipalAreaNotFoundError,
+    OrderNotFoundError,
+    normalize_phone_number,
+)
 from ruperto.schemas import (
     AssistantTurnResult,
     CustomerSnapshot,
@@ -464,6 +469,13 @@ def demo_chat_page_context(*, request: Request, store: StoreProfileSnapshot) -> 
             "random_profile_ready_text": "Persona demo aleatoria lista para usar.",
             "profile_active_text": "Persona demo activa.",
             "profile_removed_text": "Persona demo eliminada.",
+            "phone_identity_label": "Simular identidad por teléfono",
+            "phone_identity_hint": (
+                "Cuando está activo, este demo usa el teléfono como identidad estable, "
+                "como si el mensaje llegara por WhatsApp."
+            ),
+            "phone_identity_on_text": "Identidad por teléfono activa.",
+            "phone_identity_off_text": "Identidad por perfil activa.",
         }
     else:
         demo_prompts = [
@@ -487,6 +499,13 @@ def demo_chat_page_context(*, request: Request, store: StoreProfileSnapshot) -> 
             "random_profile_ready_text": "Cliente demo aleatorio listo para usar.",
             "profile_active_text": "Cliente demo activo.",
             "profile_removed_text": "Cliente demo eliminado.",
+            "phone_identity_label": "Simular identidad por teléfono",
+            "phone_identity_hint": (
+                "Cuando está activo, este demo usa el teléfono como identidad estable, "
+                "como si el mensaje llegara por WhatsApp."
+            ),
+            "phone_identity_on_text": "Identidad por teléfono activa.",
+            "phone_identity_off_text": "Identidad por perfil activa.",
         }
     return {
         "request": request,
@@ -535,6 +554,18 @@ def dashboard_store_scope_note(memberships: list[StoreMembershipSnapshot]) -> st
 def build_scoped_dev_external_user_id(*, store_slug: str, external_user_id: str) -> str:
     """Namespace one dev-chat identity under the public tenant slug."""
     return f"{store_slug}:{external_user_id.strip()}"
+
+
+def resolve_dev_demo_identity(
+    *,
+    external_user_id: str,
+    phone_number: str | None,
+    use_phone_identity: bool,
+) -> str:
+    """Resolve the dev-chat identity, optionally using the normalized phone number."""
+    if not use_phone_identity:
+        return external_user_id.strip()
+    return normalize_phone_number(phone_number) or external_user_id.strip()
 
 
 async def get_store_profile_by_slug_or_404(*, request: Request, store_slug: str) -> StoreProfileSnapshot:
@@ -1695,13 +1726,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
     @app.post("/api/dev/messages", response_model=AssistantTurnResult)
     async def post_dev_message(request: Request, payload: DevMessageRequest) -> AssistantTurnResult:
         runtime = get_runtime(request)
+        resolved_external_user_id = resolve_dev_demo_identity(
+            external_user_id=payload.external_user_id,
+            phone_number=payload.phone_number,
+            use_phone_identity=payload.use_phone_identity,
+        )
         return await handle_inbound_customer_message(
             session_factory=runtime.database.session_factory,
             settings=runtime.settings,
             inbound_message=InboundCustomerMessage(
                 channel=Channel.DEV,
-                external_user_id=payload.external_user_id,
+                external_user_id=resolved_external_user_id,
                 message_text=payload.message_text,
+                metadata={"phone_number": payload.phone_number} if payload.phone_number else {},
             ),
         )
 
@@ -1713,6 +1750,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
     ) -> AssistantTurnResult:
         runtime = get_runtime(request)
         store = await get_store_profile_by_slug_or_404(request=request, store_slug=store_slug)
+        resolved_external_user_id = resolve_dev_demo_identity(
+            external_user_id=payload.external_user_id,
+            phone_number=payload.phone_number,
+            use_phone_identity=payload.use_phone_identity,
+        )
         return await handle_inbound_customer_message(
             session_factory=runtime.database.session_factory,
             settings=runtime.settings,
@@ -1720,9 +1762,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
                 channel=Channel.DEV,
                 external_user_id=build_scoped_dev_external_user_id(
                     store_slug=store.slug,
-                    external_user_id=payload.external_user_id,
+                    external_user_id=resolved_external_user_id,
                 ),
                 message_text=payload.message_text,
+                metadata={"phone_number": payload.phone_number} if payload.phone_number else {},
             ),
             store_id=store.id,
         )
@@ -1731,14 +1774,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
     async def get_dev_notifications(
         request: Request,
         external_user_id: str,
+        phone_number: str | None = None,
+        use_phone_identity: bool = False,
     ) -> list[OutboundNotificationSnapshot]:
         runtime = get_runtime(request)
-        payload = DevNotificationPollRequest.model_validate({"external_user_id": external_user_id})
+        payload = DevNotificationPollRequest.model_validate(
+            {
+                "external_user_id": external_user_id,
+                "phone_number": phone_number,
+                "use_phone_identity": use_phone_identity,
+            }
+        )
+        resolved_external_user_id = resolve_dev_demo_identity(
+            external_user_id=payload.external_user_id,
+            phone_number=payload.phone_number,
+            use_phone_identity=payload.use_phone_identity,
+        )
         async with runtime.database.session_factory() as session:
             repository = BusinessRepository(session)
             notifications = await repository.list_pending_notifications(
                 channel=Channel.DEV,
-                external_id=payload.external_user_id,
+                external_id=resolved_external_user_id,
             )
             await session.commit()
             return notifications
@@ -1748,17 +1804,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
         request: Request,
         store_slug: str,
         external_user_id: str,
+        phone_number: str | None = None,
+        use_phone_identity: bool = False,
     ) -> list[OutboundNotificationSnapshot]:
         runtime = get_runtime(request)
         store = await get_store_profile_by_slug_or_404(request=request, store_slug=store_slug)
-        payload = DevNotificationPollRequest.model_validate({"external_user_id": external_user_id})
+        payload = DevNotificationPollRequest.model_validate(
+            {
+                "external_user_id": external_user_id,
+                "phone_number": phone_number,
+                "use_phone_identity": use_phone_identity,
+            }
+        )
+        resolved_external_user_id = resolve_dev_demo_identity(
+            external_user_id=payload.external_user_id,
+            phone_number=payload.phone_number,
+            use_phone_identity=payload.use_phone_identity,
+        )
         async with runtime.database.session_factory() as session:
             repository = BusinessRepository(session)
             notifications = await repository.list_pending_notifications(
                 channel=Channel.DEV,
                 external_id=build_scoped_dev_external_user_id(
                     store_slug=store.slug,
-                    external_user_id=payload.external_user_id,
+                    external_user_id=resolved_external_user_id,
                 ),
             )
             await session.commit()

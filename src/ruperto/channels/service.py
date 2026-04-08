@@ -91,13 +91,16 @@ async def seed_customer_name_from_inbound_message(
     """Persist a channel-provided customer name when the customer is still unnamed."""
     if not inbound_message.sender_name:
         return
+    metadata_phone_number = inbound_message.metadata.get("phone_number")
+    phone_number = metadata_phone_number if isinstance(metadata_phone_number, str) else None
     async with session_factory() as session:
         repository = BusinessRepository(session)
         customer = await repository.get_or_create_customer(
             channel=inbound_message.channel,
             external_id=inbound_message.external_user_id,
             store_id=store_id,
-            phone_number=inbound_message.external_user_id if inbound_message.channel == Channel.WHATSAPP else None,
+            phone_number=phone_number
+            or (inbound_message.external_user_id if inbound_message.channel == Channel.WHATSAPP else None),
         )
         if customer.name:
             return

@@ -20,7 +20,9 @@ from ruperto.models import (
     ChannelProvider,
     DeliveryType,
     MenuItem,
+    MunicipalCase,
     MunicipalCaseStatus,
+    MunicipalCategory,
     MunicipalRequestKind,
     Order,
     OrderStatus,
@@ -1206,6 +1208,122 @@ async def test_legacy_municipal_categories_gain_request_kind_column(tmp_path: Pa
     assert migrated_row == ("request",)
 
 
+async def test_legacy_outbound_notifications_gain_municipal_case_support(tmp_path: Path):
+    """Legacy outbound notifications are migrated to the polymorphic notification table."""
+    database_path = tmp_path / "legacy-outbound-notification.db"
+    sync_engine = create_engine(f"sqlite:///{database_path}")
+    with sync_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE store_profile (
+                    id INTEGER PRIMARY KEY,
+                    slug VARCHAR(120),
+                    store_name VARCHAR(120),
+                    bot_name VARCHAR(120),
+                    store_location VARCHAR(255),
+                    store_description VARCHAR(500),
+                    assistant_personality VARCHAR(255),
+                    locale VARCHAR(32),
+                    currency_code VARCHAR(8),
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE customer (
+                    id INTEGER PRIMARY KEY,
+                    store_id INTEGER,
+                    name VARCHAR(120),
+                    phone_number VARCHAR(32),
+                    default_address VARCHAR(255),
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE conversation (
+                    id INTEGER PRIMARY KEY,
+                    channel VARCHAR(32),
+                    external_id VARCHAR(120),
+                    customer_id INTEGER,
+                    store_id INTEGER,
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE customer_order (
+                    id INTEGER PRIMARY KEY,
+                    customer_id INTEGER NOT NULL,
+                    conversation_id INTEGER,
+                    status VARCHAR(32) NOT NULL,
+                    delivery_type VARCHAR(32),
+                    delivery_address VARCHAR(255),
+                    payment_method VARCHAR(32),
+                    total_amount_cents INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE outbound_notification (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    order_id INTEGER NOT NULL,
+                    conversation_id INTEGER NOT NULL,
+                    event_type VARCHAR(64) NOT NULL,
+                    message_text TEXT NOT NULL,
+                    delivered_at DATETIME,
+                    created_at DATETIME NOT NULL,
+                    CONSTRAINT uq_outbound_notification_order_event UNIQUE (order_id, event_type)
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO outbound_notification (
+                    id, order_id, conversation_id, event_type, message_text, delivered_at, created_at
+                ) VALUES (
+                    1, 7, 3, 'order_ready', 'Tu pedido ya está listo para retirar 🙌', NULL, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        _ensure_schema_columns(connection)
+    sync_engine.dispose()
+
+    with sqlite3.connect(database_path) as sqlite_connection:
+        columns = {row[1] for row in sqlite_connection.execute("PRAGMA table_info(outbound_notification)")}
+        migrated_row = sqlite_connection.execute(
+            """
+            SELECT order_id, municipal_case_id, conversation_id, event_type
+            FROM outbound_notification
+            WHERE id = 1
+            """
+        ).fetchone()
+
+    assert "municipal_case_id" in columns
+    assert migrated_row == (7, None, 3, "order_ready")
+
+
 async def test_legacy_customer_tables_gain_store_id_columns(tmp_path: Path):
     """Legacy customer tables are backfilled with the default store id during bootstrap."""
     database_path = tmp_path / "legacy-customer-tenancy.db"
@@ -1663,6 +1781,69 @@ async def test_update_order_status_queues_automatic_notifications(tmp_path: Path
     await close_repository(repository, runtime)
 
 
+async def test_update_municipal_case_status_queues_automatic_notifications(tmp_path: Path):
+    """Citizen-facing municipal status changes queue one outbound message for the conversation."""
+    repository, runtime = await build_municipal_repository(tmp_path)
+    store = await repository.get_store_profile()
+    customer = await repository.get_or_create_customer(
+        channel=Channel.DEV,
+        external_id="municipal-notify",
+        store_id=store.id,
+    )
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="municipal-notify",
+        customer_id=customer.id,
+        store_id=store.id,
+    )
+    water_area = next(
+        area for area in await repository.list_municipal_areas(store_id=store.id) if area.name == "Solicitud de agua"
+    )
+    water_category = next(
+        category
+        for category in await repository.list_municipal_categories(store_id=store.id, area_id=water_area.id)
+        if category.name == "Falta de agua"
+    )
+    created = await repository.create_municipal_case(
+        store_id=store.id,
+        payload=MunicipalCaseCreateRequest(
+            area_id=water_area.id,
+            category_id=water_category.id,
+            customer_id=customer.id,
+            conversation_id=conversation.id,
+            title="Sin agua en casa",
+            description="No sale agua desde ayer.",
+        ),
+    )
+
+    triaged = await repository.update_municipal_case_status(
+        created.id,
+        MunicipalCaseStatusUpdateRequest(status=MunicipalCaseStatus.TRIAGED),
+    )
+    resolved = await repository.update_municipal_case_status(
+        created.id,
+        MunicipalCaseStatusUpdateRequest(status=MunicipalCaseStatus.RESOLVED),
+    )
+    first_poll = await repository.list_pending_notifications(channel=Channel.DEV, external_id="municipal-notify")
+    second_poll = await repository.list_pending_notifications(channel=Channel.DEV, external_id="municipal-notify")
+
+    assert triaged.status == MunicipalCaseStatus.TRIAGED
+    assert resolved.status == MunicipalCaseStatus.RESOLVED
+    assert [notification.event_type for notification in first_poll] == [
+        "municipal_case_triaged",
+        "municipal_case_resolved",
+    ]
+    assert [notification.order_id for notification in first_poll] == [None, None]
+    assert [notification.municipal_case_id for notification in first_poll] == [created.id, created.id]
+    assert [notification.message_text for notification in first_poll] == [
+        f"Tu solicitud #{created.id} ya está en revisión 👀",
+        f"Tu solicitud #{created.id} fue resuelto ✅",
+    ]
+    assert second_poll == []
+
+    await close_repository(repository, runtime)
+
+
 async def test_set_order_notify_when_ready_handles_new_draft_and_latest_order(tmp_path: Path):
     """The notification preference can be set before ordering, on a draft, or on the latest confirmed order."""
     repository, runtime = await build_repository(tmp_path)
@@ -1753,6 +1934,114 @@ async def test_notification_queue_helper_covers_early_return_branches(tmp_path: 
     notifications = await repository.list_pending_notifications(channel=Channel.DEV, external_id="notify-helper-user")
     assert notifications_in_db == 1
     assert [notification.event_type for notification in notifications] == ["order_almost_ready"]
+
+    await close_repository(repository, runtime)
+
+
+async def test_municipal_notification_queue_helper_covers_early_return_branches(tmp_path: Path):
+    """Municipal notifications skip unchanged, duplicate, unmapped, and orphaned cases."""
+    repository, runtime = await build_municipal_repository(tmp_path)
+    store = await repository.get_store_profile()
+    customer = await repository.get_or_create_customer(
+        channel=Channel.DEV,
+        external_id="municipal-helper",
+        store_id=store.id,
+    )
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="municipal-helper",
+        customer_id=customer.id,
+        store_id=store.id,
+    )
+    lighting_area = next(
+        area for area in await repository.list_municipal_areas(store_id=store.id) if area.name == "Alumbrado público"
+    )
+    lighting_category = next(
+        category
+        for category in await repository.list_municipal_categories(store_id=store.id, area_id=lighting_area.id)
+        if category.name == "Lámpara apagada"
+    )
+    duplicate_case = await repository.create_municipal_case(
+        store_id=store.id,
+        payload=MunicipalCaseCreateRequest(
+            area_id=lighting_area.id,
+            category_id=lighting_category.id,
+            customer_id=customer.id,
+            conversation_id=conversation.id,
+            title="Farola caída",
+            description="No prende de noche.",
+        ),
+    )
+    orphaned_case = await repository.create_municipal_case(
+        store_id=store.id,
+        payload=MunicipalCaseCreateRequest(
+            area_id=lighting_area.id,
+            category_id=lighting_category.id,
+            customer_id=customer.id,
+            conversation_id=None,
+            title="Poste roto",
+            description="Se inclinó después del viento.",
+        ),
+    )
+
+    duplicate_case_record = await repository.session.get(MunicipalCase, duplicate_case.id)
+    orphaned_case_record = await repository.session.get(MunicipalCase, orphaned_case.id)
+    lighting_category_record = await repository.session.get(MunicipalCategory, lighting_category.id)
+    assert duplicate_case_record is not None
+    assert orphaned_case_record is not None
+    assert lighting_category_record is not None
+
+    await repository._queue_municipal_status_notification_if_needed(
+        duplicate_case_record,
+        previous_status=MunicipalCaseStatus.TRIAGED,
+    )
+    duplicate_case_record.status = MunicipalCaseStatus.TRIAGED
+    await repository._queue_municipal_status_notification_if_needed(
+        duplicate_case_record,
+        previous_status=MunicipalCaseStatus.NEW,
+    )
+    await repository._queue_municipal_status_notification_if_needed(
+        duplicate_case_record,
+        previous_status=MunicipalCaseStatus.NEW,
+    )
+    orphaned_case_record.status = MunicipalCaseStatus.BLOCKED
+    await repository._queue_municipal_status_notification_if_needed(
+        orphaned_case_record,
+        previous_status=MunicipalCaseStatus.IN_PROGRESS,
+    )
+
+    duplicate_case_record.status = MunicipalCaseStatus.NEW
+    await repository._queue_municipal_status_notification_if_needed(
+        duplicate_case_record,
+        previous_status=MunicipalCaseStatus.NEW,
+    )
+    duplicate_case_record.status = MunicipalCaseStatus.TRIAGED
+    assert (
+        repository._build_municipal_status_notification_text(duplicate_case_record, category=lighting_category_record)
+        == f"Tu reclamo #{duplicate_case.id} ya está en revisión 👀"
+    )
+    duplicate_case_record.status = MunicipalCaseStatus.CLOSED
+    assert (
+        repository._build_municipal_status_notification_text(duplicate_case_record, category=lighting_category_record)
+        == f"Tu reclamo #{duplicate_case.id} fue cerrado."
+    )
+    duplicate_case_record.status = MunicipalCaseStatus.IN_PROGRESS
+    assert (
+        repository._build_municipal_status_notification_text(duplicate_case_record, category=lighting_category_record)
+        == f"Tu reclamo #{duplicate_case.id} ya está en gestión 🛠️"
+    )
+    orphaned_case_record.status = MunicipalCaseStatus.CANCELLED
+    assert (
+        repository._build_municipal_status_notification_text(orphaned_case_record, category=lighting_category_record)
+        == f"Tu reclamo #{orphaned_case.id} fue cancelado."
+    )
+    duplicate_case_record.status = MunicipalCaseStatus.BLOCKED
+    assert (
+        repository._build_municipal_status_notification_text(duplicate_case_record, category=lighting_category_record)
+        == f"Tu reclamo #{duplicate_case.id} quedó bloqueado por el momento."
+    )
+    notifications = await repository.list_pending_notifications(channel=Channel.DEV, external_id="municipal-helper")
+    assert [notification.event_type for notification in notifications] == ["municipal_case_triaged"]
 
     await close_repository(repository, runtime)
 
@@ -2402,6 +2691,26 @@ async def test_get_customer_and_list_customers_roundtrip(tmp_path: Path):
 
     assert loaded.id == first.id
     assert {customer.id for customer in customers} >= {first.id, second.id}
+
+    await close_repository(repository, runtime)
+
+
+async def test_dev_identity_can_reuse_a_whatsapp_customer_by_phone_number(tmp_path: Path):
+    """One demo session can attach to an existing WhatsApp customer when the phone matches."""
+    repository, runtime = await build_repository(tmp_path)
+    whatsapp_customer = await repository.get_or_create_customer(
+        channel=Channel.WHATSAPP,
+        external_id="+543515557788",
+        phone_number="+54 351 555 7788",
+    )
+    same_customer = await repository.get_or_create_customer(
+        channel=Channel.DEV,
+        external_id="mi-muni:+543515557788",
+        phone_number="+54 351 555 7788",
+    )
+
+    assert same_customer.id == whatsapp_customer.id
+    assert same_customer.phone_number == "+543515557788"
 
     await close_repository(repository, runtime)
 

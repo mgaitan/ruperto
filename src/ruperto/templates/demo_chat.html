@@ -113,6 +113,24 @@
                                 {{ demo_chat_copy.add_profile_button }}
                             </button>
                         </form>
+                        <label
+                            class="mt-4 flex items-start gap-3 rounded-[1.4rem] border border-slate-200 bg-mist px-4 py-3 text-sm text-slate-700"
+                        >
+                            <input
+                                class="mt-1 h-4 w-4 rounded border-slate-300 text-ember focus:ring-ember"
+                                type="checkbox"
+                                checked
+                                data-phone-identity-toggle
+                            />
+                            <span>
+                                <span class="block font-semibold">
+                                    {{ demo_chat_copy.phone_identity_label }}
+                                </span>
+                                <span class="mt-1 block text-slate-500">
+                                    {{ demo_chat_copy.phone_identity_hint }}
+                                </span>
+                            </span>
+                        </label>
                         <button
                             class="mt-3 w-full rounded-full border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-700 transition hover:border-ember hover:text-ember"
                             type="button"
@@ -255,6 +273,8 @@
                 );
                 const profileStorageKey = "ruperto-demo-chat-profiles";
                 const activeProfileKey = "ruperto-demo-chat-active-profile";
+                const phoneIdentityModeKey =
+                    "ruperto-demo-chat-use-phone-identity";
                 const historyKeyPrefix = "ruperto-demo-chat-history:";
 
                 const profileForm = document.querySelector(
@@ -280,6 +300,9 @@
                 const resetButton = document.querySelector("[data-reset-chat]");
                 const randomProfileButton = document.querySelector(
                     "[data-random-profile]",
+                );
+                const phoneIdentityToggle = document.querySelector(
+                    "[data-phone-identity-toggle]",
                 );
 
                 if (
@@ -353,6 +376,15 @@
                     localStorage.getItem(activeProfileKey);
                 const saveActiveProfileId = (id) =>
                     localStorage.setItem(activeProfileKey, id);
+                const loadPhoneIdentityMode = () => {
+                    const stored = localStorage.getItem(phoneIdentityModeKey);
+                    return stored === null ? true : stored === "true";
+                };
+                const savePhoneIdentityMode = (enabled) =>
+                    localStorage.setItem(
+                        phoneIdentityModeKey,
+                        String(enabled),
+                    );
 
                 const loadHistory = (profileId) => {
                     const stored = localStorage.getItem(
@@ -457,12 +489,20 @@
                     saveHistory(profileId, history);
                 };
 
+                const resolveExternalUserId = (profile) => {
+                    if (!profile) return "";
+                    if (loadPhoneIdentityMode()) {
+                        return slugifyPhone(profile.phone);
+                    }
+                    return `demo-phone:${profile.id}`;
+                };
+
                 const fetchPendingNotifications = async () => {
                     const activeProfile = getActiveProfile();
                     if (!activeProfile) return;
 
                     const response = await fetch(
-                        `${config.notificationsApiPath}?external_user_id=${encodeURIComponent(`demo-phone:${activeProfile.id}`)}`,
+                        `${config.notificationsApiPath}?external_user_id=${encodeURIComponent(resolveExternalUserId(activeProfile))}&phone_number=${encodeURIComponent(activeProfile.phone)}&use_phone_identity=${loadPhoneIdentityMode() ? "true" : "false"}`,
                     );
                     if (!response.ok) return;
                     const notifications = await response.json();
@@ -521,6 +561,14 @@
                     statusText.textContent =
                         config.copy.random_profile_ready_text;
                     renderProfiles();
+                });
+
+                phoneIdentityToggle.checked = loadPhoneIdentityMode();
+                phoneIdentityToggle.addEventListener("change", () => {
+                    savePhoneIdentityMode(phoneIdentityToggle.checked);
+                    statusText.textContent = phoneIdentityToggle.checked
+                        ? config.copy.phone_identity_on_text
+                        : config.copy.phone_identity_off_text;
                 });
 
                 profileList.addEventListener("click", (event) => {
@@ -594,8 +642,12 @@
                             method: "POST",
                             headers: { "Content-Type": "application/json" },
                             body: JSON.stringify({
-                                external_user_id: `demo-phone:${activeProfile.id}`,
+                                external_user_id:
+                                    resolveExternalUserId(activeProfile),
                                 message_text: message,
+                                phone_number: activeProfile.phone,
+                                use_phone_identity:
+                                    loadPhoneIdentityMode(),
                             }),
                         });
                         const rawBody = await response.text();

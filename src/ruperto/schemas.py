@@ -301,13 +301,16 @@ class DevMessageRequest(BaseModel):
 
     external_user_id: str = Field(min_length=1)
     message_text: str = Field(min_length=1)
+    phone_number: str | None = None
+    use_phone_identity: bool = False
 
 
 class OutboundNotificationSnapshot(BaseModel):
     """One queued outbound notification ready to be delivered to a client."""
 
     id: int
-    order_id: int
+    order_id: int | None
+    municipal_case_id: int | None
     conversation_id: int
     event_type: str
     message_text: str

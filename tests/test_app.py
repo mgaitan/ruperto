@@ -21,18 +21,34 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from sqlalchemy import select
 
 from ruperto.app import (
+    build_scoped_dev_external_user_id,
     create_app,
     extract_kapso_phone_number_id,
     format_dashboard_datetime,
     parse_store_hours_form,
+    resolve_dev_demo_identity,
     serialize_store_hours_for_dashboard,
 )
 from ruperto.config import Settings
 from ruperto.db import create_database_runtime, init_database
 from ruperto.mail import SignupEmailDeliveryError
-from ruperto.models import Channel, DeliveryType, OrderStatus, PaymentMethod, StaffRole, StoreMembership, StoreVertical
+from ruperto.models import (
+    Channel,
+    DeliveryType,
+    MunicipalCaseStatus,
+    OrderStatus,
+    PaymentMethod,
+    StaffRole,
+    StoreMembership,
+    StoreVertical,
+)
 from ruperto.repository import BusinessRepository
-from ruperto.schemas import AssistantTurnResult, StoreBusinessHoursSnapshot
+from ruperto.schemas import (
+    AssistantTurnResult,
+    MunicipalCaseCreateRequest,
+    MunicipalCaseStatusUpdateRequest,
+    StoreBusinessHoursSnapshot,
+)
 
 HTTP_OK = 200
 HTTP_NOT_FOUND = 404
@@ -189,6 +205,99 @@ async def create_whatsapp_confirmed_order(settings: Settings) -> int:
     return confirmed_order.id
 
 
+async def create_whatsapp_municipal_case(settings: Settings) -> int:
+    """Create one municipal WhatsApp case ready for status transitions."""
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        store = await repository.get_store_profile()
+        customer = await repository.get_or_create_customer(
+            channel=Channel.WHATSAPP,
+            external_id="+5493513308454",
+            phone_number="+5493513308454",
+            store_id=store.id,
+        )
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.WHATSAPP,
+            external_id="+5493513308454",
+            customer_id=customer.id,
+            store_id=store.id,
+        )
+        water_area = next(
+            area
+            for area in await repository.list_municipal_areas(store_id=store.id)
+            if area.name == "Solicitud de agua"
+        )
+        water_category = next(
+            category
+            for category in await repository.list_municipal_categories(store_id=store.id, area_id=water_area.id)
+            if category.name == "Falta de agua"
+        )
+        created_case = await repository.create_municipal_case(
+            store_id=store.id,
+            payload=MunicipalCaseCreateRequest(
+                area_id=water_area.id,
+                category_id=water_category.id,
+                customer_id=customer.id,
+                conversation_id=conversation.id,
+                title="Sin agua en barrio centro",
+                description="Hace un día que no hay agua.",
+            ),
+        )
+        await session.commit()
+    await runtime.engine.dispose()
+    return created_case.id
+
+
+async def create_dev_municipal_case(settings: Settings, *, external_user_id: str) -> int:
+    """Create one municipal dev-chat case ready for kanban notifications."""
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        store = await repository.get_store_profile()
+        scoped_external_user_id = build_scoped_dev_external_user_id(
+            store_slug=store.slug,
+            external_user_id=external_user_id,
+        )
+        customer = await repository.get_or_create_customer(
+            channel=Channel.DEV,
+            external_id=scoped_external_user_id,
+            store_id=store.id,
+        )
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.DEV,
+            external_id=scoped_external_user_id,
+            customer_id=customer.id,
+            store_id=store.id,
+        )
+        lighting_area = next(
+            area
+            for area in await repository.list_municipal_areas(store_id=store.id)
+            if area.name == "Alumbrado público"
+        )
+        lighting_category = next(
+            category
+            for category in await repository.list_municipal_categories(store_id=store.id, area_id=lighting_area.id)
+            if category.name == "Lámpara apagada"
+        )
+        created_case = await repository.create_municipal_case(
+            store_id=store.id,
+            payload=MunicipalCaseCreateRequest(
+                area_id=lighting_area.id,
+                category_id=lighting_category.id,
+                customer_id=customer.id,
+                conversation_id=conversation.id,
+                title="Farola sin luz",
+                description="La farola no prende desde anoche.",
+            ),
+        )
+        await session.commit()
+    await runtime.engine.dispose()
+    return created_case.id
+
+
 def test_root_endpoint(tmp_path: Path):
     """The root endpoint exposes basic service metadata."""
     app = create_app(build_settings(tmp_path))
@@ -255,6 +364,7 @@ def test_demo_chat_page_renders_the_browser_harness(tmp_path: Path):
     assert f"/api/dev/notifications/{settings.store_slug}" in response.text
     assert "Martín" in response.text
     assert "Crear cliente aleatorio" in response.text
+    assert "Simular identidad por teléfono" in response.text
 
 
 def test_home_signup_creates_ordering_tenant_and_logs_into_dashboard(tmp_path: Path):
@@ -521,8 +631,37 @@ def test_demo_chat_page_renders_municipal_prompts_per_slug(tmp_path: Path):
     assert "Personas demo" in response.text
     assert "Agregar persona demo" in response.text
     assert "Crear persona aleatoria" in response.text
+    assert "Simular identidad por teléfono" in response.text
     assert "Cliente demo" not in response.text
     assert "cliente demo" not in response.text
+
+
+def test_resolve_dev_demo_identity_prefers_phone_when_enabled():
+    """The browser demo can switch to a phone-based identity that mimics WhatsApp."""
+    assert (
+        resolve_dev_demo_identity(
+            external_user_id="demo-phone:abc",
+            phone_number="+54 351 555 7788",
+            use_phone_identity=True,
+        )
+        == "+543515557788"
+    )
+    assert (
+        resolve_dev_demo_identity(
+            external_user_id="demo-phone:abc",
+            phone_number="",
+            use_phone_identity=True,
+        )
+        == "demo-phone:abc"
+    )
+    assert (
+        resolve_dev_demo_identity(
+            external_user_id="demo-phone:abc",
+            phone_number="+54 351 555 7788",
+            use_phone_identity=False,
+        )
+        == "demo-phone:abc"
+    )
 
 
 def test_demo_chat_page_returns_not_found_for_unknown_slug(tmp_path: Path):
@@ -534,6 +673,44 @@ def test_demo_chat_page_returns_not_found_for_unknown_slug(tmp_path: Path):
 
     assert response.status_code == HTTP_NOT_FOUND
     assert response.json()["detail"] == "Store not found."
+
+
+def test_slug_scoped_demo_message_endpoint_can_use_phone_identity(tmp_path: Path, mocker):
+    """The store-scoped demo endpoint can mimic WhatsApp-style identity by phone number."""
+    settings = build_settings(tmp_path, store_slug="mi-muni")
+    app = create_app(settings)
+    fake_result = AssistantTurnResult.model_validate(
+        {
+            "conversation_id": 1,
+            "customer": {"id": 1, "name": "Tomas", "phone_number": "+543515557788", "default_address": None},
+            "reply": {"reply_text": "Hola", "next_step": "choose_items"},
+            "current_order": None,
+        }
+    )
+    handled_messages = []
+
+    async def fake_handle_inbound_customer_message(*, session_factory, settings, inbound_message, store_id=None):
+        handled_messages.append((inbound_message, store_id))
+        return fake_result
+
+    mocker.patch("ruperto.app.handle_inbound_customer_message", side_effect=fake_handle_inbound_customer_message)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/dev/messages/mi-muni",
+            json={
+                "external_user_id": "browser-tab-1",
+                "message_text": "Hola",
+                "phone_number": "+54 351 555 7788",
+                "use_phone_identity": True,
+            },
+        )
+
+    assert response.status_code == HTTP_OK
+    inbound_message, resolved_store_id = handled_messages[0]
+    assert inbound_message.external_user_id == "mi-muni:+543515557788"
+    assert inbound_message.metadata == {"phone_number": "+54 351 555 7788"}
+    assert resolved_store_id == 1
 
 
 def test_extract_kapso_phone_number_id_supports_direct_and_nested_payloads():
@@ -957,6 +1134,39 @@ def test_order_status_update_delivers_whatsapp_notifications(tmp_path: Path, moc
     assert sent_payloads == [{"to": "+5493513308454", "text": "Tu pedido ya casi está 👀"}]
 
 
+def test_municipal_case_status_update_delivers_whatsapp_notifications(tmp_path: Path, mocker):
+    """Municipal status changes dispatch queued notifications through the WhatsApp gateway."""
+    settings = build_settings(
+        tmp_path,
+        store_vertical=StoreVertical.MUNICIPAL,
+        store_slug="mi-muni",
+    ).model_copy(
+        update={
+            "kapso_api_key": SecretStr("kapso-key"),
+            "kapso_phone_number_id": "597907523413541",
+            "kapso_webhook_secret": SecretStr("kapso-secret"),
+        }
+    )
+    case_id = anyio.run(create_whatsapp_municipal_case, settings)
+    app = create_app(settings)
+    sent_payloads: list[dict[str, Any]] = []
+
+    async def fake_send_text(self, message):
+        sent_payloads.append({"to": message.external_user_id, "text": message.message_text})
+
+    mocker.patch("ruperto.channels.kapso_whatsapp.KapsoWhatsAppGateway.send_text", new=fake_send_text)
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        response = client.patch(
+            f"/api/kanban/municipal/cases/{case_id}/status",
+            json=MunicipalCaseStatusUpdateRequest(status=MunicipalCaseStatus.TRIAGED).model_dump(mode="json"),
+        )
+
+    assert response.status_code == HTTP_OK
+    assert sent_payloads == [{"to": "+5493513308454", "text": f"Tu solicitud #{case_id} ya está en revisión 👀"}]
+
+
 def test_dev_notifications_endpoint_returns_pending_messages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """The browser harness can poll queued status notifications for one demo client."""
     monkeypatch.setattr("ruperto.assistant.build_google_model", lambda settings: FunctionModel(dev_message_model))
@@ -1014,6 +1224,62 @@ def test_dev_notifications_endpoint_supports_slug_scoped_demo_routes(tmp_path: P
 
     assert poll_response.status_code == HTTP_OK
     assert [notification["event_type"] for notification in poll_response.json()] == ["order_almost_ready"]
+
+
+def test_municipal_dev_notifications_endpoint_returns_pending_messages(tmp_path: Path):
+    """Municipal kanban status changes can be polled from the slug-scoped demo chat."""
+    settings = build_settings(tmp_path, store_vertical=StoreVertical.MUNICIPAL, store_slug="mi-muni")
+    case_id = anyio.run(lambda: create_dev_municipal_case(settings, external_user_id="cli-user"))
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        status_response = client.patch(
+            f"/api/kanban/municipal/cases/{case_id}/status",
+            json=MunicipalCaseStatusUpdateRequest(status=MunicipalCaseStatus.RESOLVED).model_dump(mode="json"),
+        )
+        first_poll = client.get(
+            f"/api/dev/notifications/{settings.store_slug}",
+            params={"external_user_id": "cli-user"},
+        )
+        second_poll = client.get(
+            f"/api/dev/notifications/{settings.store_slug}",
+            params={"external_user_id": "cli-user"},
+        )
+
+    assert status_response.status_code == HTTP_OK
+    assert first_poll.status_code == HTTP_OK
+    assert [notification["event_type"] for notification in first_poll.json()] == ["municipal_case_resolved"]
+    assert [notification["municipal_case_id"] for notification in first_poll.json()] == [case_id]
+    assert second_poll.status_code == HTTP_OK
+    assert second_poll.json() == []
+
+
+def test_municipal_dev_notifications_endpoint_supports_phone_identity_mode(tmp_path: Path):
+    """The browser demo can poll municipal notifications using a WhatsApp-like phone identity."""
+    settings = build_settings(tmp_path, store_vertical=StoreVertical.MUNICIPAL, store_slug="mi-muni")
+    case_id = anyio.run(lambda: create_dev_municipal_case(settings, external_user_id="+543515557788"))
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        status_response = client.patch(
+            f"/api/kanban/municipal/cases/{case_id}/status",
+            json=MunicipalCaseStatusUpdateRequest(status=MunicipalCaseStatus.RESOLVED).model_dump(mode="json"),
+        )
+        poll_response = client.get(
+            f"/api/dev/notifications/{settings.store_slug}",
+            params={
+                "external_user_id": "browser-tab-1",
+                "phone_number": "+54 351 555 7788",
+                "use_phone_identity": "true",
+            },
+        )
+
+    assert status_response.status_code == HTTP_OK
+    assert poll_response.status_code == HTTP_OK
+    assert [notification["event_type"] for notification in poll_response.json()] == ["municipal_case_resolved"]
+    assert [notification["municipal_case_id"] for notification in poll_response.json()] == [case_id]
 
 
 def test_staff_update_order_status_returns_not_found_for_unknown_order(tmp_path: Path):
