@@ -215,6 +215,11 @@ If one dashboard user belongs to more than one store, the header lets staff
 switch the active store. That switch already scopes the editable store profile
 and weekly opening hours, which is the first visible step toward logical
 multi-tenancy in the dashboard.
+When the assistant decides a conversation needs a person, the backend now marks
+that conversation as waiting for a human. New customer messages stop receiving
+automatic bot replies, the dashboard customers page surfaces the handoff queue,
+and staff can answer from there using the same official WhatsApp connection
+owned by the active store. Releasing the handoff returns control to the bot.
 
 ## 4. Run quality checks
 

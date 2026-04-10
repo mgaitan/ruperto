@@ -25,6 +25,7 @@ from ruperto.api import kanban
 from ruperto.auth import normalize_email
 from ruperto.channels.base import ChannelDeliveryError, InboundCustomerMessage, OutboundCustomerMessage
 from ruperto.channels.service import (
+    build_store_channel_gateway,
     build_whatsapp_gateway_for_phone_number,
     deliver_order_notifications,
     handle_inbound_customer_message,
@@ -83,6 +84,8 @@ DASHBOARD_FLASH_MESSAGES = {
     "profile-updated": "Perfil del local actualizado.",
     "municipal-area-created": "Area creada.",
     "municipal-category-created": "Categoria creada.",
+    "handoff-released": "La conversación volvió al bot.",
+    "handoff-reply-sent": "La respuesta humana ya salió por el canal oficial.",
     "role-updated": "Rol actualizado.",
     "store-switched": "Local activo actualizado.",
 }
@@ -1099,6 +1102,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
             repository = BusinessRepository(session)
             store = await repository.get_store_profile(store_id=identity.active_store_id)
             customers = await repository.list_customers(limit=200, store_id=identity.active_store_id)
+            handoffs = await repository.list_active_conversation_handoffs(store_id=identity.active_store_id)
 
         filtered_customers = [
             customer for customer in customers if not query or matches_customer_query(customer, query)
@@ -1136,9 +1140,89 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
                     "personas encontradas" if store.vertical == StoreVertical.MUNICIPAL else "clientes encontrados"
                 ),
                 "results_count": len(filtered_customers),
+                "handoffs": handoffs,
+                "handoffs_title": (
+                    "Conversaciones derivadas"
+                    if store.vertical == StoreVertical.MUNICIPAL
+                    else "Conversaciones derivadas a atención humana"
+                ),
+                "handoffs_empty_message": "No hay conversaciones esperando atención humana.",
+                "handoffs_latest_message_label": (
+                    "Último mensaje de la persona"
+                    if store.vertical == StoreVertical.MUNICIPAL
+                    else "Último mensaje del cliente"
+                ),
+                "handoffs_reply_label": (
+                    "Responder desde el WhatsApp oficial"
+                    if store.vertical == StoreVertical.MUNICIPAL
+                    else "Responder desde el WhatsApp del local"
+                ),
             }
         )
         return TEMPLATES.TemplateResponse(request=request, name="dashboard_customers.html", context=context)
+
+    @app.post("/dashboard/handoffs/{conversation_id}/reply")
+    async def post_dashboard_handoff_reply(request: Request, conversation_id: int) -> RedirectResponse:
+        identity = await load_dashboard_identity(request)
+        if identity is None:
+            return dashboard_login_redirect(next_url="/dashboard/customers", flash="login-required")
+
+        form = await request.form()
+        message_text = str(form.get("message_text", "")).strip()
+        if not message_text:
+            raise HTTPException(status_code=422, detail="Reply text is required.")
+
+        runtime = get_runtime(request)
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            target = await repository.get_conversation_target(
+                conversation_id=conversation_id,
+                store_id=identity.active_store_id,
+            )
+            if target is None:
+                raise HTTPException(status_code=404, detail="Conversation not found.")
+            if not await repository.conversation_is_awaiting_human(conversation_id):
+                raise HTTPException(status_code=409, detail="Conversation is not waiting for a human.")
+
+        gateway = await build_store_channel_gateway(
+            session_factory=runtime.database.session_factory,
+            settings=runtime.settings,
+            store_id=identity.active_store_id,
+            channel=target.channel,
+        )
+        if gateway is None:
+            raise HTTPException(status_code=503, detail="Channel delivery is not configured.")
+        await gateway.send_text(
+            OutboundCustomerMessage(
+                channel=target.channel,
+                external_user_id=target.external_id,
+                message_text=message_text,
+            )
+        )
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            await repository.mark_handoff_operator_reply(conversation_id)
+            await session.commit()
+        return dashboard_redirect(path="/dashboard/customers", flash="handoff-reply-sent")
+
+    @app.post("/dashboard/handoffs/{conversation_id}/release")
+    async def post_dashboard_handoff_release(request: Request, conversation_id: int) -> RedirectResponse:
+        identity = await load_dashboard_identity(request)
+        if identity is None:
+            return dashboard_login_redirect(next_url="/dashboard/customers", flash="login-required")
+
+        runtime = get_runtime(request)
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            target = await repository.get_conversation_target(
+                conversation_id=conversation_id,
+                store_id=identity.active_store_id,
+            )
+            if target is None:
+                raise HTTPException(status_code=404, detail="Conversation not found.")
+            await repository.release_conversation_handoff(conversation_id)
+            await session.commit()
+        return dashboard_redirect(path="/dashboard/customers", flash="handoff-released")
 
     @app.get("/dashboard/kanban", response_class=HTMLResponse)
     async def read_dashboard_kanban(
@@ -1730,13 +1814,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
                 inbound_message=inbound_message,
                 store_id=store_id,
             )
-            await gateway.send_text(
-                OutboundCustomerMessage(
-                    channel=Channel.WHATSAPP,
-                    external_user_id=inbound_message.external_user_id,
-                    message_text=result.reply.reply_text,
+            if result.reply.reply_text.strip():
+                await gateway.send_text(
+                    OutboundCustomerMessage(
+                        channel=Channel.WHATSAPP,
+                        external_user_id=inbound_message.external_user_id,
+                        message_text=result.reply.reply_text,
+                    )
                 )
-            )
             handled += 1
 
         return {"status": "ok", "processed": handled}

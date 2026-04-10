@@ -54,6 +54,7 @@ from ruperto.schemas import (
     MunicipalCaseCreateRequest,
     MunicipalCaseStatusUpdateRequest,
     StoreBusinessHoursSnapshot,
+    StoreChannelConnectionUpdateRequest,
 )
 
 HTTP_OK = 200
@@ -69,6 +70,7 @@ MIN_MENU_ITEMS = 35
 DEFAULT_WEEKLY_HOURS = 7
 TENANT_STORE_ID = 7
 SMTP_PORT = 587
+HANDOFF_AUTO_REPLY_ERROR = "The bot should not send an automatic reply during human handoff."
 
 
 def build_settings(
@@ -302,6 +304,42 @@ async def create_dev_municipal_case(settings: Settings, *, external_user_id: str
         await session.commit()
     await runtime.engine.dispose()
     return created_case.id
+
+
+async def create_whatsapp_handoff_conversation(settings: Settings) -> int:
+    """Create one WhatsApp conversation already waiting for a human reply."""
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(
+            channel=Channel.WHATSAPP,
+            external_id="+5493513308454",
+            phone_number="+5493513308454",
+        )
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.WHATSAPP,
+            external_id="+5493513308454",
+            customer_id=customer.id,
+        )
+        await repository.update_store_channel_connection(
+            store_id=settings.default_store_id,
+            channel=Channel.WHATSAPP,
+            payload=StoreChannelConnectionUpdateRequest(
+                phone_number_id="597907523413541",
+                api_key="kapso-key",
+                webhook_secret="kapso-secret",
+                is_active=True,
+            ),
+        )
+        await repository.activate_conversation_handoff(
+            conversation_id=conversation.id,
+            reason="Te paso con una persona del equipo.",
+            latest_customer_message="Necesito hablar con alguien.",
+        )
+        await session.commit()
+    await runtime.engine.dispose()
+    return conversation.id
 
 
 def test_root_endpoint(tmp_path: Path):
@@ -754,6 +792,13 @@ def test_enrich_kapso_payload_from_headers_backfills_event_metadata():
     assert enriched_mapping["batch"] is True
 
 
+def test_enrich_kapso_payload_from_headers_leaves_non_mapping_payloads_unchanged():
+    """Header enrichment is a no-op for payloads that are not JSON objects."""
+    payload = ["not-a-dict"]
+
+    assert enrich_kapso_payload_from_headers(payload=payload, headers={"X-Webhook-Event": "ignored"}) == payload
+
+
 def test_kapso_webhook_requires_valid_signature(tmp_path: Path):
     """Kapso webhooks are rejected when the signature does not match."""
     settings = build_settings(tmp_path).model_copy(
@@ -982,6 +1027,93 @@ def test_kapso_webhook_processes_header_only_event_payloads(tmp_path: Path, mock
     assert response.json() == {"status": "ok", "processed": 1}
     assert handled_messages[0].external_user_id == "+5493513308454"
     assert sent_payloads == [{"to": "+5493513308454", "text": "Hola Pedro, ¿qué te gustaría pedir?"}]
+
+
+def test_kapso_webhook_skips_bot_reply_while_waiting_for_human(tmp_path: Path, mocker):
+    """WhatsApp turns stop auto-replying once the conversation was handed to a human."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "kapso_api_key": SecretStr("kapso-key"),
+            "kapso_phone_number_id": "597907523413541",
+            "kapso_webhook_secret": SecretStr("kapso-secret"),
+        }
+    )
+    conversation_id = anyio.run(lambda: create_whatsapp_handoff_conversation(settings))
+    app = create_app(settings)
+
+    async def fail_if_called(self, message):
+        raise AssertionError(HANDOFF_AUTO_REPLY_ERROR)
+
+    mocker.patch("ruperto.channels.kapso_whatsapp.KapsoWhatsAppGateway.send_text", new=fail_if_called)
+
+    payload = {
+        "message": {
+            "id": "wamid.123",
+            "from": "5493513308454",
+            "timestamp": "1730092800",
+            "type": "text",
+            "text": {"body": "¿Sigue alguien ahí?"},
+        },
+        "conversation": {
+            "id": "conv_123",
+            "phone_number": "+5493513308454",
+            "phone_number_id": "597907523413541",
+            "kapso": {"contact_name": "Pedro"},
+        },
+        "phone_number_id": "597907523413541",
+    }
+    raw_payload = json.dumps(payload).encode("utf-8")
+    signature = build_kapso_signature(payload=raw_payload, secret="kapso-secret")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhooks/whatsapp/kapso",
+            content=raw_payload,
+            headers={
+                "Content-Type": "application/json",
+                "X-Webhook-Signature": signature,
+                "X-Webhook-Event": "whatsapp.message.received",
+            },
+        )
+
+    assert response.status_code == HTTP_OK
+    assert response.json() == {"status": "ok", "processed": 1}
+
+    runtime = create_database_runtime(settings)
+
+    async def assert_latest_message():
+        async with runtime.session_factory() as session:
+            repository = BusinessRepository(session)
+            handoffs = await repository.list_active_conversation_handoffs(store_id=settings.default_store_id)
+        assert handoffs[0].conversation_id == conversation_id
+        assert handoffs[0].latest_customer_message == "¿Sigue alguien ahí?"
+
+    anyio.run(assert_latest_message)
+    anyio.run(runtime.engine.dispose)
+
+
+def test_kapso_webhook_rejects_non_object_json_payloads(tmp_path: Path):
+    """Kapso webhooks require a JSON object after header enrichment."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "kapso_api_key": SecretStr("kapso-key"),
+            "kapso_phone_number_id": "597907523413541",
+            "kapso_webhook_secret": SecretStr("kapso-secret"),
+        }
+    )
+    app = create_app(settings)
+    raw_payload = json.dumps(["not-a-dict"]).encode("utf-8")
+    signature = build_kapso_signature(payload=raw_payload, secret="kapso-secret")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhooks/whatsapp/kapso",
+            content=raw_payload,
+            headers={"Content-Type": "application/json", "X-Webhook-Signature": signature},
+        )
+
+    assert response.status_code == HTTP_BAD_REQUEST
+    assert response.json()["detail"] == "Invalid Kapso webhook payload."
 
 
 def test_format_dashboard_datetime_formats_local_time():
@@ -1774,6 +1906,8 @@ def test_dashboard_protected_posts_require_login(tmp_path: Path):
         users_response = client.post("/dashboard/settings/users/1/role", data={}, follow_redirects=False)
         order_response = client.post("/dashboard/orders/1/status", data={}, follow_redirects=False)
         switch_response = client.post("/dashboard/active-store", data={}, follow_redirects=False)
+        handoff_reply_response = client.post("/dashboard/handoffs/1/reply", data={}, follow_redirects=False)
+        handoff_release_response = client.post("/dashboard/handoffs/1/release", data={}, follow_redirects=False)
 
     assert profile_response.status_code == HTTP_FOUND
     assert profile_response.headers["location"].startswith("/dashboard/login")
@@ -1787,6 +1921,10 @@ def test_dashboard_protected_posts_require_login(tmp_path: Path):
     assert order_response.headers["location"].startswith("/dashboard/login")
     assert switch_response.status_code == HTTP_FOUND
     assert switch_response.headers["location"].startswith("/dashboard/login")
+    assert handoff_reply_response.status_code == HTTP_FOUND
+    assert handoff_reply_response.headers["location"].startswith("/dashboard/login")
+    assert handoff_release_response.status_code == HTTP_FOUND
+    assert handoff_release_response.headers["location"].startswith("/dashboard/login")
 
 
 def test_dashboard_store_switch_rejects_invalid_requests(tmp_path: Path):
@@ -1859,6 +1997,145 @@ def test_dashboard_customers_search_filters_results(tmp_path: Path, monkeypatch:
     assert "1 clientes encontrados" in response.text
     assert empty_response.status_code == HTTP_OK
     assert "No hay clientes que coincidan con esa búsqueda." in empty_response.text
+
+
+def test_dashboard_customers_page_supports_handoff_reply_and_release(tmp_path: Path, mocker):
+    """Staff can reply manually and release a WhatsApp handoff from the dashboard."""
+    settings = build_settings(tmp_path)
+    conversation_id = anyio.run(lambda: create_whatsapp_handoff_conversation(settings))
+    sent_payloads: list[dict[str, str]] = []
+
+    async def fake_send_text(self, message):
+        sent_payloads.append({"to": message.external_user_id, "text": message.message_text})
+
+    mocker.patch("ruperto.channels.kapso_whatsapp.KapsoWhatsAppGateway.send_text", new=fake_send_text)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        customers_response = client.get("/dashboard/customers")
+        reply_response = client.post(
+            f"/dashboard/handoffs/{conversation_id}/reply",
+            data={"message_text": "Hola, ya lo está revisando una persona del equipo."},
+            follow_redirects=True,
+        )
+        release_response = client.post(
+            f"/dashboard/handoffs/{conversation_id}/release",
+            follow_redirects=True,
+        )
+
+    assert customers_response.status_code == HTTP_OK
+    assert "Conversaciones derivadas a atención humana" in customers_response.text
+    assert "Necesito hablar con alguien." in customers_response.text
+    assert reply_response.status_code == HTTP_OK
+    assert "La respuesta humana ya salió por el canal oficial." in reply_response.text
+    assert sent_payloads == [{"to": "+5493513308454", "text": "Hola, ya lo está revisando una persona del equipo."}]
+    assert release_response.status_code == HTTP_OK
+    assert "La conversación volvió al bot." in release_response.text
+
+    runtime = create_database_runtime(settings)
+
+    async def assert_handoff_released():
+        async with runtime.session_factory() as session:
+            repository = BusinessRepository(session)
+            assert await repository.list_active_conversation_handoffs(store_id=settings.default_store_id) == []
+
+    anyio.run(assert_handoff_released)
+    anyio.run(runtime.engine.dispose)
+
+
+def test_dashboard_handoff_reply_validates_missing_message_and_unknown_conversation(tmp_path: Path):
+    """Handoff reply routes surface validation and missing conversation errors."""
+    settings = build_settings(tmp_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        blank_response = client.post("/dashboard/handoffs/1/reply", data={"message_text": "   "})
+        missing_reply_response = client.post("/dashboard/handoffs/999/reply", data={"message_text": "Hola"})
+        missing_release_response = client.post("/dashboard/handoffs/999/release")
+
+    assert blank_response.status_code == HTTP_UNPROCESSABLE_ENTITY
+    assert blank_response.json()["detail"] == "Reply text is required."
+    assert missing_reply_response.status_code == HTTP_NOT_FOUND
+    assert missing_reply_response.json()["detail"] == "Conversation not found."
+    assert missing_release_response.status_code == HTTP_NOT_FOUND
+    assert missing_release_response.json()["detail"] == "Conversation not found."
+
+
+def test_dashboard_handoff_reply_rejects_conversations_not_waiting_for_human(tmp_path: Path):
+    """Operators cannot reply through the handoff form before the bot escalates."""
+    settings = build_settings(tmp_path)
+    app = create_app(settings)
+    runtime = create_database_runtime(settings)
+
+    async def prepare_conversation():
+        await init_database(settings=settings, runtime=runtime)
+        async with runtime.session_factory() as session:
+            repository = BusinessRepository(session)
+            customer = await repository.get_or_create_customer(
+                channel=Channel.WHATSAPP,
+                external_id="+5493513308454",
+                phone_number="+5493513308454",
+            )
+            conversation = await repository.get_or_create_conversation(
+                channel=Channel.WHATSAPP,
+                external_id="+5493513308454",
+                customer_id=customer.id,
+            )
+            await session.commit()
+            return conversation.id
+
+    conversation_id = anyio.run(prepare_conversation)
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        response = client.post(
+            f"/dashboard/handoffs/{conversation_id}/reply",
+            data={"message_text": "Hola"},
+        )
+
+    assert response.status_code == HTTP_CONFLICT
+    assert response.json()["detail"] == "Conversation is not waiting for a human."
+    anyio.run(runtime.engine.dispose)
+
+
+def test_dashboard_handoff_reply_requires_channel_delivery_configuration(tmp_path: Path):
+    """Operator replies fail fast when the active store lacks a configured gateway."""
+    settings = build_settings(tmp_path)
+    conversation_id = anyio.run(lambda: create_whatsapp_handoff_conversation(settings))
+    app = create_app(settings.model_copy(update={"kapso_api_key": None, "kapso_phone_number_id": None}))
+
+    runtime = create_database_runtime(settings)
+
+    async def clear_connection():
+        await init_database(settings=settings, runtime=runtime)
+        async with runtime.session_factory() as session:
+            repository = BusinessRepository(session)
+            await repository.update_store_channel_connection(
+                store_id=settings.default_store_id,
+                channel=Channel.WHATSAPP,
+                payload=StoreChannelConnectionUpdateRequest(
+                    phone_number_id="sandbox-phone",
+                    api_key="",
+                    webhook_secret=None,
+                    is_active=False,
+                ),
+            )
+            await session.commit()
+
+    anyio.run(clear_connection)
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        response = client.post(
+            f"/dashboard/handoffs/{conversation_id}/reply",
+            data={"message_text": "Hola"},
+        )
+
+    assert response.status_code == HTTP_SERVICE_UNAVAILABLE
+    assert response.json()["detail"] == "Channel delivery is not configured."
+    anyio.run(runtime.engine.dispose)
 
 
 def test_dashboard_settings_pages_render_menu_filters_and_profile_data(tmp_path: Path):

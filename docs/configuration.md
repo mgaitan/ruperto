@@ -79,13 +79,15 @@ RUPERTO_DASHBOARD_ADMIN_NAME
   Full name shown in the dashboard header for the bootstrap dashboard user.
 
 RUPERTO_SMTP_SERVER
-  SMTP hostname used for future transactional emails sent by the backend.
+  SMTP hostname used for transactional emails sent by the backend, such as
+  signup welcomes and human-handoff alerts for store staff.
 
 RUPERTO_SMTP_PORT
   SMTP port used together with {term}`RUPERTO_SMTP_SERVER`.
 
 RUPERTO_SMTP_USER
   SMTP username used to authenticate against the configured server.
+  The same sender is reused for handoff alert emails.
 
 RUPERTO_SMTP_PASSWORD
   SMTP password used to authenticate against the configured server.
