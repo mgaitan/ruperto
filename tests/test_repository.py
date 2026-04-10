@@ -81,6 +81,9 @@ async def build_repository(tmp_path: Path) -> tuple[BusinessRepository, Database
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'repo.db'}",
         store_name="Rotisería Test",
         bot_name="Ruperto Test",
+        kapso_api_key=None,
+        kapso_phone_number_id=None,
+        kapso_webhook_secret=None,
     )
     runtime = create_database_runtime(settings)
     await init_database(settings=settings, runtime=runtime)
@@ -97,6 +100,9 @@ async def build_municipal_repository(tmp_path: Path) -> tuple[BusinessRepository
         store_name="Municipio Test",
         bot_name="Moony Test",
         store_vertical=StoreVertical.MUNICIPAL,
+        kapso_api_key=None,
+        kapso_phone_number_id=None,
+        kapso_webhook_secret=None,
     )
     runtime = create_database_runtime(settings)
     await init_database(settings=settings, runtime=runtime)
@@ -1161,6 +1167,49 @@ async def test_legacy_conversation_table_gains_store_id_column(tmp_path: Path):
 
     assert "store_id" in columns
     assert migrated_row == (1,)
+
+
+async def test_legacy_conversation_state_table_gains_handoff_columns(tmp_path: Path):
+    """Legacy conversation state rows gain the additive human-handoff columns."""
+    database_path = tmp_path / "legacy-conversation-state.db"
+    sync_engine = create_engine(f"sqlite:///{database_path}")
+    with sync_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE conversation_state (
+                    id INTEGER PRIMARY KEY,
+                    conversation_id INTEGER NOT NULL,
+                    pending_customer_message TEXT,
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO conversation_state (
+                    id, conversation_id, pending_customer_message, created_at, updated_at
+                ) VALUES (
+                    1, 10, 'hola', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        _ensure_schema_columns(connection)
+    sync_engine.dispose()
+
+    with sqlite3.connect(database_path) as sqlite_connection:
+        columns = {row[1] for row in sqlite_connection.execute("PRAGMA table_info(conversation_state)")}
+
+    assert "awaiting_human" in columns
+    assert "handoff_reason" in columns
+    assert "handoff_requested_at" in columns
+    assert "handoff_latest_customer_message" in columns
+    assert "handoff_last_customer_message_at" in columns
+    assert "handoff_last_operator_reply_at" in columns
 
 
 async def test_legacy_municipal_categories_gain_request_kind_column(tmp_path: Path):
@@ -2645,6 +2694,22 @@ async def test_store_channel_runtime_returns_none_for_incomplete_connections(tmp
         )
         is None
     )
+
+    await close_repository(repository, runtime)
+
+
+async def test_conversation_handoff_helpers_cover_missing_paths(tmp_path: Path):
+    """Conversation handoff helpers report clean null paths when nothing is active."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="handoff-user")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="handoff-user",
+        customer_id=customer.id,
+    )
+
+    assert await repository.get_conversation_target(conversation_id=9999, store_id=1) is None
+    assert await repository.release_conversation_handoff(conversation.id) is False
 
     await close_repository(repository, runtime)
 

@@ -3,24 +3,28 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from pydantic import SecretStr
 
 from ruperto.channels.base import InboundCustomerMessage
 from ruperto.channels.service import (
+    _notify_store_staff_about_handoff,
     build_channel_gateway,
     build_store_channel_gateway_from_runtime_config,
     build_whatsapp_gateway_for_phone_number,
     deliver_order_notifications,
     deliver_pending_notifications,
+    handle_inbound_customer_message,
     seed_customer_name_from_inbound_message,
 )
 from ruperto.config import Settings
 from ruperto.db import create_database_runtime, init_database
+from ruperto.mail import HandoffEmailDeliveryError
 from ruperto.models import Channel, ChannelProvider
 from ruperto.repository import BusinessRepository
-from ruperto.schemas import StoreChannelConnectionUpdateRequest
+from ruperto.schemas import AssistantNextStep, AssistantReply, AssistantTurnResult, StoreChannelConnectionUpdateRequest
 
 pytestmark = pytest.mark.anyio
 
@@ -44,6 +48,9 @@ async def test_build_channel_gateway_returns_none_when_kapso_is_not_configured(t
         environment="test",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'channels.db'}",
         auto_init_db=True,
+        kapso_api_key=None,
+        kapso_phone_number_id=None,
+        kapso_webhook_secret=None,
     )
 
     assert build_channel_gateway(channel=Channel.DEV, settings=settings) is None
@@ -265,6 +272,34 @@ async def test_build_whatsapp_gateway_for_phone_number_uses_fallback_when_number
     assert store_id == settings.default_store_id
 
 
+async def test_build_whatsapp_gateway_for_phone_number_uses_fallback_without_inbound_number(tmp_path: Path):
+    """Fallback env credentials still work when the webhook omits the inbound phone number id."""
+    runtime_settings = Settings(
+        environment="test",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'channels.db'}",
+        auto_init_db=True,
+        dashboard_session_secret="test-session-secret",
+        kapso_api_key=None,
+        kapso_phone_number_id=None,
+        kapso_webhook_secret=None,
+    )
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(runtime_settings)
+    await init_database(settings=runtime_settings, runtime=runtime)
+
+    gateway, store_id = await build_whatsapp_gateway_for_phone_number(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        phone_number_id=None,
+    )
+
+    await runtime.engine.dispose()
+
+    assert gateway is not None
+    assert gateway.phone_number_id == settings.kapso_phone_number_id
+    assert store_id == settings.default_store_id
+
+
 async def test_build_store_channel_gateway_from_runtime_config_ignores_unknown_provider(tmp_path: Path):
     """Only the Kapso WhatsApp provider is supported by the current gateway builder."""
     settings = build_settings(tmp_path)
@@ -296,3 +331,183 @@ async def test_build_store_channel_gateway_from_runtime_config_ignores_unknown_p
     await runtime.engine.dispose()
 
     assert build_store_channel_gateway_from_runtime_config(channel_config=unsupported) is None
+
+
+async def test_handle_inbound_customer_message_activates_human_handoff(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Assistant handoff replies persist conversation state for operator takeover."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    fake_result = AssistantTurnResult.model_validate(
+        {
+            "conversation_id": 1,
+            "customer": {"id": 1, "name": "Pedro", "phone_number": "+5493513308454", "default_address": None},
+            "reply": {"reply_text": "Te paso con una persona del equipo.", "next_step": "handoff", "handoff": True},
+            "current_order": None,
+        }
+    )
+    mocked_router = AsyncMock(return_value=fake_result)
+    monkeypatch.setattr("ruperto.channels.service.handle_customer_message_for_store", mocked_router)
+
+    result = await handle_inbound_customer_message(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        inbound_message=InboundCustomerMessage(
+            channel=Channel.WHATSAPP,
+            external_user_id="+5493513308454",
+            message_text="Necesito hablar con una persona.",
+        ),
+    )
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(
+            channel=Channel.WHATSAPP,
+            external_id="+5493513308454",
+            phone_number="+5493513308454",
+        )
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.WHATSAPP,
+            external_id="+5493513308454",
+            customer_id=customer.id,
+        )
+        handoffs = await repository.list_active_conversation_handoffs(store_id=settings.default_store_id)
+
+    await runtime.engine.dispose()
+
+    assert result.reply.handoff is True
+    assert mocked_router.await_count == 1
+    assert handoffs[0].conversation_id == conversation.id
+    assert handoffs[0].latest_customer_message == "Necesito hablar con una persona."
+
+
+async def test_handle_inbound_customer_message_skips_bot_while_waiting_for_human(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Customer follow-ups stay silent until an operator releases the handoff."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(
+            channel=Channel.WHATSAPP,
+            external_id="+5493513308454",
+            phone_number="+5493513308454",
+        )
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.WHATSAPP,
+            external_id="+5493513308454",
+            customer_id=customer.id,
+        )
+        await repository.activate_conversation_handoff(
+            conversation_id=conversation.id,
+            reason="Te paso con una persona del equipo.",
+            latest_customer_message="Necesito ayuda urgente.",
+        )
+        await session.commit()
+
+    mocked_router = AsyncMock()
+    monkeypatch.setattr("ruperto.channels.service.handle_customer_message_for_store", mocked_router)
+
+    result = await handle_inbound_customer_message(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        inbound_message=InboundCustomerMessage(
+            channel=Channel.WHATSAPP,
+            external_user_id="+5493513308454",
+            message_text="¿Me pueden responder?",
+        ),
+    )
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        handoffs = await repository.list_active_conversation_handoffs(store_id=settings.default_store_id)
+
+    await runtime.engine.dispose()
+
+    assert result.reply == AssistantReply(reply_text="", next_step=AssistantNextStep.HANDOFF, handoff=True)
+    assert mocked_router.await_count == 0
+    assert handoffs[0].latest_customer_message == "¿Me pueden responder?"
+
+
+async def test_handle_inbound_customer_message_suppresses_handoff_alert_email_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """SMTP delivery failures do not break the handoff activation path."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "dashboard_admin_email": "owner@example.com",
+            "dashboard_admin_password": SecretStr("super-secret"),
+            "dashboard_admin_name": "Owner Demo",
+            "smtp_server": "smtp.example.com",
+            "smtp_port": 587,
+            "smtp_user": "mailer@example.com",
+            "smtp_password": SecretStr("smtp-secret"),
+        }
+    )
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    fake_result = AssistantTurnResult.model_validate(
+        {
+            "conversation_id": 1,
+            "customer": {"id": 1, "name": "Pedro", "phone_number": "+5493513308454", "default_address": None},
+            "reply": {"reply_text": "Te paso con una persona del equipo.", "next_step": "handoff", "handoff": True},
+            "current_order": None,
+        }
+    )
+    mocked_router = AsyncMock(return_value=fake_result)
+    monkeypatch.setattr("ruperto.channels.service.handle_customer_message_for_store", mocked_router)
+
+    def fail_email(**kwargs):
+        raise HandoffEmailDeliveryError()
+
+    monkeypatch.setattr("ruperto.channels.service.send_handoff_alert_email", fail_email)
+
+    result = await handle_inbound_customer_message(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        inbound_message=InboundCustomerMessage(
+            channel=Channel.WHATSAPP,
+            external_user_id="+5493513308454",
+            message_text="Necesito hablar con una persona.",
+        ),
+    )
+
+    await runtime.engine.dispose()
+
+    assert result.reply.handoff is True
+    assert mocked_router.await_count == 1
+
+
+async def test_notify_store_staff_about_handoff_returns_early_without_smtp(tmp_path: Path):
+    """The handoff notifier exits quietly when SMTP is not configured."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "dashboard_admin_email": "owner@example.com",
+            "dashboard_admin_password": SecretStr("super-secret"),
+            "dashboard_admin_name": "Owner Demo",
+            "smtp_server": None,
+            "smtp_port": None,
+            "smtp_user": None,
+            "smtp_password": None,
+        }
+    )
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+
+    await _notify_store_staff_about_handoff(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        store_id=settings.default_store_id,
+        inbound_message=InboundCustomerMessage(
+            channel=Channel.WHATSAPP,
+            external_user_id="+5493513308454",
+            message_text="Necesito una persona.",
+        ),
+        reply_text="Te paso con una persona del equipo.",
+    )
+
+    await runtime.engine.dispose()

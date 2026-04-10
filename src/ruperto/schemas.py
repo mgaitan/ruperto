@@ -326,6 +326,23 @@ class ConversationTargetSnapshot(BaseModel):
     external_id: str
 
 
+class ConversationHandoffSnapshot(BaseModel):
+    """One active human-handoff conversation shown in the dashboard."""
+
+    conversation_id: int
+    store_id: int
+    channel: Channel
+    external_id: str
+    customer_id: int
+    customer_name: str | None
+    customer_phone_number: str | None
+    handoff_reason: str | None
+    latest_customer_message: str | None
+    requested_at: datetime | None
+    last_customer_message_at: datetime | None
+    last_operator_reply_at: datetime | None
+
+
 class DevNotificationPollRequest(BaseModel):
     """Query payload used to fetch pending demo notifications."""
 
