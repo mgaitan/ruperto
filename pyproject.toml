@@ -24,6 +24,7 @@ classifiers = [
 ]
 dependencies = [
     "aiosqlite>=0.22.1",
+    "asyncpg>=0.31.0",
     "fastapi[standard]>=0.135.2",
     "httpx>=0.28.1",
     "itsdangerous>=2.2.0",
@@ -43,7 +44,7 @@ build-backend = "uv_build"
 module-name = "ruperto"
 
 [tool.fastapi]
-entrypoint = "ruperto.app:app"
+entrypoint = "asgi:app"
 
 [tool.uv]
 exclude-newer = "1 week"
