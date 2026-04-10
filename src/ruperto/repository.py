@@ -1131,6 +1131,44 @@ class BusinessRepository:
         rows = (await self.session.scalars(statement)).all()
         return [self._municipal_case_snapshot(row) for row in rows]
 
+    async def get_customer_municipal_case(
+        self,
+        case_id: int,
+        *,
+        customer_id: int,
+        store_id: int,
+    ) -> MunicipalCaseSnapshot | None:
+        """Return one municipal case owned by the given customer within one tenant."""
+        row = await self.session.scalar(
+            select(MunicipalCase).where(
+                MunicipalCase.id == case_id,
+                MunicipalCase.customer_id == customer_id,
+                MunicipalCase.store_id == store_id,
+            )
+        )
+        if row is None:
+            return None
+        return self._municipal_case_snapshot(row)
+
+    async def get_latest_customer_municipal_case(
+        self,
+        *,
+        customer_id: int,
+        store_id: int,
+    ) -> MunicipalCaseSnapshot | None:
+        """Return the most recent municipal case created by one customer in one tenant."""
+        row = await self.session.scalar(
+            select(MunicipalCase)
+            .where(
+                MunicipalCase.customer_id == customer_id,
+                MunicipalCase.store_id == store_id,
+            )
+            .order_by(MunicipalCase.updated_at.desc(), MunicipalCase.id.desc())
+        )
+        if row is None:
+            return None
+        return self._municipal_case_snapshot(row)
+
     async def update_municipal_case_status(
         self,
         case_id: int,

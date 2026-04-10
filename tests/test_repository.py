@@ -81,6 +81,9 @@ async def build_repository(tmp_path: Path) -> tuple[BusinessRepository, Database
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'repo.db'}",
         store_name="Rotisería Test",
         bot_name="Ruperto Test",
+        kapso_api_key=None,
+        kapso_phone_number_id=None,
+        kapso_webhook_secret=None,
     )
     runtime = create_database_runtime(settings)
     await init_database(settings=settings, runtime=runtime)
@@ -97,6 +100,9 @@ async def build_municipal_repository(tmp_path: Path) -> tuple[BusinessRepository
         store_name="Municipio Test",
         bot_name="Moony Test",
         store_vertical=StoreVertical.MUNICIPAL,
+        kapso_api_key=None,
+        kapso_phone_number_id=None,
+        kapso_webhook_secret=None,
     )
     runtime = create_database_runtime(settings)
     await init_database(settings=settings, runtime=runtime)
@@ -2437,6 +2443,56 @@ async def test_municipal_case_status_and_assignment_can_be_updated(tmp_path: Pat
     assert assigned.assignee_staff_user_id == owner.id
     assert updated.status == MunicipalCaseStatus.IN_PROGRESS
     assert [case.id for case in filtered] == [created.id]
+
+    await close_repository(repository, runtime)
+
+
+async def test_customer_scoped_municipal_case_follow_up_helpers_find_only_owned_cases(tmp_path: Path):
+    """Customer-scoped municipal lookups keep follow-up replies bound to the right tenant and person."""
+    repository, runtime = await build_municipal_repository(tmp_path)
+    store = await repository.get_store_profile()
+    area = next(
+        area for area in await repository.list_municipal_areas(store_id=store.id) if area.name == "Solicitud de agua"
+    )
+    first_customer = await repository.get_or_create_customer(channel=Channel.WHATSAPP, external_id="3510000001")
+    second_customer = await repository.get_or_create_customer(channel=Channel.WHATSAPP, external_id="3510000002")
+
+    first_case = await repository.create_municipal_case(
+        store_id=store.id,
+        payload=MunicipalCaseCreateRequest(
+            area_id=area.id,
+            customer_id=first_customer.id,
+            title="Falta de agua en el centro",
+            description="No sale agua desde anoche.",
+        ),
+    )
+    second_case = await repository.create_municipal_case(
+        store_id=store.id,
+        payload=MunicipalCaseCreateRequest(
+            area_id=area.id,
+            customer_id=second_customer.id,
+            title="Baja presión en zona norte",
+            description="Sale un hilo de agua.",
+        ),
+    )
+
+    owned = await repository.get_customer_municipal_case(
+        first_case.id,
+        customer_id=first_customer.id,
+        store_id=store.id,
+    )
+    foreign = await repository.get_customer_municipal_case(
+        second_case.id,
+        customer_id=first_customer.id,
+        store_id=store.id,
+    )
+    latest = await repository.get_latest_customer_municipal_case(customer_id=second_customer.id, store_id=store.id)
+
+    assert owned is not None
+    assert owned.id == first_case.id
+    assert foreign is None
+    assert latest is not None
+    assert latest.id == second_case.id
 
     await close_repository(repository, runtime)
 
