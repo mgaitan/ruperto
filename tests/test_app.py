@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import importlib.util
 import json
 from base64 import b64encode
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 
 import anyio
@@ -21,8 +23,12 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from sqlalchemy import select
 
 from ruperto.app import (
+    app as package_app,
+)
+from ruperto.app import (
     build_scoped_dev_external_user_id,
     create_app,
+    enrich_kapso_payload_from_headers,
     extract_kapso_phone_number_id,
     format_dashboard_datetime,
     parse_store_hours_form,
@@ -308,6 +314,18 @@ def test_root_endpoint(tmp_path: Path):
     assert response.json()["store_name"] == "Test Rotisería"
     assert response.json()["bot_name"] == "Test Bot"
     assert response.json()["store_locale"] == "es-AR"
+
+
+def test_root_asgi_entrypoint_exposes_the_main_app():
+    """The deployment shim exposes the same FastAPI app from the repository root."""
+    asgi_path = Path(__file__).resolve().parents[1] / "asgi.py"
+    spec = importlib.util.spec_from_file_location("asgi", asgi_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module.app is package_app
 
 
 def test_healthcheck_initializes_database(tmp_path: Path):
@@ -721,6 +739,21 @@ def test_extract_kapso_phone_number_id_supports_direct_and_nested_payloads():
     assert extract_kapso_phone_number_id(["not-a-dict"]) is None
 
 
+def test_enrich_kapso_payload_from_headers_backfills_event_metadata():
+    """Kapso event headers can restore the webhook type when the body omits it."""
+    payload = {"message": {"text": {"body": "hola"}}}
+
+    enriched = enrich_kapso_payload_from_headers(
+        payload=payload,
+        headers={"X-Webhook-Event": "whatsapp.message.received", "X-Webhook-Batch": "true"},
+    )
+
+    assert isinstance(enriched, Mapping)
+    enriched_mapping = cast(dict[str, object], enriched)
+    assert enriched_mapping["event"] == "whatsapp.message.received"
+    assert enriched_mapping["batch"] is True
+
+
 def test_kapso_webhook_requires_valid_signature(tmp_path: Path):
     """Kapso webhooks are rejected when the signature does not match."""
     settings = build_settings(tmp_path).model_copy(
@@ -761,7 +794,14 @@ def test_kapso_webhook_requires_valid_signature(tmp_path: Path):
 
 def test_kapso_webhook_requires_runtime_configuration(tmp_path: Path):
     """Kapso webhook processing stays disabled until the runtime credentials exist."""
-    app = create_app(build_settings(tmp_path))
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "kapso_api_key": None,
+            "kapso_phone_number_id": None,
+            "kapso_webhook_secret": None,
+        }
+    )
+    app = create_app(settings)
 
     with TestClient(app) as client:
         response = client.post(
@@ -877,6 +917,73 @@ def test_kapso_webhook_processes_inbound_message_and_sends_reply(tmp_path: Path,
     assert sent_payloads == [{"to": "+5493513308454", "text": "Hola Pedro, ¿qué te gustaría pedir?"}]
 
 
+def test_kapso_webhook_processes_header_only_event_payloads(tmp_path: Path, mocker):
+    """Kapso event webhooks can rely on headers for the event name."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "kapso_api_key": SecretStr("kapso-key"),
+            "kapso_phone_number_id": "597907523413541",
+            "kapso_webhook_secret": SecretStr("kapso-secret"),
+        }
+    )
+    app = create_app(settings)
+    fake_result = AssistantTurnResult.model_validate(
+        {
+            "conversation_id": 1,
+            "customer": {"id": 1, "name": "Pedro", "phone_number": "+5493513308454", "default_address": None},
+            "reply": {"reply_text": "Hola Pedro, ¿qué te gustaría pedir?", "next_step": "choose_items"},
+            "current_order": None,
+        }
+    )
+    handled_messages = []
+    sent_payloads: list[dict[str, Any]] = []
+
+    async def fake_handle_inbound_customer_message(*, session_factory, settings, inbound_message, store_id=None):
+        handled_messages.append(inbound_message)
+        return fake_result
+
+    async def fake_send_text(self, message):
+        sent_payloads.append({"to": message.external_user_id, "text": message.message_text})
+
+    mocker.patch("ruperto.app.handle_inbound_customer_message", side_effect=fake_handle_inbound_customer_message)
+    mocker.patch("ruperto.channels.kapso_whatsapp.KapsoWhatsAppGateway.send_text", new=fake_send_text)
+
+    payload = {
+        "message": {
+            "id": "wamid.123",
+            "from": "5493513308454",
+            "timestamp": "1730092800",
+            "type": "text",
+            "text": {"body": "Hola, ¿tenés menú?"},
+        },
+        "conversation": {
+            "id": "conv_123",
+            "phone_number": "+5493513308454",
+            "phone_number_id": "597907523413541",
+            "kapso": {"contact_name": "Pedro"},
+        },
+        "phone_number_id": "597907523413541",
+    }
+    raw_payload = json.dumps(payload).encode("utf-8")
+    signature = build_kapso_signature(payload=raw_payload, secret="kapso-secret")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhooks/whatsapp/kapso",
+            content=raw_payload,
+            headers={
+                "Content-Type": "application/json",
+                "X-Webhook-Signature": signature,
+                "X-Webhook-Event": "whatsapp.message.received",
+            },
+        )
+
+    assert response.status_code == HTTP_OK
+    assert response.json() == {"status": "ok", "processed": 1}
+    assert handled_messages[0].external_user_id == "+5493513308454"
+    assert sent_payloads == [{"to": "+5493513308454", "text": "Hola Pedro, ¿qué te gustaría pedir?"}]
+
+
 def test_format_dashboard_datetime_formats_local_time():
     """Dashboard timestamps are shown in the configured local timezone."""
     value = datetime(2026, 4, 4, 15, 30, tzinfo=UTC)
@@ -889,6 +996,7 @@ def test_public_settings_marks_secret_configuration():
     settings = Settings(
         gemini_api_key=SecretStr("gemini-key"),
         kapso_api_key=SecretStr("kapso-key"),
+        kapso_webhook_secret=None,
         default_store_id=TENANT_STORE_ID,
         smtp_server="smtp.example.com",
         smtp_port=SMTP_PORT,

@@ -180,7 +180,11 @@ def test_kapso_gateway_builds_from_settings():
 
 def test_kapso_gateway_from_settings_returns_none_without_runtime_credentials():
     """The adapter stays disabled until the Kapso runtime credentials exist."""
-    settings = Settings()
+    settings = Settings(
+        kapso_api_key=None,
+        kapso_phone_number_id=None,
+        kapso_webhook_secret=None,
+    )
 
     assert KapsoWhatsAppGateway.from_settings(settings) is None
 

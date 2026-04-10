@@ -541,6 +541,20 @@ def extract_kapso_phone_number_id(payload: object) -> str | None:
     return None
 
 
+def enrich_kapso_payload_from_headers(*, payload: object, headers: Mapping[str, str]) -> object:
+    """Backfill Kapso event metadata from headers when the JSON body omits it."""
+    if not isinstance(payload, dict):
+        return payload
+    payload_dict = cast(dict[str, object], payload).copy()
+    header_event = headers.get("X-Webhook-Event")
+    if header_event and "event" not in payload_dict and "type" not in payload_dict:
+        payload_dict["event"] = header_event
+    header_batch = headers.get("X-Webhook-Batch")
+    if header_batch and "batch" not in payload_dict:
+        payload_dict["batch"] = header_batch.strip().lower() == "true"
+    return payload_dict
+
+
 def dashboard_store_scope_note(memberships: list[StoreMembershipSnapshot]) -> str | None:
     """Explain the current tenancy boundary of the MVP dashboard."""
     if len(memberships) <= 1:
@@ -1689,6 +1703,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
             payload = json.loads(raw_payload)
         except json.JSONDecodeError as error:
             raise HTTPException(status_code=400, detail="Invalid JSON payload.") from error
+        payload = enrich_kapso_payload_from_headers(payload=payload, headers=request.headers)
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid Kapso webhook payload.")
+        payload = cast(dict[str, object], payload)
 
         phone_number_id = extract_kapso_phone_number_id(payload)
         gateway, store_id = await build_whatsapp_gateway_for_phone_number(
