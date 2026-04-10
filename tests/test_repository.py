@@ -81,6 +81,9 @@ async def build_repository(tmp_path: Path) -> tuple[BusinessRepository, Database
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'repo.db'}",
         store_name="Rotisería Test",
         bot_name="Ruperto Test",
+        kapso_api_key=None,
+        kapso_phone_number_id=None,
+        kapso_webhook_secret=None,
     )
     runtime = create_database_runtime(settings)
     await init_database(settings=settings, runtime=runtime)
@@ -97,6 +100,9 @@ async def build_municipal_repository(tmp_path: Path) -> tuple[BusinessRepository
         store_name="Municipio Test",
         bot_name="Moony Test",
         store_vertical=StoreVertical.MUNICIPAL,
+        kapso_api_key=None,
+        kapso_phone_number_id=None,
+        kapso_webhook_secret=None,
     )
     runtime = create_database_runtime(settings)
     await init_database(settings=settings, runtime=runtime)
