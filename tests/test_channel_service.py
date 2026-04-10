@@ -44,6 +44,9 @@ async def test_build_channel_gateway_returns_none_when_kapso_is_not_configured(t
         environment="test",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'channels.db'}",
         auto_init_db=True,
+        kapso_api_key=None,
+        kapso_phone_number_id=None,
+        kapso_webhook_secret=None,
     )
 
     assert build_channel_gateway(channel=Channel.DEV, settings=settings) is None
@@ -262,6 +265,33 @@ async def test_build_whatsapp_gateway_for_phone_number_uses_fallback_when_number
 
     assert gateway is not None
     assert gateway.phone_number_id == settings.kapso_phone_number_id
+    assert store_id == settings.default_store_id
+
+
+async def test_build_whatsapp_gateway_for_phone_number_uses_fallback_without_explicit_number(tmp_path: Path):
+    """Fallback env credentials still work when the webhook payload omits the phone number id."""
+    runtime_settings = Settings(
+        environment="test",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'channels.db'}",
+        auto_init_db=True,
+        dashboard_session_secret="test-session-secret",
+        kapso_api_key=None,
+        kapso_phone_number_id=None,
+        kapso_webhook_secret=None,
+    )
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(runtime_settings)
+    await init_database(settings=runtime_settings, runtime=runtime)
+
+    gateway, store_id = await build_whatsapp_gateway_for_phone_number(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        phone_number_id=None,
+    )
+
+    await runtime.engine.dispose()
+
+    assert gateway is not None
     assert store_id == settings.default_store_id
 
 

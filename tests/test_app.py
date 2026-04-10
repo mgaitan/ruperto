@@ -754,6 +754,11 @@ def test_enrich_kapso_payload_from_headers_backfills_event_metadata():
     assert enriched_mapping["batch"] is True
 
 
+def test_enrich_kapso_payload_from_headers_leaves_non_mapping_payloads_untouched():
+    """Non-object payloads should pass through unchanged before webhook validation."""
+    assert enrich_kapso_payload_from_headers(payload=["hola"], headers={}) == ["hola"]
+
+
 def test_kapso_webhook_requires_valid_signature(tmp_path: Path):
     """Kapso webhooks are rejected when the signature does not match."""
     settings = build_settings(tmp_path).model_copy(
@@ -811,6 +816,28 @@ def test_kapso_webhook_requires_runtime_configuration(tmp_path: Path):
         )
 
     assert response.status_code == HTTP_SERVICE_UNAVAILABLE
+
+
+def test_kapso_webhook_rejects_non_object_payloads(tmp_path: Path):
+    """Kapso webhook payloads must decode into JSON objects."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "kapso_api_key": SecretStr("kapso-key"),
+            "kapso_phone_number_id": "597907523413541",
+            "kapso_webhook_secret": SecretStr("kapso-secret"),
+        }
+    )
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhooks/whatsapp/kapso",
+            content=b"[]",
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert response.status_code == HTTP_BAD_REQUEST
+    assert response.json() == {"detail": "Invalid Kapso webhook payload."}
 
 
 def test_dashboard_agent_channel_form_requires_login(tmp_path: Path):

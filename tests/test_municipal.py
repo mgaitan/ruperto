@@ -842,6 +842,55 @@ async def test_municipal_case_follow_up_does_not_override_an_active_intake_draft
     await runtime.engine.dispose()
 
 
+async def test_municipal_case_follow_up_handles_missing_cases_and_unknown_category_copy(tmp_path: Path):
+    """Follow-up copy stays safe when no case exists or when a case lacks category metadata."""
+    settings, runtime = await build_municipal_runtime(tmp_path)
+    store_id, areas, _categories = await load_municipal_catalog(runtime)
+    area = next(area for area in areas if area.name == "Higiene urbana")
+
+    service = MunicipalAssistantService(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        agent=StubMunicipalAgent(),
+    )
+    missing = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="vecino-sin-casos",
+        message_text="¿Cómo va mi reclamo?",
+        model="stub",
+        store_id=store_id,
+    )
+    generic_tracking = service._build_case_tracking_reply(
+        case_snapshot=MunicipalCaseSnapshot(
+            id=8,
+            store_id=store_id,
+            area_id=area.id,
+            category_id=None,
+            customer_id=1,
+            conversation_id=1,
+            assignee_staff_user_id=None,
+            title="Limpieza pendiente",
+            description="Hace falta barrer la cuadra.",
+            reporter_name="Nora",
+            reporter_phone_number=None,
+            location_text="San Martín 500",
+            location_reference=None,
+            latitude=None,
+            longitude=None,
+            status=MunicipalCaseStatus.NEW,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        ),
+        categories=[],
+    )
+
+    assert missing.reply.next_step == AssistantNextStep.CHOOSE_AREA
+    assert "todavía no encuentro un caso tuyo" in missing.reply.reply_text.lower()
+    assert generic_tracking.startswith("Tu caso #8 ")
+
+    await runtime.engine.dispose()
+
+
 async def test_municipal_service_rejects_aggressive_turns_and_requests_a_clean_rephrase(tmp_path: Path):
     """Aggressive wording should trigger a respectful rephrase prompt instead of continuing blindly."""
     settings, runtime = await build_municipal_runtime(tmp_path)

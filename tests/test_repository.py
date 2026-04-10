@@ -2497,6 +2497,21 @@ async def test_customer_scoped_municipal_case_follow_up_helpers_find_only_owned_
     await close_repository(repository, runtime)
 
 
+async def test_customer_scoped_municipal_case_helpers_return_none_without_owned_cases(tmp_path: Path):
+    """Customer-scoped municipal lookups report clean null paths when nothing matches."""
+    repository, runtime = await build_municipal_repository(tmp_path)
+    store = await repository.get_store_profile()
+    customer = await repository.get_or_create_customer(channel=Channel.WHATSAPP, external_id="3510000003")
+
+    assert (
+        await repository.get_customer_municipal_case(999, customer_id=customer.id, store_id=store.id)
+        is None
+    )
+    assert await repository.get_latest_customer_municipal_case(customer_id=customer.id, store_id=store.id) is None
+
+    await close_repository(repository, runtime)
+
+
 async def test_municipal_areas_and_categories_can_be_created_manually(tmp_path: Path):
     """Stores can extend the demo municipal catalog with tenant-specific entries."""
     repository, runtime = await build_municipal_repository(tmp_path)
