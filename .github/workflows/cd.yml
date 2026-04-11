@@ -11,14 +11,6 @@ on:
       - "README.md"
       - "CONTRIBUTING.md"
       - ".github/workflows/cd.yml"
-  pull_request:
-    branches:
-      - main
-    paths:
-      - "docs/**"
-      - "README.md"
-      - "CONTRIBUTING.md"
-      - ".github/workflows/cd.yml"
   workflow_dispatch:
 
 permissions:
