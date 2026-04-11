@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import SecretStr
+from pydantic_ai import RunContext
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -24,6 +25,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from ruperto.assistant import (
     MODEL_UNAVAILABLE_REPLY,
+    AssistantDeps,
     InformationalTurnMutationError,
     MissingConfirmationSignalError,
     OrderingAssistantService,
@@ -36,6 +38,7 @@ from ruperto.assistant import (
     set_order_delivery_address,
     set_order_delivery_type,
     set_order_payment_method,
+    with_repository,
 )
 from ruperto.config import Settings
 from ruperto.db import create_database_runtime, init_database
@@ -4273,3 +4276,36 @@ async def test_recover_large_order_after_model_failure_skips_existing_draft_orde
     assert result is None
 
     await runtime.engine.dispose()
+
+
+async def test_with_repository_commit_flag_commits_the_session(tmp_path: Path):
+    """Repository helpers can opt into committing their short-lived session."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    ctx = RunContext[AssistantDeps](
+        deps=AssistantDeps(
+            session_factory=runtime.session_factory,
+            settings=settings,
+            store_id=settings.default_store_id,
+            customer_id=1,
+            conversation_id=1,
+        ),
+        model=cast(Any, None),
+        usage=cast(Any, None),
+        prompt="",
+    )
+
+    async def create_customer(repository: BusinessRepository) -> int:
+        customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="commit-helper")
+        return customer.id
+
+    customer_id = await with_repository(ctx, create_customer, commit=True)
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="commit-helper")
+
+    await runtime.engine.dispose()
+
+    assert customer.id == customer_id

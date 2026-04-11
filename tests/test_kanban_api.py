@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
+from starlette.requests import Request as StarletteRequest
 
 from ruperto.api.kanban import router
 from ruperto.app import create_app
@@ -37,6 +39,36 @@ def build_kanban_settings(tmp_path: Path, database_name: str) -> Settings:
         dashboard_admin_password=SecretStr("super-secret"),
         dashboard_admin_name="Staff User",
     )
+
+
+def build_request(app, *, path: str, session: dict[str, int] | None = None) -> StarletteRequest:
+    """Build a direct request object for route endpoint coverage."""
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "PATCH",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("utf-8"),
+        "query_string": b"",
+        "headers": [(b"host", b"testserver")],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+        "app": app,
+        "session": session or {},
+    }
+    return StarletteRequest(scope)
+
+
+def get_route_endpoint(path: str, method: str):
+    """Return the route endpoint registered for one kanban path and method."""
+    for route in router.routes:
+        route_path = getattr(route, "path", None)
+        route_methods = getattr(route, "methods", None)
+        if route_path == path and route_methods is not None and method in route_methods:
+            return cast(Any, route).endpoint
+    msg = f"Could not find route {method} {path!r}"
+    raise AssertionError(msg)
 
 
 async def test_kanban_api_list_cases_requires_authentication(tmp_path):
@@ -195,3 +227,61 @@ async def test_kanban_api_returns_not_found_when_updating_unknown_case(tmp_path)
     assert response.status_code == HTTP_NOT_FOUND
     assert response.json()["detail"] == "Municipal case not found."
     await runtime.engine.dispose()
+
+
+async def test_kanban_route_endpoint_commits_success_and_not_found_paths(tmp_path):
+    """Direct route calls cover the kanban commit and not-found branches under Python 3.13."""
+    settings = build_kanban_settings(tmp_path, "kanban-direct-coverage.db")
+    app = create_app(settings)
+
+    with TestClient(app):
+        runtime = app.state.runtime
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            staff_user = await repository.get_staff_user_by_email("staff@example.com")
+            assert staff_user is not None
+            session_data = {"dashboard_staff_user_id": staff_user.id, "dashboard_store_id": 1}
+            store = await repository.get_store_profile()
+            area = next(
+                area
+                for area in await repository.list_municipal_areas(store_id=store.id)
+                if area.name == "Solicitud de agua"
+            )
+            created_case = await repository.create_municipal_case(
+                store_id=store.id,
+                payload=MunicipalCaseCreateRequest(
+                    area_id=area.id,
+                    title="Cobertura directa",
+                    description="Cubrir commit del endpoint",
+                ),
+            )
+            await session.commit()
+
+        update_case_status = get_route_endpoint("/api/kanban/municipal/cases/{case_id}/status", "PATCH")
+        updated_case = await update_case_status(
+            request=build_request(
+                app,
+                path=f"/api/kanban/municipal/cases/{created_case.id}/status",
+                session=session_data,
+            ),
+            case_id=created_case.id,
+            payload=MunicipalCaseStatusUpdateRequest(status=MunicipalCaseStatus.TRIAGED),
+            identity={"store_id": 1},
+        )
+
+        assert updated_case.status == MunicipalCaseStatus.TRIAGED
+
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            stored_case = await repository.get_municipal_case(created_case.id)
+            assert stored_case.status == MunicipalCaseStatus.TRIAGED
+
+        with pytest.raises(Exception) as error_info:
+            await update_case_status(
+                request=build_request(app, path="/api/kanban/municipal/cases/999/status", session=session_data),
+                case_id=999,
+                payload=MunicipalCaseStatusUpdateRequest(status=MunicipalCaseStatus.TRIAGED),
+                identity={"store_id": 1},
+            )
+
+    assert "Municipal case not found." in str(error_info.value)

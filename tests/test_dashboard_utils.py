@@ -31,6 +31,9 @@ async def build_runtime(tmp_path: Path):
         dashboard_admin_email="staff@example.com",
         dashboard_admin_password=SecretStr("super-secret"),
         dashboard_admin_name="Staff User",
+        kapso_api_key=None,
+        kapso_phone_number_id=None,
+        kapso_webhook_secret=None,
     )
     runtime = create_database_runtime(settings)
     await init_database(settings=settings, runtime=runtime)
