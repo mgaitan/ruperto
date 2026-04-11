@@ -178,6 +178,9 @@ notification is sent.
 Kapso credentials can still come from environment variables as a development
 fallback, but the recommended path for multi-store setups is now to configure
 each local's WhatsApp connection from the dashboard agent settings page.
+If the assistant decides a conversation should be delegated, the dashboard
+customers page now exposes that handoff queue and lets staff answer through the
+same store-owned WhatsApp connection before returning control to the bot.
 
 ## Development
 

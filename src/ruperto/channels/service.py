@@ -2,17 +2,68 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
+
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ruperto.assistant_router import handle_customer_message_for_store
 from ruperto.channels.base import InboundCustomerMessage, OutboundCustomerMessage
 from ruperto.channels.kapso_whatsapp import KapsoWhatsAppGateway
 from ruperto.config import Settings
+from ruperto.mail import HandoffEmailDeliveryError, send_handoff_alert_email
 from ruperto.models import Channel, ChannelProvider
 from ruperto.repository import BusinessRepository
-from ruperto.schemas import AssistantTurnResult, StoreChannelConnectionRuntimeConfig
+from ruperto.schemas import AssistantNextStep, AssistantReply, AssistantTurnResult, StoreChannelConnectionRuntimeConfig
 
 SessionFactory = async_sessionmaker[AsyncSession]
+
+
+async def _notify_store_staff_about_handoff(
+    *,
+    session_factory: SessionFactory,
+    settings: Settings,
+    store_id: int,
+    inbound_message: InboundCustomerMessage,
+    reply_text: str,
+) -> None:
+    """Send operator notifications when SMTP is configured."""
+    if not settings.smtp_configured:
+        return
+    assert settings.smtp_server is not None
+    assert settings.smtp_port is not None
+    assert settings.smtp_user is not None
+    assert settings.smtp_password is not None
+
+    async with session_factory() as session:
+        repository = BusinessRepository(session)
+        store = await repository.get_store_profile(store_id=store_id)
+        staff_memberships = await repository.list_staff_memberships_for_store(store_id=store_id)
+        customer = await repository.get_or_create_customer(
+            channel=inbound_message.channel,
+            external_id=inbound_message.external_user_id,
+            store_id=store_id,
+            phone_number=inbound_message.external_user_id if inbound_message.channel == Channel.WHATSAPP else None,
+        )
+
+    recipients = [membership for membership in staff_memberships if membership.is_active]
+    for recipient in recipients:
+        with suppress(HandoffEmailDeliveryError):
+            await asyncio.to_thread(
+                send_handoff_alert_email,
+                smtp_server=settings.smtp_server,
+                smtp_port=settings.smtp_port,
+                smtp_user=settings.smtp_user,
+                smtp_password=settings.smtp_password.get_secret_value(),
+                recipient_email=recipient.email,
+                recipient_name=recipient.full_name,
+                store_name=store.store_name,
+                dashboard_url="Open your Ruperto dashboard and go to /dashboard/customers",
+                customer_label=customer.name or inbound_message.external_user_id,
+                customer_phone_number=customer.phone_number,
+                latest_customer_message=inbound_message.message_text,
+                handoff_reason=reply_text,
+            )
 
 
 def build_channel_gateway(*, channel: Channel, settings: Settings) -> KapsoWhatsAppGateway | None:
@@ -122,7 +173,34 @@ async def handle_inbound_customer_message(
         inbound_message=inbound_message,
         store_id=resolved_store_id,
     )
-    return await handle_customer_message_for_store(
+    metadata_phone_number = inbound_message.metadata.get("phone_number")
+    phone_number = metadata_phone_number if isinstance(metadata_phone_number, str) else None
+    async with session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(
+            channel=inbound_message.channel,
+            external_id=inbound_message.external_user_id,
+            store_id=resolved_store_id,
+            phone_number=phone_number
+            or (inbound_message.external_user_id if inbound_message.channel == Channel.WHATSAPP else None),
+        )
+        conversation = await repository.get_or_create_conversation(
+            channel=inbound_message.channel,
+            external_id=inbound_message.external_user_id,
+            customer_id=customer.id,
+            store_id=resolved_store_id,
+        )
+        if await repository.conversation_is_awaiting_human(conversation.id):
+            await repository.record_handoff_customer_message(conversation.id, inbound_message.message_text)
+            await session.commit()
+            return AssistantTurnResult(
+                conversation_id=conversation.id,
+                customer=customer,
+                reply=AssistantReply(reply_text="", next_step=AssistantNextStep.HANDOFF, handoff=True),
+                current_order=None,
+            )
+
+    result = await handle_customer_message_for_store(
         session_factory=session_factory,
         settings=settings,
         channel=inbound_message.channel,
@@ -130,6 +208,24 @@ async def handle_inbound_customer_message(
         message_text=inbound_message.message_text,
         store_id=resolved_store_id,
     )
+    if result.reply.handoff:
+        async with session_factory() as session:
+            repository = BusinessRepository(session)
+            activated_now = await repository.activate_conversation_handoff(
+                conversation_id=result.conversation_id,
+                reason=result.reply.reply_text,
+                latest_customer_message=inbound_message.message_text,
+            )
+            await session.commit()
+        if activated_now:
+            await _notify_store_staff_about_handoff(
+                session_factory=session_factory,
+                settings=settings,
+                store_id=resolved_store_id,
+                inbound_message=inbound_message,
+                reply_text=result.reply.reply_text,
+            )
+    return result
 
 
 async def deliver_pending_notifications(

@@ -2,6 +2,71 @@
 
 {% block content %}
 <section class="rounded-[2rem] border border-white/70 bg-white/85 p-6 shadow-card backdrop-blur">
+    <div class="flex items-center justify-between gap-3">
+        <div>
+            <p class="text-xs font-semibold uppercase tracking-[0.3em] text-slate-500">Handoff</p>
+            <h2 class="mt-2 text-2xl font-semibold text-slate-950">{{ handoffs_title }}</h2>
+        </div>
+        <span class="rounded-full bg-slate-950 px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-white">
+            {{ handoffs|length }} activas
+        </span>
+    </div>
+    <div class="mt-5 grid gap-4 xl:grid-cols-2">
+        {% for handoff in handoffs %}
+        <article class="rounded-[1.75rem] border border-amber-200 bg-amber-50/80 p-5 shadow-sm">
+            <div class="flex items-start justify-between gap-4">
+                <div>
+                    <h3 class="text-lg font-semibold text-slate-950">{{ handoff.customer_name or customers_fallback_name }}</h3>
+                    <p class="mt-1 text-sm text-slate-500">{{ handoff.customer_phone_number or handoff.external_id }}</p>
+                </div>
+                <span class="rounded-full bg-amber-200 px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-amber-900">
+                    humano
+                </span>
+            </div>
+            {% if handoff.handoff_reason %}
+            <p class="mt-4 text-sm text-slate-700">{{ handoff.handoff_reason }}</p>
+            {% endif %}
+            <div class="mt-4 rounded-2xl bg-white/90 p-4 text-sm text-slate-700">
+                <p class="font-semibold text-slate-950">{{ handoffs_latest_message_label }}</p>
+                <p class="mt-2 whitespace-pre-wrap">{{ handoff.latest_customer_message or "Sin mensajes nuevos." }}</p>
+            </div>
+            <form class="mt-4 space-y-3" method="post" action="/dashboard/handoffs/{{ handoff.conversation_id }}/reply">
+                <label class="block space-y-2 text-sm font-medium text-slate-700">
+                    <span>{{ handoffs_reply_label }}</span>
+                    <textarea
+                        class="min-h-28 w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-ember"
+                        name="message_text"
+                        placeholder="Escribí la respuesta humana..."
+                        required
+                    ></textarea>
+                </label>
+                <div class="flex flex-wrap gap-3">
+                    <button
+                        class="rounded-full bg-ink px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-800"
+                        type="submit"
+                    >
+                        Enviar respuesta
+                    </button>
+                </div>
+            </form>
+            <form class="mt-3" method="post" action="/dashboard/handoffs/{{ handoff.conversation_id }}/release">
+                <button
+                    class="rounded-full border border-slate-300 bg-white px-5 py-3 text-sm font-semibold text-slate-700 transition hover:border-slate-400"
+                    type="submit"
+                >
+                    Devolver al bot
+                </button>
+            </form>
+        </article>
+        {% else %}
+        <article class="rounded-[1.75rem] border border-dashed border-slate-300 bg-slate-50 p-6 text-sm text-slate-600 xl:col-span-2">
+            {{ handoffs_empty_message }}
+        </article>
+        {% endfor %}
+    </div>
+</section>
+
+<section class="rounded-[2rem] border border-white/70 bg-white/85 p-6 shadow-card backdrop-blur">
     <form class="grid gap-4 lg:grid-cols-[minmax(0,1fr)_180px]" method="get">
         <label class="space-y-2 text-sm font-medium text-slate-700">
             <span>{{ customers_query_label }}</span>

@@ -48,6 +48,7 @@ from ruperto.models import (
     utc_now,
 )
 from ruperto.schemas import (
+    ConversationHandoffSnapshot,
     ConversationTargetSnapshot,
     CustomerMemorySnapshot,
     CustomerSnapshot,
@@ -828,6 +829,126 @@ class BusinessRepository:
         state.updated_at = utc_now()
         await self.session.flush()
         return state.pending_customer_message
+
+    async def conversation_is_awaiting_human(self, conversation_id: int) -> bool:
+        """Return whether one conversation is currently paused for human handoff."""
+        state = await self._get_or_create_conversation_state(conversation_id)
+        return state.awaiting_human
+
+    async def activate_conversation_handoff(
+        self,
+        *,
+        conversation_id: int,
+        reason: str | None,
+        latest_customer_message: str | None,
+    ) -> bool:
+        """Mark one conversation as waiting for a human operator."""
+        state = await self._get_or_create_conversation_state(conversation_id)
+        now = utc_now()
+        was_inactive = not state.awaiting_human
+        state.awaiting_human = True
+        state.handoff_reason = reason.strip() if reason else None
+        if state.handoff_requested_at is None:
+            state.handoff_requested_at = now
+        if latest_customer_message:
+            state.handoff_latest_customer_message = latest_customer_message.strip()
+            state.handoff_last_customer_message_at = now
+        state.updated_at = now
+        await self.session.flush()
+        return was_inactive
+
+    async def record_handoff_customer_message(self, conversation_id: int, message_text: str) -> None:
+        """Update the latest customer message while a conversation waits for a human."""
+        state = await self._get_or_create_conversation_state(conversation_id)
+        now = utc_now()
+        state.handoff_latest_customer_message = message_text.strip()
+        state.handoff_last_customer_message_at = now
+        state.updated_at = now
+        await self.session.flush()
+
+    async def mark_handoff_operator_reply(self, conversation_id: int) -> None:
+        """Record that a human operator sent one reply during the handoff."""
+        state = await self._get_or_create_conversation_state(conversation_id)
+        now = utc_now()
+        state.handoff_last_operator_reply_at = now
+        state.updated_at = now
+        await self.session.flush()
+
+    async def release_conversation_handoff(self, conversation_id: int) -> bool:
+        """Return one conversation from human handoff mode back to the bot."""
+        state = await self._get_or_create_conversation_state(conversation_id)
+        if not state.awaiting_human:
+            return False
+        state.awaiting_human = False
+        state.handoff_reason = None
+        state.handoff_requested_at = None
+        state.handoff_latest_customer_message = None
+        state.handoff_last_customer_message_at = None
+        state.handoff_last_operator_reply_at = None
+        state.updated_at = utc_now()
+        await self.session.flush()
+        return True
+
+    async def list_active_conversation_handoffs(self, *, store_id: int) -> list[ConversationHandoffSnapshot]:
+        """List conversations currently waiting for a human in one store."""
+        rows = (
+            await self.session.execute(
+                select(Conversation, ConversationState, Customer)
+                .join(ConversationState, ConversationState.conversation_id == Conversation.id)
+                .join(Customer, Customer.id == Conversation.customer_id)
+                .where(
+                    Conversation.store_id == store_id,
+                    Conversation.channel == Channel.WHATSAPP,
+                    ConversationState.awaiting_human.is_(True),
+                )
+                .order_by(
+                    ConversationState.handoff_requested_at.desc().nullslast(),
+                    Conversation.updated_at.desc(),
+                    Conversation.id.desc(),
+                )
+            )
+        ).all()
+        return [
+            ConversationHandoffSnapshot(
+                conversation_id=conversation.id,
+                store_id=conversation.store_id,
+                channel=conversation.channel,
+                external_id=conversation.external_id,
+                customer_id=customer.id,
+                customer_name=customer.name,
+                customer_phone_number=customer.phone_number,
+                handoff_reason=state.handoff_reason,
+                latest_customer_message=state.handoff_latest_customer_message,
+                requested_at=state.handoff_requested_at,
+                last_customer_message_at=state.handoff_last_customer_message_at,
+                last_operator_reply_at=state.handoff_last_operator_reply_at,
+            )
+            for conversation, state, customer in rows
+        ]
+
+    async def get_conversation_target(
+        self,
+        *,
+        conversation_id: int,
+        store_id: int,
+    ) -> ConversationTargetSnapshot | None:
+        """Return the outbound target for one conversation inside the given store."""
+        target = await self.session.execute(
+            select(Conversation.id, Conversation.channel, Conversation.store_id, Conversation.external_id).where(
+                Conversation.id == conversation_id,
+                Conversation.store_id == store_id,
+            )
+        )
+        row = target.one_or_none()
+        if row is None:
+            return None
+        resolved_conversation_id, channel, resolved_store_id, external_id = row
+        return ConversationTargetSnapshot(
+            conversation_id=resolved_conversation_id,
+            channel=channel,
+            store_id=resolved_store_id,
+            external_id=external_id,
+        )
 
     async def append_conversation_messages(self, conversation_id: int, messages: list[ModelMessage]) -> None:
         """Persist the newly generated PydanticAI messages for a conversation."""

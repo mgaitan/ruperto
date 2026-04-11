@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import anyio
 import pytest
@@ -39,6 +39,7 @@ from ruperto.app import (
     resolve_dev_demo_identity,
     serialize_store_hours_for_dashboard,
 )
+from ruperto.channels.base import ChannelDeliveryError
 from ruperto.config import Settings
 from ruperto.db import create_database_runtime, init_database
 from ruperto.mail import SignupEmailDeliveryError
@@ -53,6 +54,7 @@ from ruperto.models import (
     StaffRole,
     StaffUser,
     StoreMembership,
+    StoreProfile,
     StoreVertical,
 )
 from ruperto.repository import BusinessRepository
@@ -81,6 +83,7 @@ MIN_MENU_ITEMS = 35
 DEFAULT_WEEKLY_HOURS = 7
 TENANT_STORE_ID = 7
 SMTP_PORT = 587
+HANDOFF_AUTO_REPLY_ERROR = "The bot should not send an automatic reply during human handoff."
 
 
 def build_settings(
@@ -371,6 +374,42 @@ async def create_dev_municipal_case(settings: Settings, *, external_user_id: str
         await session.commit()
     await runtime.engine.dispose()
     return created_case.id
+
+
+async def create_whatsapp_handoff_conversation(settings: Settings) -> int:
+    """Create one WhatsApp conversation already waiting for a human reply."""
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(
+            channel=Channel.WHATSAPP,
+            external_id="+5493513308454",
+            phone_number="+5493513308454",
+        )
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.WHATSAPP,
+            external_id="+5493513308454",
+            customer_id=customer.id,
+        )
+        await repository.update_store_channel_connection(
+            store_id=settings.default_store_id,
+            channel=Channel.WHATSAPP,
+            payload=StoreChannelConnectionUpdateRequest(
+                phone_number_id="597907523413541",
+                api_key="kapso-key",
+                webhook_secret="kapso-secret",
+                is_active=True,
+            ),
+        )
+        await repository.activate_conversation_handoff(
+            conversation_id=conversation.id,
+            reason="Te paso con una persona del equipo.",
+            latest_customer_message="Necesito hablar con alguien.",
+        )
+        await session.commit()
+    await runtime.engine.dispose()
+    return conversation.id
 
 
 def test_root_endpoint(tmp_path: Path):
@@ -731,10 +770,47 @@ def test_home_signup_reports_smtp_delivery_errors_as_json(tmp_path: Path):
                 "password": "super-secret-123",
                 "vertical": StoreVertical.ORDERING.value,
             },
+            headers={"accept": "application/json"},
         )
 
     assert response.status_code == HTTP_SERVICE_UNAVAILABLE
     assert response.json() == {"detail": "Could not deliver signup email."}
+
+
+def test_home_signup_direct_route_raises_http_exception_for_json_email_failures(tmp_path: Path):
+    """The signup endpoint raises the JSON HTTP exception branch outside HTML form flows."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "smtp_server": "smtp.example.com",
+            "smtp_port": SMTP_PORT,
+            "smtp_user": "mailer@example.com",
+            "smtp_password": SecretStr("smtp-secret"),
+        }
+    )
+    app = create_app(settings)
+
+    async def run_signup():
+        request = with_request_form(
+            build_request(app, path="/signup", method="POST", headers={"accept": "application/json"}),
+            {
+                "store_name": "Tenant JSON Directo",
+                "full_name": "Falla Directa",
+                "email": "falla-directa@example.com",
+                "password": "super-secret-123",
+                "vertical": StoreVertical.ORDERING.value,
+            },
+        )
+        return await get_route_endpoint(app, "/signup", "POST")(request=request)
+
+    with (
+        patch("ruperto.app.send_signup_welcome_email", side_effect=SignupEmailDeliveryError()),
+        TestClient(app),
+        pytest.raises(HTTPException) as error,
+    ):
+        anyio.run(run_signup)
+
+    assert error.value.status_code == HTTP_SERVICE_UNAVAILABLE
+    assert error.value.detail == "Could not deliver signup email."
 
 
 def test_demo_chat_page_renders_municipal_prompts_per_slug(tmp_path: Path):
@@ -858,7 +934,7 @@ def test_enrich_kapso_payload_from_headers_backfills_event_metadata():
 
 def test_enrich_kapso_payload_from_headers_keeps_non_mapping_payloads_unchanged():
     """Header enrichment leaves non-dict webhook payloads untouched."""
-    payload = ["hola"]
+    payload = ["not-a-dict"]
 
     assert enrich_kapso_payload_from_headers(payload=payload, headers={"X-Webhook-Event": "ignored"}) == payload
 
@@ -1137,6 +1213,93 @@ def test_kapso_webhook_processes_header_only_event_payloads(tmp_path: Path, mock
     assert response.json() == {"status": "ok", "processed": 1}
     assert handled_messages[0].external_user_id == "+5493513308454"
     assert sent_payloads == [{"to": "+5493513308454", "text": "Hola Pedro, ¿qué te gustaría pedir?"}]
+
+
+def test_kapso_webhook_skips_bot_reply_while_waiting_for_human(tmp_path: Path, mocker):
+    """WhatsApp turns stop auto-replying once the conversation was handed to a human."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "kapso_api_key": SecretStr("kapso-key"),
+            "kapso_phone_number_id": "597907523413541",
+            "kapso_webhook_secret": SecretStr("kapso-secret"),
+        }
+    )
+    conversation_id = anyio.run(lambda: create_whatsapp_handoff_conversation(settings))
+    app = create_app(settings)
+
+    async def fail_if_called(self, message):
+        raise AssertionError(HANDOFF_AUTO_REPLY_ERROR)
+
+    mocker.patch("ruperto.channels.kapso_whatsapp.KapsoWhatsAppGateway.send_text", new=fail_if_called)
+
+    payload = {
+        "message": {
+            "id": "wamid.123",
+            "from": "5493513308454",
+            "timestamp": "1730092800",
+            "type": "text",
+            "text": {"body": "¿Sigue alguien ahí?"},
+        },
+        "conversation": {
+            "id": "conv_123",
+            "phone_number": "+5493513308454",
+            "phone_number_id": "597907523413541",
+            "kapso": {"contact_name": "Pedro"},
+        },
+        "phone_number_id": "597907523413541",
+    }
+    raw_payload = json.dumps(payload).encode("utf-8")
+    signature = build_kapso_signature(payload=raw_payload, secret="kapso-secret")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhooks/whatsapp/kapso",
+            content=raw_payload,
+            headers={
+                "Content-Type": "application/json",
+                "X-Webhook-Signature": signature,
+                "X-Webhook-Event": "whatsapp.message.received",
+            },
+        )
+
+    assert response.status_code == HTTP_OK
+    assert response.json() == {"status": "ok", "processed": 1}
+
+    runtime = create_database_runtime(settings)
+
+    async def assert_latest_message():
+        async with runtime.session_factory() as session:
+            repository = BusinessRepository(session)
+            handoffs = await repository.list_active_conversation_handoffs(store_id=settings.default_store_id)
+        assert handoffs[0].conversation_id == conversation_id
+        assert handoffs[0].latest_customer_message == "¿Sigue alguien ahí?"
+
+    anyio.run(assert_latest_message)
+    anyio.run(runtime.engine.dispose)
+
+
+def test_kapso_webhook_rejects_non_object_json_payloads(tmp_path: Path):
+    """Kapso webhooks require a JSON object after header enrichment."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "kapso_api_key": SecretStr("kapso-key"),
+            "kapso_phone_number_id": "597907523413541",
+            "kapso_webhook_secret": SecretStr("kapso-secret"),
+        }
+    )
+    app = create_app(settings)
+    raw_payload = json.dumps(["not-a-dict"]).encode("utf-8")
+    signature = build_kapso_signature(payload=raw_payload, secret="kapso-secret")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhooks/whatsapp/kapso",
+            content=raw_payload,
+            headers={"Content-Type": "application/json", "X-Webhook-Signature": signature},
+        )
+
+    assert response.status_code == HTTP_BAD_REQUEST
+    assert response.json()["detail"] == "Invalid Kapso webhook payload."
 
 
 def test_format_dashboard_datetime_formats_local_time():
@@ -1874,6 +2037,38 @@ def test_dashboard_login_rejects_invalid_credentials(tmp_path: Path):
     assert "Credenciales inválidas." in response.text
 
 
+def test_dashboard_login_rejects_staff_without_store_memberships(tmp_path: Path):
+    """Staff users without memberships cannot open a dashboard session."""
+    app = create_app(build_settings(tmp_path))
+    authenticated_staff = StaffUser(
+        id=999,
+        email="staff@example.com",
+        full_name="Staff Demo",
+        password_hash="hashed",
+    )
+
+    with (
+        patch.object(
+            BusinessRepository,
+            "authenticate_staff_user",
+            new=AsyncMock(return_value=authenticated_staff),
+        ),
+        patch.object(
+            BusinessRepository,
+            "list_store_memberships_for_staff_user",
+            new=AsyncMock(return_value=[]),
+        ),
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            "/dashboard/login",
+            data={"email": "staff@example.com", "password": "secret123", "next": "/dashboard"},
+        )
+
+    assert response.status_code == HTTP_UNAUTHORIZED
+    assert "Credenciales inválidas." in response.text
+
+
 def test_dashboard_login_page_redirects_when_already_authenticated(tmp_path: Path):
     """The login page redirects authenticated staff back to the dashboard."""
     settings = build_settings(tmp_path)
@@ -1929,6 +2124,8 @@ def test_dashboard_protected_posts_require_login(tmp_path: Path):
         users_response = client.post("/dashboard/settings/users/1/role", data={}, follow_redirects=False)
         order_response = client.post("/dashboard/orders/1/status", data={}, follow_redirects=False)
         switch_response = client.post("/dashboard/active-store", data={}, follow_redirects=False)
+        handoff_reply_response = client.post("/dashboard/handoffs/1/reply", data={}, follow_redirects=False)
+        handoff_release_response = client.post("/dashboard/handoffs/1/release", data={}, follow_redirects=False)
 
     assert profile_response.status_code == HTTP_FOUND
     assert profile_response.headers["location"].startswith("/dashboard/login")
@@ -1942,6 +2139,10 @@ def test_dashboard_protected_posts_require_login(tmp_path: Path):
     assert order_response.headers["location"].startswith("/dashboard/login")
     assert switch_response.status_code == HTTP_FOUND
     assert switch_response.headers["location"].startswith("/dashboard/login")
+    assert handoff_reply_response.status_code == HTTP_FOUND
+    assert handoff_reply_response.headers["location"].startswith("/dashboard/login")
+    assert handoff_release_response.status_code == HTTP_FOUND
+    assert handoff_release_response.headers["location"].startswith("/dashboard/login")
 
 
 def test_dashboard_store_switch_rejects_invalid_requests(tmp_path: Path):
@@ -2016,6 +2217,245 @@ def test_dashboard_customers_search_filters_results(tmp_path: Path, monkeypatch:
     assert "No hay clientes que coincidan con esa búsqueda." in empty_response.text
 
 
+def test_dashboard_customers_page_supports_handoff_reply_and_release(tmp_path: Path, mocker):
+    """Staff can reply manually and release a WhatsApp handoff from the dashboard."""
+    settings = build_settings(tmp_path)
+    conversation_id = anyio.run(lambda: create_whatsapp_handoff_conversation(settings))
+    sent_payloads: list[dict[str, str]] = []
+
+    async def fake_send_text(self, message):
+        sent_payloads.append({"to": message.external_user_id, "text": message.message_text})
+
+    mocker.patch("ruperto.channels.kapso_whatsapp.KapsoWhatsAppGateway.send_text", new=fake_send_text)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        customers_response = client.get("/dashboard/customers")
+        reply_response = client.post(
+            f"/dashboard/handoffs/{conversation_id}/reply",
+            data={"message_text": "Hola, ya lo está revisando una persona del equipo."},
+            follow_redirects=True,
+        )
+        release_response = client.post(
+            f"/dashboard/handoffs/{conversation_id}/release",
+            follow_redirects=True,
+        )
+
+    assert customers_response.status_code == HTTP_OK
+    assert "Conversaciones derivadas a atención humana" in customers_response.text
+    assert "Necesito hablar con alguien." in customers_response.text
+    assert reply_response.status_code == HTTP_OK
+    assert "La respuesta humana ya salió por el canal oficial." in reply_response.text
+    assert sent_payloads == [{"to": "+5493513308454", "text": "Hola, ya lo está revisando una persona del equipo."}]
+    assert release_response.status_code == HTTP_OK
+    assert "La conversación volvió al bot." in release_response.text
+
+    runtime = create_database_runtime(settings)
+
+    async def assert_handoff_released():
+        async with runtime.session_factory() as session:
+            repository = BusinessRepository(session)
+            assert await repository.list_active_conversation_handoffs(store_id=settings.default_store_id) == []
+
+    anyio.run(assert_handoff_released)
+    anyio.run(runtime.engine.dispose)
+
+
+def test_dashboard_handoff_release_succeeds_for_known_conversations(tmp_path: Path):
+    """Operators can release a handoff directly from the dashboard queue."""
+    settings = build_settings(tmp_path)
+    conversation_id = anyio.run(lambda: create_whatsapp_handoff_conversation(settings))
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        response = client.post(f"/dashboard/handoffs/{conversation_id}/release", follow_redirects=False)
+
+    assert response.status_code == HTTP_FOUND
+    assert response.headers["location"] == "/dashboard/customers?flash=handoff-released"
+
+
+def test_dashboard_handoff_reply_validates_missing_message_and_unknown_conversation(tmp_path: Path):
+    """Handoff reply routes surface validation and missing conversation errors."""
+    settings = build_settings(tmp_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        blank_response = client.post("/dashboard/handoffs/1/reply", data={"message_text": "   "})
+        missing_reply_response = client.post("/dashboard/handoffs/999/reply", data={"message_text": "Hola"})
+        missing_release_response = client.post("/dashboard/handoffs/999/release")
+
+    assert blank_response.status_code == HTTP_UNPROCESSABLE_ENTITY
+    assert blank_response.json()["detail"] == "Reply text is required."
+    assert missing_reply_response.status_code == HTTP_NOT_FOUND
+    assert missing_reply_response.json()["detail"] == "Conversation not found."
+    assert missing_release_response.status_code == HTTP_NOT_FOUND
+    assert missing_release_response.json()["detail"] == "Conversation not found."
+
+
+def test_dashboard_handoff_reply_surfaces_unknown_conversations_from_repository(tmp_path: Path):
+    """The reply form returns 404 when the repository cannot resolve the conversation target."""
+    app = create_app(build_settings(tmp_path))
+
+    with (
+        patch.object(BusinessRepository, "get_conversation_target", new=AsyncMock(return_value=None)),
+        TestClient(app) as client,
+    ):
+        login_dashboard(client)
+        response = client.post("/dashboard/handoffs/123/reply", data={"message_text": "Hola"})
+
+    assert response.status_code == HTTP_NOT_FOUND
+    assert response.json()["detail"] == "Conversation not found."
+
+
+def test_dashboard_handoff_reply_rejects_conversations_not_waiting_for_human(tmp_path: Path):
+    """Operators cannot reply through the handoff form before the bot escalates."""
+    settings = build_settings(tmp_path)
+    app = create_app(settings)
+    runtime = create_database_runtime(settings)
+
+    async def prepare_conversation():
+        await init_database(settings=settings, runtime=runtime)
+        async with runtime.session_factory() as session:
+            repository = BusinessRepository(session)
+            customer = await repository.get_or_create_customer(
+                channel=Channel.WHATSAPP,
+                external_id="+5493513308454",
+                phone_number="+5493513308454",
+            )
+            conversation = await repository.get_or_create_conversation(
+                channel=Channel.WHATSAPP,
+                external_id="+5493513308454",
+                customer_id=customer.id,
+            )
+            await session.commit()
+            return conversation.id
+
+    conversation_id = anyio.run(prepare_conversation)
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        response = client.post(
+            f"/dashboard/handoffs/{conversation_id}/reply",
+            data={"message_text": "Hola"},
+        )
+
+    assert response.status_code == HTTP_CONFLICT
+    assert response.json()["detail"] == "Conversation is not waiting for a human."
+    anyio.run(runtime.engine.dispose)
+
+
+def test_dashboard_handoff_reply_checks_awaiting_human_after_resolving_the_target(tmp_path: Path):
+    """The reply route still blocks operator messages until the handoff is active."""
+    app = create_app(build_settings(tmp_path))
+    target = type("Target", (), {"channel": Channel.WHATSAPP, "external_id": "+5493513308454"})()
+
+    with (
+        patch.object(BusinessRepository, "get_conversation_target", new=AsyncMock(return_value=target)),
+        patch.object(BusinessRepository, "conversation_is_awaiting_human", new=AsyncMock(return_value=False)),
+        TestClient(app) as client,
+    ):
+        login_dashboard(client)
+        response = client.post("/dashboard/handoffs/123/reply", data={"message_text": "Hola"})
+
+    assert response.status_code == HTTP_CONFLICT
+    assert response.json()["detail"] == "Conversation is not waiting for a human."
+
+
+def test_dashboard_handoff_release_surfaces_unknown_conversations_from_repository(tmp_path: Path):
+    """The release form returns 404 when the conversation target is no longer available."""
+    app = create_app(build_settings(tmp_path))
+
+    with (
+        patch.object(BusinessRepository, "get_conversation_target", new=AsyncMock(return_value=None)),
+        TestClient(app) as client,
+    ):
+        login_dashboard(client)
+        response = client.post("/dashboard/handoffs/123/release")
+
+    assert response.status_code == HTTP_NOT_FOUND
+    assert response.json()["detail"] == "Conversation not found."
+
+
+def test_dashboard_handoff_release_commits_successful_releases(tmp_path: Path):
+    """Known conversations can leave the handoff queue cleanly."""
+    app = create_app(build_settings(tmp_path))
+    target = type("Target", (), {"channel": Channel.WHATSAPP, "external_id": "+5493513308454"})()
+
+    with (
+        patch.object(BusinessRepository, "get_conversation_target", new=AsyncMock(return_value=target)),
+        patch.object(BusinessRepository, "release_conversation_handoff", new=AsyncMock(return_value=True)),
+        TestClient(app) as client,
+    ):
+        login_dashboard(client)
+        response = client.post("/dashboard/handoffs/123/release", follow_redirects=False)
+
+    assert response.status_code == HTTP_FOUND
+    assert response.headers["location"] == "/dashboard/customers?flash=handoff-released"
+
+
+def test_dashboard_handoff_reply_requires_channel_delivery_configuration(tmp_path: Path):
+    """Operator replies fail fast when the active store lacks a configured gateway."""
+    settings = build_settings(tmp_path)
+    conversation_id = anyio.run(lambda: create_whatsapp_handoff_conversation(settings))
+    app = create_app(settings.model_copy(update={"kapso_api_key": None, "kapso_phone_number_id": None}))
+
+    runtime = create_database_runtime(settings)
+
+    async def clear_connection():
+        await init_database(settings=settings, runtime=runtime)
+        async with runtime.session_factory() as session:
+            repository = BusinessRepository(session)
+            await repository.update_store_channel_connection(
+                store_id=settings.default_store_id,
+                channel=Channel.WHATSAPP,
+                payload=StoreChannelConnectionUpdateRequest(
+                    phone_number_id="sandbox-phone",
+                    api_key="",
+                    webhook_secret=None,
+                    is_active=False,
+                ),
+            )
+            await session.commit()
+
+    anyio.run(clear_connection)
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        response = client.post(
+            f"/dashboard/handoffs/{conversation_id}/reply",
+            data={"message_text": "Hola"},
+        )
+
+    assert response.status_code == HTTP_SERVICE_UNAVAILABLE
+    assert response.json()["detail"] == "Channel delivery is not configured."
+    anyio.run(runtime.engine.dispose)
+
+
+def test_dashboard_handoff_reply_surfaces_channel_delivery_failures(tmp_path: Path, mocker):
+    """Operator replies return a controlled error when the provider rejects delivery."""
+    settings = build_settings(tmp_path)
+    conversation_id = anyio.run(lambda: create_whatsapp_handoff_conversation(settings))
+
+    async def fail_send_text(self, message):
+        raise ChannelDeliveryError()
+
+    mocker.patch("ruperto.channels.kapso_whatsapp.KapsoWhatsAppGateway.send_text", new=fail_send_text)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        response = client.post(
+            f"/dashboard/handoffs/{conversation_id}/reply",
+            data={"message_text": "Hola"},
+        )
+
+    assert response.status_code == HTTP_SERVICE_UNAVAILABLE
+    assert response.json()["detail"] == "Could not deliver the reply through the channel."
+
+
 def test_dashboard_settings_pages_render_menu_filters_and_profile_data(tmp_path: Path):
     """Settings pages render their dedicated content and menu filters work."""
     app = create_app(build_settings(tmp_path))
@@ -2088,6 +2528,47 @@ def test_dashboard_kanban_page_renders_for_municipal_staff(tmp_path: Path):
     assert response.status_code == HTTP_OK
     assert "Tablero Kanban" in response.text
     assert "Todas las áreas" in response.text
+
+
+def test_dashboard_kanban_page_redirects_anonymous_staff_to_login(tmp_path: Path):
+    """The municipal Kanban page keeps the usual dashboard auth guard."""
+    settings = build_settings(tmp_path, store_vertical=StoreVertical.MUNICIPAL, store_slug="mi-muni")
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.get("/dashboard/kanban", follow_redirects=False)
+
+    assert response.status_code == HTTP_FOUND
+    assert response.headers["location"] == "/dashboard/login?next=%2Fdashboard%2Fkanban&flash=login-required"
+
+
+def test_dashboard_kanban_page_loads_municipal_areas_for_the_active_store(tmp_path: Path):
+    """The Kanban page always fetches active municipal areas before rendering."""
+    settings = build_settings(tmp_path, store_vertical=StoreVertical.MUNICIPAL, store_slug="mi-muni")
+    app = create_app(settings)
+    municipal_store = StoreProfile(
+        id=1,
+        slug="mi-muni",
+        store_name="Mi muni",
+        bot_name="Ruperto",
+        store_description="Municipio de prueba",
+        assistant_personality="Amable",
+        vertical=StoreVertical.MUNICIPAL,
+        locale="es-AR",
+        currency_code="ARS",
+    )
+    list_areas = AsyncMock(return_value=[])
+
+    with (
+        patch.object(BusinessRepository, "get_store_profile", new=AsyncMock(return_value=municipal_store)),
+        patch.object(BusinessRepository, "list_municipal_areas", new=list_areas),
+        TestClient(app) as client,
+    ):
+        login_dashboard(client)
+        response = client.get("/dashboard/kanban")
+
+    assert response.status_code == HTTP_OK
+    list_areas.assert_awaited_once_with(store_id=settings.default_store_id, only_active=True)
 
 
 def test_dashboard_municipal_catalog_forms_can_create_areas_and_categories(tmp_path: Path):
@@ -2187,6 +2668,32 @@ def test_dashboard_municipal_area_form_rejects_invalid_payloads_and_non_municipa
         )
 
     assert disabled_response.status_code == HTTP_NOT_FOUND
+
+
+def test_dashboard_municipal_area_form_uses_store_vertical_guard(tmp_path: Path):
+    """Area creation checks the active store vertical before writing municipal data."""
+    app = create_app(build_settings(tmp_path))
+    ordering_store = StoreProfile(
+        id=1,
+        slug="test-rotiseria",
+        store_name="Test Rotisería",
+        bot_name="Ruperto",
+        store_description="Rotisería de prueba",
+        assistant_personality="Amable",
+        vertical=StoreVertical.ORDERING,
+        locale="es-AR",
+        currency_code="ARS",
+    )
+
+    with (
+        patch.object(BusinessRepository, "get_store_profile", new=AsyncMock(return_value=ordering_store)),
+        TestClient(app) as client,
+    ):
+        login_dashboard(client)
+        response = client.post("/dashboard/settings/municipal/areas", data={"name": "Arbolado"})
+
+    assert response.status_code == HTTP_NOT_FOUND
+    assert response.json()["detail"] == "Municipal catalog not enabled."
 
 
 def test_dashboard_municipal_category_form_handles_auth_validation_and_missing_area(tmp_path: Path):

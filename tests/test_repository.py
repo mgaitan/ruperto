@@ -1257,6 +1257,49 @@ async def test_legacy_conversation_table_gains_store_id_column(tmp_path: Path):
     assert migrated_row == (1,)
 
 
+async def test_legacy_conversation_state_table_gains_handoff_columns(tmp_path: Path):
+    """Legacy conversation state rows gain the additive human-handoff columns."""
+    database_path = tmp_path / "legacy-conversation-state.db"
+    sync_engine = create_engine(f"sqlite:///{database_path}")
+    with sync_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE conversation_state (
+                    id INTEGER PRIMARY KEY,
+                    conversation_id INTEGER NOT NULL,
+                    pending_customer_message TEXT,
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO conversation_state (
+                    id, conversation_id, pending_customer_message, created_at, updated_at
+                ) VALUES (
+                    1, 10, 'hola', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        _ensure_schema_columns(connection)
+    sync_engine.dispose()
+
+    with sqlite3.connect(database_path) as sqlite_connection:
+        columns = {row[1] for row in sqlite_connection.execute("PRAGMA table_info(conversation_state)")}
+
+    assert "awaiting_human" in columns
+    assert "handoff_reason" in columns
+    assert "handoff_requested_at" in columns
+    assert "handoff_latest_customer_message" in columns
+    assert "handoff_last_customer_message_at" in columns
+    assert "handoff_last_operator_reply_at" in columns
+
+
 async def test_legacy_municipal_categories_gain_request_kind_column(tmp_path: Path):
     """Legacy municipal catalogs gain request-kind semantics during schema checks."""
     database_path = tmp_path / "legacy-municipal-category.db"
@@ -2813,6 +2856,96 @@ async def test_store_channel_runtime_returns_none_for_incomplete_connections(tmp
         )
         is None
     )
+
+    await close_repository(repository, runtime)
+
+
+async def test_conversation_handoff_helpers_cover_missing_paths(tmp_path: Path):
+    """Conversation handoff helpers report clean null paths when nothing is active."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="handoff-user")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="handoff-user",
+        customer_id=customer.id,
+    )
+
+    assert await repository.get_conversation_target(conversation_id=9999, store_id=1) is None
+    assert await repository.release_conversation_handoff(conversation.id) is False
+
+    await close_repository(repository, runtime)
+
+
+async def test_conversation_handoff_helpers_track_operator_replies_and_release_state(tmp_path: Path):
+    """Handoff helpers persist operator timestamps and clear state on release."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(
+        channel=Channel.WHATSAPP,
+        external_id="+5493513308454",
+        phone_number="+5493513308454",
+    )
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.WHATSAPP,
+        external_id="+5493513308454",
+        customer_id=customer.id,
+    )
+
+    await repository.activate_conversation_handoff(
+        conversation_id=conversation.id,
+        reason="Te paso con una persona del equipo.",
+        latest_customer_message="Necesito ayuda urgente.",
+    )
+    await repository.mark_handoff_operator_reply(conversation.id)
+    target = await repository.get_conversation_target(conversation_id=conversation.id, store_id=1)
+    handoffs = await repository.list_active_conversation_handoffs(store_id=1)
+
+    assert target is not None
+    assert target.conversation_id == conversation.id
+    assert target.external_id == "+5493513308454"
+    assert len(handoffs) == 1
+    assert handoffs[0].last_operator_reply_at is not None
+    assert handoffs[0].latest_customer_message == "Necesito ayuda urgente."
+    assert await repository.release_conversation_handoff(conversation.id) is True
+    assert await repository.list_active_conversation_handoffs(store_id=1) == []
+
+    await close_repository(repository, runtime)
+
+
+async def test_list_active_conversation_handoffs_only_returns_whatsapp_conversations(tmp_path: Path):
+    """The staff queue only surfaces handoffs that the dashboard can answer."""
+    repository, runtime = await build_repository(tmp_path)
+    whatsapp_customer = await repository.get_or_create_customer(
+        channel=Channel.WHATSAPP,
+        external_id="+5493513308454",
+        phone_number="+5493513308454",
+    )
+    whatsapp_conversation = await repository.get_or_create_conversation(
+        channel=Channel.WHATSAPP,
+        external_id="+5493513308454",
+        customer_id=whatsapp_customer.id,
+    )
+    dev_customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="handoff-dev")
+    dev_conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="handoff-dev",
+        customer_id=dev_customer.id,
+    )
+
+    await repository.activate_conversation_handoff(
+        conversation_id=whatsapp_conversation.id,
+        reason="Te paso con una persona del equipo.",
+        latest_customer_message="Necesito ayuda urgente.",
+    )
+    await repository.activate_conversation_handoff(
+        conversation_id=dev_conversation.id,
+        reason="Te paso con una persona del equipo.",
+        latest_customer_message="Hola desde el demo.",
+    )
+
+    handoffs = await repository.list_active_conversation_handoffs(store_id=1)
+
+    assert [handoff.conversation_id for handoff in handoffs] == [whatsapp_conversation.id]
+    assert handoffs[0].channel == Channel.WHATSAPP
 
     await close_repository(repository, runtime)
 

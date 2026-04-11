@@ -272,6 +272,12 @@ class ConversationState(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     conversation_id: Mapped[int] = mapped_column(ForeignKey("conversation.id", ondelete="CASCADE"))
     pending_customer_message: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    awaiting_human: Mapped[bool] = mapped_column(default=False)
+    handoff_reason: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    handoff_requested_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    handoff_latest_customer_message: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    handoff_last_customer_message_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    handoff_last_operator_reply_at: Mapped[datetime | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(default=utc_now, onupdate=utc_now)
 

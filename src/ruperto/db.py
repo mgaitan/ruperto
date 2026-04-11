@@ -273,6 +273,7 @@ def _ensure_schema_columns(connection: Connection) -> None:
     _ensure_customer_tenancy_columns(connection, inspector=inspector)
     _ensure_outbound_notification_table(connection, inspector=inspector)
     _ensure_conversation_columns(connection, inspector=inspector)
+    _ensure_conversation_state_columns(connection, inspector=inspector)
     _ensure_store_channel_connection_table(connection, inspector=inspector)
     _ensure_store_business_hours_shape(connection, inspector=inspector)
     _ensure_municipal_category_columns(connection, inspector=inspector)
@@ -372,6 +373,26 @@ def _ensure_conversation_columns(connection: Connection, *, inspector: Inspector
             )
             connection.execute(text("UPDATE conversation SET store_id = 1 WHERE store_id IS NULL"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_conversation_store_id ON conversation (store_id)"))
+
+
+def _ensure_conversation_state_columns(connection: Connection, *, inspector: Inspector) -> None:
+    """Additive migration for persisted human-handoff conversation state."""
+    if "conversation_state" not in inspector.get_table_names():
+        return
+
+    state_columns = {column["name"] for column in inspector.get_columns("conversation_state")}
+    if "awaiting_human" not in state_columns:
+        connection.execute(text("ALTER TABLE conversation_state ADD COLUMN awaiting_human BOOLEAN NOT NULL DEFAULT 0"))
+    if "handoff_reason" not in state_columns:
+        connection.execute(text("ALTER TABLE conversation_state ADD COLUMN handoff_reason TEXT"))
+    if "handoff_requested_at" not in state_columns:
+        connection.execute(text("ALTER TABLE conversation_state ADD COLUMN handoff_requested_at DATETIME"))
+    if "handoff_latest_customer_message" not in state_columns:
+        connection.execute(text("ALTER TABLE conversation_state ADD COLUMN handoff_latest_customer_message TEXT"))
+    if "handoff_last_customer_message_at" not in state_columns:
+        connection.execute(text("ALTER TABLE conversation_state ADD COLUMN handoff_last_customer_message_at DATETIME"))
+    if "handoff_last_operator_reply_at" not in state_columns:
+        connection.execute(text("ALTER TABLE conversation_state ADD COLUMN handoff_last_operator_reply_at DATETIME"))
 
 
 def _ensure_store_channel_connection_table(connection: Connection, *, inspector: Inspector) -> None:
