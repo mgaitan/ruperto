@@ -35,6 +35,7 @@ from ruperto.app import (
     resolve_dev_demo_identity,
     serialize_store_hours_for_dashboard,
 )
+from ruperto.channels.base import ChannelDeliveryError
 from ruperto.config import Settings
 from ruperto.db import create_database_runtime, init_database
 from ruperto.mail import SignupEmailDeliveryError
@@ -2136,6 +2137,28 @@ def test_dashboard_handoff_reply_requires_channel_delivery_configuration(tmp_pat
     assert response.status_code == HTTP_SERVICE_UNAVAILABLE
     assert response.json()["detail"] == "Channel delivery is not configured."
     anyio.run(runtime.engine.dispose)
+
+
+def test_dashboard_handoff_reply_surfaces_channel_delivery_failures(tmp_path: Path, mocker):
+    """Operator replies return a controlled error when the provider rejects delivery."""
+    settings = build_settings(tmp_path)
+    conversation_id = anyio.run(lambda: create_whatsapp_handoff_conversation(settings))
+
+    async def fail_send_text(self, message):
+        raise ChannelDeliveryError()
+
+    mocker.patch("ruperto.channels.kapso_whatsapp.KapsoWhatsAppGateway.send_text", new=fail_send_text)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        response = client.post(
+            f"/dashboard/handoffs/{conversation_id}/reply",
+            data={"message_text": "Hola"},
+        )
+
+    assert response.status_code == HTTP_SERVICE_UNAVAILABLE
+    assert response.json()["detail"] == "Could not deliver the reply through the channel."
 
 
 def test_dashboard_settings_pages_render_menu_filters_and_profile_data(tmp_path: Path):

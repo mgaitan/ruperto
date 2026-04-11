@@ -896,7 +896,11 @@ class BusinessRepository:
                 select(Conversation, ConversationState, Customer)
                 .join(ConversationState, ConversationState.conversation_id == Conversation.id)
                 .join(Customer, Customer.id == Conversation.customer_id)
-                .where(Conversation.store_id == store_id, ConversationState.awaiting_human.is_(True))
+                .where(
+                    Conversation.store_id == store_id,
+                    Conversation.channel == Channel.WHATSAPP,
+                    ConversationState.awaiting_human.is_(True),
+                )
                 .order_by(
                     ConversationState.handoff_requested_at.desc().nullslast(),
                     Conversation.updated_at.desc(),

@@ -1192,13 +1192,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
         )
         if gateway is None:
             raise HTTPException(status_code=503, detail="Channel delivery is not configured.")
-        await gateway.send_text(
-            OutboundCustomerMessage(
-                channel=target.channel,
-                external_user_id=target.external_id,
-                message_text=message_text,
+        try:
+            await gateway.send_text(
+                OutboundCustomerMessage(
+                    channel=target.channel,
+                    external_user_id=target.external_id,
+                    message_text=message_text,
+                )
             )
-        )
+        except ChannelDeliveryError as error:
+            raise HTTPException(status_code=503, detail="Could not deliver the reply through the channel.") from error
         async with runtime.database.session_factory() as session:
             repository = BusinessRepository(session)
             await repository.mark_handoff_operator_reply(conversation_id)

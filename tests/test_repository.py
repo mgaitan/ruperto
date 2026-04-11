@@ -2714,6 +2714,45 @@ async def test_conversation_handoff_helpers_cover_missing_paths(tmp_path: Path):
     await close_repository(repository, runtime)
 
 
+async def test_list_active_conversation_handoffs_only_returns_whatsapp_conversations(tmp_path: Path):
+    """The staff queue only surfaces handoffs that the dashboard can answer."""
+    repository, runtime = await build_repository(tmp_path)
+    whatsapp_customer = await repository.get_or_create_customer(
+        channel=Channel.WHATSAPP,
+        external_id="+5493513308454",
+        phone_number="+5493513308454",
+    )
+    whatsapp_conversation = await repository.get_or_create_conversation(
+        channel=Channel.WHATSAPP,
+        external_id="+5493513308454",
+        customer_id=whatsapp_customer.id,
+    )
+    dev_customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="handoff-dev")
+    dev_conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="handoff-dev",
+        customer_id=dev_customer.id,
+    )
+
+    await repository.activate_conversation_handoff(
+        conversation_id=whatsapp_conversation.id,
+        reason="Te paso con una persona del equipo.",
+        latest_customer_message="Necesito ayuda urgente.",
+    )
+    await repository.activate_conversation_handoff(
+        conversation_id=dev_conversation.id,
+        reason="Te paso con una persona del equipo.",
+        latest_customer_message="Hola desde el demo.",
+    )
+
+    handoffs = await repository.list_active_conversation_handoffs(store_id=1)
+
+    assert [handoff.conversation_id for handoff in handoffs] == [whatsapp_conversation.id]
+    assert handoffs[0].channel == Channel.WHATSAPP
+
+    await close_repository(repository, runtime)
+
+
 async def test_staff_user_refresh_rehashes_password_and_updates_role(tmp_path: Path):
     """Refreshing an existing staff user updates both credentials and membership role."""
     repository, runtime = await build_repository(tmp_path)
