@@ -20,7 +20,7 @@ from pydantic_ai.providers.google import GoogleProvider
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ruperto.config import Settings
-from ruperto.models import Channel, DeliveryType, PaymentMethod
+from ruperto.models import Channel, DeliveryType, OrderStatus, PaymentMethod
 from ruperto.repository import BusinessRepository, IncompleteOrderError
 from ruperto.schemas import (
     AssistantNextStep,
@@ -244,6 +244,23 @@ EXPLICIT_CONFIRMATION_HINTS = (
     "cerralo",
     "cerrá el pedido",
     "confirmar pedido",
+)
+ORDER_STATUS_FOLLOW_UP_HINTS = (
+    "estado del pedido",
+    "cómo va mi pedido",
+    "como va mi pedido",
+    "cómo viene mi pedido",
+    "como viene mi pedido",
+    "en qué está mi pedido",
+    "en qué esta mi pedido",
+    "en que está mi pedido",
+    "en que esta mi pedido",
+    "dónde viene mi pedido",
+    "donde viene mi pedido",
+    "ya salió mi pedido",
+    "ya salio mi pedido",
+    "cuánto falta para mi pedido",
+    "cuanto falta para mi pedido",
 )
 ORDER_CORRECTION_HINTS = (
     "dije",
@@ -979,8 +996,25 @@ class OrderingAssistantService:
 
             customer = name_handling.customer
             resumed_pending_message = name_handling.resumed_pending_message
+            effective_message_text = resumed_pending_message or message_text
+            order_status_follow_up = self._maybe_build_order_status_follow_up_result(
+                conversation_id=conversation.id,
+                customer=customer,
+                current_order=current_order_before_run,
+                latest_order=latest_order_before_run,
+                message_text=effective_message_text,
+            )
+            if order_status_follow_up is not None:
+                await self._persist_direct_reply(
+                    repository=repository,
+                    conversation_id=conversation.id,
+                    user_text=effective_message_text,
+                    reply_text=order_status_follow_up.reply.reply_text,
+                )
+                await session.commit()
+                return order_status_follow_up
             turn_policy = self._analyze_turn_policy(
-                resumed_pending_message or message_text,
+                effective_message_text,
                 current_order=current_order_before_run,
             )
             deps = AssistantDeps(
@@ -1488,6 +1522,82 @@ class OrderingAssistantService:
         if not candidate_tokens:
             return None
         return candidate_tokens[0].title()
+
+    def _maybe_build_order_status_follow_up_result(
+        self,
+        *,
+        conversation_id: int,
+        customer: CustomerSnapshot,
+        current_order: OrderSnapshot | None,
+        latest_order: OrderSnapshot | None,
+        message_text: str,
+    ) -> AssistantTurnResult | None:
+        """Return a deterministic reply when the customer is asking about an existing order status."""
+        if not self._message_requests_order_status_follow_up(message_text):
+            return None
+
+        tracked_order = current_order or latest_order
+        if tracked_order is None:
+            return AssistantTurnResult(
+                conversation_id=conversation_id,
+                customer=customer,
+                reply=AssistantReply(
+                    reply_text="Todavía no veo un pedido reciente por acá. Si querés, armamos uno nuevo.",
+                    next_step=AssistantNextStep.CHOOSE_ITEMS,
+                ),
+                current_order=None,
+            )
+
+        if tracked_order.status == OrderStatus.DRAFT:
+            return AssistantTurnResult(
+                conversation_id=conversation_id,
+                customer=customer,
+                reply=AssistantReply(
+                    reply_text=self._build_draft_order_follow_up_reply(tracked_order),
+                    next_step=self._next_step_for_current_order(tracked_order),
+                ),
+                current_order=tracked_order,
+            )
+
+        return AssistantTurnResult(
+            conversation_id=conversation_id,
+            customer=customer,
+            reply=AssistantReply(
+                reply_text=self._build_order_status_follow_up_reply(tracked_order),
+                next_step=AssistantNextStep.COMPLETE,
+            ),
+            current_order=tracked_order,
+        )
+
+    def _message_requests_order_status_follow_up(self, message_text: str) -> bool:
+        """Return whether the latest customer turn is asking about an existing order status."""
+        lowered = " ".join(message_text.casefold().split())
+        return any(hint in lowered for hint in ORDER_STATUS_FOLLOW_UP_HINTS)
+
+    def _build_draft_order_follow_up_reply(self, current_order: OrderSnapshot) -> str:
+        """Explain that the current order still needs checkout data before it can progress."""
+        if not current_order.items:
+            return "Todavía no veo un pedido armado. Si querés, decime qué te gustaría pedir."
+        if current_order.delivery_type is None:
+            return "Tu pedido todavía está en borrador. Falta definir si es envío o retiro."
+        if current_order.delivery_type == DeliveryType.DELIVERY and current_order.delivery_address is None:
+            return "Tu pedido todavía está en borrador. Falta confirmar la dirección de envío."
+        if current_order.payment_method is None:
+            return "Tu pedido todavía está en borrador. Falta definir el medio de pago."
+        return "Tu pedido todavía está en borrador. Si querés, confirmámelo y lo cierro por acá."
+
+    def _build_order_status_follow_up_reply(self, current_order: OrderSnapshot) -> str:
+        """Return short status copy for one already created order."""
+        status_text = {
+            OrderStatus.CONFIRMED: "ya quedó confirmado y lo estamos preparando.",
+            OrderStatus.IN_PREPARATION: "ya está en preparación 👨‍🍳",
+            OrderStatus.ALMOST_READY: "ya casi está listo 👀",
+            OrderStatus.READY_FOR_PICKUP: "ya está listo para retirar 🙌",
+            OrderStatus.OUT_FOR_DELIVERY: "ya salió y va en camino 🚚",
+            OrderStatus.DELIVERED: "ya figura como entregado.",
+            OrderStatus.CANCELLED: "fue cancelado.",
+        }[current_order.status]
+        return f"Tu pedido #{current_order.id} {status_text}"
 
     def _analyze_turn_policy(self, message_text: str, *, current_order: OrderSnapshot | None) -> TurnPolicy:
         """Return deterministic mutation/confirmation guardrails for the current turn."""

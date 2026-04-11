@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from typing import Protocol, cast
 
@@ -14,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ruperto.assistant import build_google_model
 from ruperto.config import Settings
-from ruperto.models import Channel
+from ruperto.models import Channel, MunicipalCaseStatus
 from ruperto.repository import UNSET, BusinessRepository
 from ruperto.schemas import (
     AssistantNextStep,
@@ -53,6 +54,19 @@ MUNICIPAL_AGGRESSIVE_LANGUAGE_HINTS = (
     "hijo de puta",
     "hdp",
 )
+MUNICIPAL_CASE_TRACKING_HINTS = (
+    "estado",
+    "seguimiento",
+    "cómo va",
+    "como va",
+    "qué pasó",
+    "que paso",
+    "qué onda",
+    "que onda",
+    "mi caso",
+    "mi reclamo",
+    "mi solicitud",
+)
 
 MUNICIPAL_VAGUE_LOCATION_HINTS = {
     "aca",
@@ -69,6 +83,7 @@ MUNICIPAL_VAGUE_LOCATION_HINTS = {
     "por ahi",
     "por ahí",
 }
+MUNICIPAL_CASE_NUMBER_PATTERN = re.compile(r"\bcaso\s*#?\s*(?P<case_id>\d+)\b", re.IGNORECASE)
 MIN_LOCATION_TEXT_LENGTH = 8
 
 MUNICIPAL_MODEL_UNAVAILABLE_REPLY = (
@@ -235,6 +250,13 @@ class MunicipalAssistantService:
             draft = await repository.get_municipal_case_draft(conversation_id=conversation.id)
             areas = await repository.list_municipal_areas(store_id=resolved_store_id, only_active=True)
             categories = await repository.list_municipal_categories(store_id=resolved_store_id, only_active=True)
+            tracked_case = await self._maybe_get_tracked_case(
+                repository=repository,
+                customer=customer,
+                store_id=resolved_store_id,
+                draft=draft,
+                message_text=message_text,
+            )
             await session.commit()
 
         if not areas:
@@ -246,6 +268,27 @@ class MunicipalAssistantService:
                     next_step=AssistantNextStep.HANDOFF,
                     handoff=True,
                 ),
+                current_order=None,
+            )
+        if tracked_case is not None:
+            tracked_snapshot, requested_case_id = tracked_case
+            if tracked_snapshot is None:
+                reply = AssistantReply(
+                    reply_text=self._build_missing_case_follow_up_reply(case_id=requested_case_id),
+                    next_step=AssistantNextStep.CHOOSE_AREA,
+                )
+            else:
+                reply = AssistantReply(
+                    reply_text=self._build_case_tracking_reply(
+                        case_snapshot=tracked_snapshot,
+                        categories=categories,
+                    ),
+                    next_step=AssistantNextStep.COMPLETE,
+                )
+            return AssistantTurnResult(
+                conversation_id=conversation.id,
+                customer=customer,
+                reply=reply,
                 current_order=None,
             )
 
@@ -306,6 +349,28 @@ class MunicipalAssistantService:
             reply=reply,
             current_order=None,
         )
+
+    async def _maybe_get_tracked_case(
+        self,
+        *,
+        repository: BusinessRepository,
+        customer: CustomerSnapshot,
+        store_id: int,
+        draft: MunicipalCaseDraftSnapshot | None,
+        message_text: str,
+    ) -> tuple[MunicipalCaseSnapshot | None, int | None] | None:
+        """Return the requested municipal case when the citizen is following up on an existing ticket."""
+        case_id = self._extract_case_number(message_text)
+        if case_id is None and draft is not None and self._draft_is_active(draft):
+            return None
+        if case_id is None and not self._message_requests_case_follow_up(message_text):
+            return None
+
+        return (
+            await repository.get_customer_municipal_case(case_id, customer_id=customer.id, store_id=store_id)
+            if case_id is not None
+            else await repository.get_latest_customer_municipal_case(customer_id=customer.id, store_id=store_id)
+        ), case_id
 
     async def _interpret_turn(
         self,
@@ -608,6 +673,32 @@ class MunicipalAssistantService:
             ]
         )
 
+    def _build_case_tracking_reply(
+        self,
+        *,
+        case_snapshot: MunicipalCaseSnapshot,
+        categories: list[MunicipalCategorySnapshot],
+    ) -> str:
+        """Render a proactive follow-up answer about one already created municipal case."""
+        noun = self._noun_for_case(case_snapshot=case_snapshot, categories=categories)
+        status_text = self._municipal_case_status_text(case_snapshot.status)
+        lines = [f"Tu {noun} #{case_snapshot.id} {status_text}."]
+        if case_snapshot.title:
+            lines.extend(["", f"**Detalle**\n{case_snapshot.title}"])
+        if case_snapshot.location_text:
+            lines.extend(["", f"**Ubicación**\n{case_snapshot.location_text}"])
+        lines.extend(["", "Si querés, también puedo ayudarte a cargar otro caso nuevo por acá."])
+        return "\n".join(lines)
+
+    def _build_missing_case_follow_up_reply(self, *, case_id: int | None) -> str:
+        """Render a safe fallback when the requested municipal case cannot be found."""
+        if case_id is not None:
+            return (
+                f"No encuentro un caso tuyo con el número #{case_id}. "
+                "Si querés, probá con otro número o contame qué pasó y te ayudo a cargarlo."
+            )
+        return "Todavía no encuentro un caso tuyo para seguir por acá. Si querés, contame qué pasó y lo cargamos."
+
     def _draft_has_location(self, draft: MunicipalCaseDraftSnapshot) -> bool:
         """Return whether the municipal draft already has enough location context."""
         if draft.latitude is not None and draft.longitude is not None:
@@ -615,6 +706,18 @@ class MunicipalAssistantService:
         if draft.location_text is None:
             return False
         return self._location_text_is_specific_enough(draft.location_text)
+
+    def _draft_is_active(self, draft: MunicipalCaseDraftSnapshot) -> bool:
+        """Return whether the draft already has enough data to keep intake in the foreground."""
+        return any(
+            value is not None
+            for value in (
+                draft.area_id,
+                draft.category_id,
+                draft.request_summary,
+                draft.location_text,
+            )
+        )
 
     def _display_name(self, customer_name: str | None) -> str | None:
         """Return a short customer-facing name when one is available."""
@@ -642,10 +745,22 @@ class MunicipalAssistantService:
         lowered = " ".join(message_text.lower().split())
         return any(hint in lowered for hint in MUNICIPAL_CONFIRMATION_HINTS)
 
+    def _message_requests_case_follow_up(self, message_text: str) -> bool:
+        """Return whether the citizen is asking about an already created municipal case."""
+        lowered = " ".join(message_text.casefold().split())
+        return any(hint in lowered for hint in MUNICIPAL_CASE_TRACKING_HINTS)
+
     def _message_contains_aggressive_language(self, message_text: str) -> bool:
         """Return whether the turn contains insulting or aggressive phrasing."""
         lowered = " ".join(message_text.casefold().split())
         return any(hint in lowered for hint in MUNICIPAL_AGGRESSIVE_LANGUAGE_HINTS)
+
+    def _extract_case_number(self, message_text: str) -> int | None:
+        """Extract one explicit municipal case identifier from the latest message."""
+        match = MUNICIPAL_CASE_NUMBER_PATTERN.search(message_text)
+        if match is None:
+            return None
+        return int(match.group("case_id"))
 
     def _location_text_is_specific_enough(self, location_text: str) -> bool:
         """Return whether the saved location looks usable for staff follow-up."""
@@ -677,6 +792,30 @@ class MunicipalAssistantService:
         if draft is not None and draft.area_id is not None:
             return "Te puedo ayudar con eso, pero necesito que me expliques qué pasa sin insultos así lo cargo bien."
         return "Te puedo ayudar con eso. Contame qué está pasando, sin insultos, y te ayudo a ubicarlo."
+
+    def _noun_for_case(
+        self,
+        *,
+        case_snapshot: MunicipalCaseSnapshot,
+        categories: list[MunicipalCategorySnapshot],
+    ) -> str:
+        """Return the citizen-facing noun that matches one stored municipal case."""
+        category = next((item for item in categories if item.id == case_snapshot.category_id), None)
+        if category is None:
+            return "caso"
+        return self._noun(category)
+
+    def _municipal_case_status_text(self, status: MunicipalCaseStatus) -> str:
+        """Return short status copy for one municipal case follow-up reply."""
+        return {
+            MunicipalCaseStatus.NEW: "ya quedó registrado y está esperando revisión",
+            MunicipalCaseStatus.TRIAGED: "ya está en revisión",
+            MunicipalCaseStatus.IN_PROGRESS: "ya está en gestión",
+            MunicipalCaseStatus.BLOCKED: "está bloqueado por el momento",
+            MunicipalCaseStatus.RESOLVED: "ya fue resuelto",
+            MunicipalCaseStatus.CLOSED: "ya fue cerrado",
+            MunicipalCaseStatus.CANCELLED: "fue cancelado",
+        }[status]
 
     def _build_model_unavailable_result(
         self,

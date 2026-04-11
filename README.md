@@ -163,12 +163,18 @@ The municipal intake also keeps a few guardrails in the chat layer: it asks
 for a more precise location before submitting a case, nudges the citizen to
 rephrase if the message contains insults, and uses the person's first name in
 the final confirmation to keep the tone concise and natural.
+When the same citizen comes back later, the municipal assistant can now also
+answer proactive follow-up questions such as "¿cómo va mi caso?" or "¿qué pasó
+con mi caso #12?" without forcing a brand-new intake flow first.
 There is now also a first production-shaped WhatsApp integration path through
 Kapso: the backend can receive inbound text messages from the
 `/webhooks/whatsapp/kapso` endpoint, answer through the Kapso proxy, and send
 automatic ready/almost-ready/out-for-delivery notifications when a WhatsApp
 order changes status. The adapter is intentionally isolated behind a channel
 layer so future providers or channels do not leak into the assistant logic.
+The ordering assistant can also answer proactive follow-up questions such as
+"¿cómo va mi pedido?" from stored order state, even before a new inbound
+notification is sent.
 Kapso credentials can still come from environment variables as a development
 fallback, but the recommended path for multi-store setups is now to configure
 each local's WhatsApp connection from the dashboard agent settings page.

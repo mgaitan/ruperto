@@ -998,6 +998,28 @@ def test_kapso_webhook_requires_runtime_configuration(tmp_path: Path):
     assert response.status_code == HTTP_SERVICE_UNAVAILABLE
 
 
+def test_kapso_webhook_rejects_non_object_payloads(tmp_path: Path):
+    """Kapso webhook payloads must decode into JSON objects."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "kapso_api_key": SecretStr("kapso-key"),
+            "kapso_phone_number_id": "597907523413541",
+            "kapso_webhook_secret": SecretStr("kapso-secret"),
+        }
+    )
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhooks/whatsapp/kapso",
+            content=b"[]",
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert response.status_code == HTTP_BAD_REQUEST
+    assert response.json() == {"detail": "Invalid Kapso webhook payload."}
+
+
 def test_dashboard_agent_channel_form_requires_login(tmp_path: Path):
     """Channel settings are protected behind the same dashboard login as the rest of the panel."""
     app = create_app(build_settings(tmp_path))

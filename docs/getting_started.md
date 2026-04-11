@@ -182,6 +182,9 @@ When that order belongs to a WhatsApp conversation handled through Kapso, the
 backend now tries to deliver the matching proactive customer notification
 automatically through the same channel instead of waiting for the next inbound
 message.
+If the customer writes back asking "¿cómo va mi pedido?", the same chat can now
+answer from the stored order state without waiting for another operational
+update first.
 
 You can also replace the weekly opening-hours schedule. Each weekday accepts
 zero or more slots, so leaving a day without open ranges means the store stays
@@ -209,7 +212,9 @@ catalog with municipal areas and categories, and the shared chat endpoint
 guides neighbors through a first complaint/request intake before creating the
 municipal case. That intake only accepts a usable location before submission,
 asks for a respectful rephrase if the message becomes insulting, and keeps the
-final confirmation brief by addressing the citizen by first name.
+final confirmation brief by addressing the citizen by first name. Once a case
+already exists, the same chat can also answer proactive follow-up questions
+about the latest case or an explicit `caso #<n>` reference.
 
 If one dashboard user belongs to more than one store, the header lets staff
 switch the active store. That switch already scopes the editable store profile
