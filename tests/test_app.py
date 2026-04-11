@@ -15,12 +15,15 @@ from unittest.mock import patch
 
 import anyio
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from itsdangerous import TimestampSigner
 from pydantic import SecretStr
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from sqlalchemy import select
+from starlette.datastructures import FormData
+from starlette.requests import Request as StarletteRequest
 
 from ruperto.app import (
     app as package_app,
@@ -31,6 +34,7 @@ from ruperto.app import (
     enrich_kapso_payload_from_headers,
     extract_kapso_phone_number_id,
     format_dashboard_datetime,
+    load_dashboard_identity,
     parse_store_hours_form,
     resolve_dev_demo_identity,
     serialize_store_hours_for_dashboard,
@@ -40,11 +44,14 @@ from ruperto.db import create_database_runtime, init_database
 from ruperto.mail import SignupEmailDeliveryError
 from ruperto.models import (
     Channel,
+    ChannelProvider,
     DeliveryType,
     MunicipalCaseStatus,
+    MunicipalRequestKind,
     OrderStatus,
     PaymentMethod,
     StaffRole,
+    StaffUser,
     StoreMembership,
     StoreVertical,
 )
@@ -53,7 +60,12 @@ from ruperto.schemas import (
     AssistantTurnResult,
     MunicipalCaseCreateRequest,
     MunicipalCaseStatusUpdateRequest,
+    OrderStatusUpdateRequest,
     StoreBusinessHoursSnapshot,
+    StoreBusinessHoursUpdateEntry,
+    StoreBusinessHoursUpdateRequest,
+    StoreChannelConnectionUpdateRequest,
+    StoreProfileUpdateRequest,
 )
 
 HTTP_OK = 200
@@ -92,6 +104,9 @@ def build_settings(
         dashboard_admin_email="staff@example.com",
         dashboard_admin_password=SecretStr("super-secret"),
         dashboard_admin_name="Staff User",
+        kapso_api_key=None,
+        kapso_phone_number_id=None,
+        kapso_webhook_secret=None,
     )
 
 
@@ -114,6 +129,60 @@ def set_dashboard_session(client: TestClient, settings: Settings, session_data: 
     signer = TimestampSigner(settings.dashboard_session_secret)
     payload = b64encode(json.dumps(session_data).encode("utf-8"))
     client.cookies.set("session", signer.sign(payload).decode("utf-8"))
+
+
+def build_request(
+    app,
+    *,
+    path: str,
+    method: str = "GET",
+    session: dict[str, int] | None = None,
+    headers: dict[str, str] | None = None,
+) -> StarletteRequest:
+    """Create a bare Starlette request with session data for direct endpoint calls."""
+    normalized_headers = {
+        "host": "testserver",
+        **(headers or {}),
+    }
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("utf-8"),
+        "query_string": b"",
+        "headers": [(key.lower().encode("utf-8"), value.encode("utf-8")) for key, value in normalized_headers.items()],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+        "app": app,
+        "session": session or {},
+    }
+    return StarletteRequest(scope)
+
+
+def get_route_endpoint(app, path: str, method: str):
+    """Return the route endpoint registered for one path and method."""
+    for route in app.router.routes:
+        if getattr(route, "path", None) == path and method in getattr(route, "methods", set()):
+            return route.endpoint
+    msg = f"Could not find route {method} {path!r}"
+    raise AssertionError(msg)
+
+
+async def form_data(values: dict[str, str]) -> FormData:
+    """Return a form payload compatible with direct request overrides."""
+    return FormData(values)
+
+
+def with_request_form(request: StarletteRequest, values: dict[str, str]) -> StarletteRequest:
+    """Override one request form reader in a type-checker-friendly way."""
+
+    async def _form() -> FormData:
+        return await form_data(values)
+
+    cast(Any, request).form = _form
+    return request
 
 
 async def add_second_store_membership(settings: Settings):
@@ -527,6 +596,39 @@ def test_home_signup_sends_welcome_email_when_smtp_is_configured(tmp_path: Path)
     assert call["vertical"] == StoreVertical.ORDERING
 
 
+def test_home_signup_direct_route_call_covers_smtp_success_branch(tmp_path: Path):
+    """Direct signup handler calls cover the SMTP success branch under Python 3.13 coverage."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "smtp_server": "smtp.example.com",
+            "smtp_port": SMTP_PORT,
+            "smtp_user": "mailer@example.com",
+            "smtp_password": SecretStr("smtp-secret"),
+        }
+    )
+    app = create_app(settings)
+
+    async def run_signup():
+        request = with_request_form(
+            build_request(app, path="/signup", method="POST"),
+            {
+                "store_name": "Rotiseria Centro Directa",
+                "full_name": "Nora Directa",
+                "email": "nora-directa@example.com",
+                "password": "super-secret-123",
+                "vertical": StoreVertical.ORDERING.value,
+            },
+        )
+        return await get_route_endpoint(app, "/signup", "POST")(request=request)
+
+    with patch("ruperto.app.send_signup_welcome_email") as send_signup_email, TestClient(app):
+        response = anyio.run(run_signup)
+
+    assert response.status_code == HTTP_FOUND
+    assert response.headers["location"] == "/dashboard"
+    send_signup_email.assert_called_once()
+
+
 def test_home_signup_reports_smtp_delivery_errors_and_rolls_back(tmp_path: Path):
     """Configured SMTP failures abort the signup instead of hiding the error."""
     settings = build_settings(tmp_path).model_copy(
@@ -754,9 +856,11 @@ def test_enrich_kapso_payload_from_headers_backfills_event_metadata():
     assert enriched_mapping["batch"] is True
 
 
-def test_enrich_kapso_payload_from_headers_leaves_non_mapping_payloads_untouched():
-    """Non-object payloads should pass through unchanged before webhook validation."""
-    assert enrich_kapso_payload_from_headers(payload=["hola"], headers={}) == ["hola"]
+def test_enrich_kapso_payload_from_headers_keeps_non_mapping_payloads_unchanged():
+    """Header enrichment leaves non-dict webhook payloads untouched."""
+    payload = ["hola"]
+
+    assert enrich_kapso_payload_from_headers(payload=payload, headers={"X-Webhook-Event": "ignored"}) == payload
 
 
 def test_kapso_webhook_requires_valid_signature(tmp_path: Path):
@@ -876,6 +980,30 @@ def test_kapso_webhook_rejects_invalid_json(tmp_path: Path):
         )
 
     assert response.status_code == HTTP_BAD_REQUEST
+
+
+def test_kapso_webhook_rejects_non_object_json_payload(tmp_path: Path):
+    """Kapso webhook payloads must decode to a JSON object."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "kapso_api_key": SecretStr("kapso-key"),
+            "kapso_phone_number_id": "597907523413541",
+            "kapso_webhook_secret": SecretStr("kapso-secret"),
+        }
+    )
+    app = create_app(settings)
+    raw_payload = json.dumps(["not", "an", "object"]).encode("utf-8")
+    signature = build_kapso_signature(payload=raw_payload, secret="kapso-secret")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhooks/whatsapp/kapso",
+            content=raw_payload,
+            headers={"Content-Type": "application/json", "X-Webhook-Signature": signature},
+        )
+
+    assert response.status_code == HTTP_BAD_REQUEST
+    assert response.json() == {"detail": "Invalid Kapso webhook payload."}
 
 
 def test_kapso_webhook_processes_inbound_message_and_sends_reply(tmp_path: Path, mocker):
@@ -2220,6 +2348,832 @@ def test_dashboard_redirects_stale_or_invalid_sessions_to_login(tmp_path: Path):
 
     assert stale_user_response.status_code == HTTP_FOUND
     assert stale_user_response.headers["location"].startswith("/dashboard/login")
+
+
+def test_dashboard_invalid_session_is_cleared_when_memberships_disappear(tmp_path: Path):
+    """App-level dashboard identity clears the browser session without memberships too."""
+    settings = build_settings(tmp_path)
+    app = create_app(settings)
+
+    async def strip_memberships():
+        runtime = app.state.runtime
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            staff_user = await repository.get_staff_user_by_email("staff@example.com")
+            assert staff_user is not None
+            memberships = (
+                await session.scalars(select(StoreMembership).where(StoreMembership.staff_user_id == staff_user.id))
+            ).all()
+            for membership in memberships:
+                await session.delete(membership)
+            await session.commit()
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        anyio.run(strip_memberships)
+        response = client.get("/dashboard", follow_redirects=False)
+
+    assert response.status_code == HTTP_FOUND
+    assert response.headers["location"].startswith("/dashboard/login")
+
+
+def test_load_dashboard_identity_clears_inactive_staff_sessions(tmp_path: Path):
+    """Inactive staff users are logged out before the dashboard resolves identity."""
+    settings = build_settings(tmp_path)
+    app = create_app(settings)
+
+    async def resolve_identity_with_inactive_staff():
+        runtime = app.state.runtime
+        async with runtime.database.session_factory() as session:
+            staff_user = await session.scalar(select(StaffUser).where(StaffUser.email == "staff@example.com"))
+            assert staff_user is not None
+            staff_user.is_active = False
+            staff_user_id = staff_user.id
+            await session.commit()
+        request = build_request(
+            app,
+            path="/dashboard",
+            session={"dashboard_staff_user_id": staff_user_id, "dashboard_store_id": 1},
+        )
+        return await load_dashboard_identity(request), request.session
+
+    with TestClient(app):
+        identity, session_data = anyio.run(resolve_identity_with_inactive_staff)
+
+    assert identity is None
+    assert session_data == {}
+
+
+def test_load_dashboard_identity_clears_sessions_without_memberships_directly(tmp_path: Path):
+    """Identity resolution clears sessions when the staff user lost every membership."""
+    settings = build_settings(tmp_path)
+    app = create_app(settings)
+
+    async def resolve_identity_without_memberships():
+        runtime = app.state.runtime
+        async with runtime.database.session_factory() as session:
+            staff_user = await session.scalar(select(StaffUser).where(StaffUser.email == "staff@example.com"))
+            assert staff_user is not None
+            memberships = (
+                await session.scalars(select(StoreMembership).where(StoreMembership.staff_user_id == staff_user.id))
+            ).all()
+            for membership in memberships:
+                await session.delete(membership)
+            await session.commit()
+            staff_user_id = staff_user.id
+        request = build_request(
+            app,
+            path="/dashboard",
+            session={"dashboard_staff_user_id": staff_user_id, "dashboard_store_id": 1},
+        )
+        return await load_dashboard_identity(request), request.session
+
+    with TestClient(app):
+        identity, session_data = anyio.run(resolve_identity_without_memberships)
+
+    assert identity is None
+    assert session_data == {}
+
+
+async def exercise_dashboard_success_routes(ordering_app, municipal_app, municipal_slug: str):
+    """Drive direct dashboard route calls that coverage misses in Python 3.13."""
+    ordering_runtime = ordering_app.state.runtime
+    municipal_runtime = municipal_app.state.runtime
+    async with ordering_runtime.database.session_factory() as session:
+        repository = BusinessRepository(session)
+        ordering_staff = await repository.get_staff_user_by_email("staff@example.com")
+        assert ordering_staff is not None
+        customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="coverage-user")
+        await repository.get_or_create_conversation(
+            channel=Channel.DEV,
+            external_id="coverage-user",
+            customer_id=customer.id,
+        )
+        await session.commit()
+    async with municipal_runtime.database.session_factory() as session:
+        repository = BusinessRepository(session)
+        municipal_staff = await repository.get_staff_user_by_email("staff@example.com")
+        assert municipal_staff is not None
+        water_area = next(
+            area for area in await repository.list_municipal_areas(store_id=1) if area.name == "Solicitud de agua"
+        )
+        await repository.update_store_channel_connection(
+            store_id=1,
+            channel=Channel.WHATSAPP,
+            provider=ChannelProvider.KAPSO,
+            payload=StoreChannelConnectionUpdateRequest(
+                phone_number_id="597907523413541",
+                api_key="kapso-key",
+                webhook_secret="kapso-secret",
+                is_active=True,
+            ),
+        )
+        await session.commit()
+
+    ordering_session = {"dashboard_staff_user_id": ordering_staff.id, "dashboard_store_id": 1}
+    municipal_session = {"dashboard_staff_user_id": municipal_staff.id, "dashboard_store_id": 1}
+
+    dashboard_home_response = await get_route_endpoint(ordering_app, "/dashboard", "GET")(
+        request=build_request(ordering_app, path="/dashboard", session=ordering_session),
+    )
+    dashboard_customers_response = await get_route_endpoint(ordering_app, "/dashboard/customers", "GET")(
+        request=build_request(ordering_app, path="/dashboard/customers", session=ordering_session),
+    )
+    ordering_menu_response = await get_route_endpoint(ordering_app, "/dashboard/settings/menu", "GET")(
+        request=build_request(ordering_app, path="/dashboard/settings/menu", session=ordering_session),
+    )
+    municipal_menu_response = await get_route_endpoint(municipal_app, "/dashboard/settings/menu", "GET")(
+        request=build_request(municipal_app, path="/dashboard/settings/menu", session=municipal_session),
+    )
+
+    area_request = build_request(
+        municipal_app,
+        path="/dashboard/settings/municipal/areas",
+        method="POST",
+        session=municipal_session,
+    )
+    area_request = with_request_form(
+        area_request,
+        {"name": "Defensa civil", "description": "", "display_order": "5"},
+    )
+    create_area_response = await get_route_endpoint(municipal_app, "/dashboard/settings/municipal/areas", "POST")(
+        request=area_request,
+    )
+
+    category_request = build_request(
+        municipal_app,
+        path="/dashboard/settings/municipal/categories",
+        method="POST",
+        session=municipal_session,
+    )
+    category_request = with_request_form(
+        category_request,
+        {
+            "area_id": str(water_area.id),
+            "name": "Refuerzo",
+            "description": "",
+            "request_kind": MunicipalRequestKind.REQUEST.value,
+            "display_order": "3",
+        },
+    )
+    create_category_response = await get_route_endpoint(
+        municipal_app,
+        "/dashboard/settings/municipal/categories",
+        "POST",
+    )(request=category_request)
+
+    profile_request = build_request(
+        ordering_app,
+        path="/dashboard/settings/profile",
+        method="POST",
+        session=ordering_session,
+    )
+    profile_request = with_request_form(
+        profile_request,
+        {
+            "store_name": "Cobertura Rotisería",
+            "store_location": "Alta Gracia",
+            "store_description": "Cobertura de dashboard.",
+            "transfer_alias": "cobertura.rotiseria",
+        },
+    )
+    profile_response = await get_route_endpoint(ordering_app, "/dashboard/settings/profile", "POST")(
+        request=profile_request,
+    )
+
+    agent_get_response = await get_route_endpoint(ordering_app, "/dashboard/settings/agent", "GET")(
+        request=build_request(ordering_app, path="/dashboard/settings/agent", session=ordering_session),
+    )
+
+    agent_request = build_request(
+        ordering_app,
+        path="/dashboard/settings/agent",
+        method="POST",
+        session=ordering_session,
+    )
+    agent_request = with_request_form(
+        agent_request,
+        {"bot_name": "Cobertura Bot", "assistant_personality": "Helpful and brief."},
+    )
+    agent_post_response = await get_route_endpoint(ordering_app, "/dashboard/settings/agent", "POST")(
+        request=agent_request,
+    )
+
+    channel_request = build_request(
+        ordering_app,
+        path="/dashboard/settings/agent/channel",
+        method="POST",
+        session=ordering_session,
+    )
+    channel_request = with_request_form(
+        channel_request,
+        {
+            "kapso_phone_number_id": "597907523413541",
+            "kapso_api_key": "kapso-key",
+            "kapso_webhook_secret": "kapso-secret",
+            "kapso_is_active": "on",
+        },
+    )
+    channel_response = await get_route_endpoint(ordering_app, "/dashboard/settings/agent/channel", "POST")(
+        request=channel_request,
+    )
+
+    hours_get_response = await get_route_endpoint(ordering_app, "/dashboard/settings/hours", "GET")(
+        request=build_request(ordering_app, path="/dashboard/settings/hours", session=ordering_session),
+    )
+    users_get_response = await get_route_endpoint(ordering_app, "/dashboard/settings/users", "GET")(
+        request=build_request(ordering_app, path="/dashboard/settings/users", session=ordering_session),
+    )
+
+    hours_request = build_request(
+        ordering_app,
+        path="/dashboard/settings/hours",
+        method="POST",
+        session=ordering_session,
+    )
+    hours_request = with_request_form(
+        hours_request,
+        {"opens_at_1_0": "11:30", "closes_at_1_0": "15:00"},
+    )
+    hours_post_response = await get_route_endpoint(ordering_app, "/dashboard/settings/hours", "POST")(
+        request=hours_request,
+    )
+
+    store_profile_response = await get_route_endpoint(ordering_app, "/api/store-profile", "PUT")(
+        request=build_request(ordering_app, path="/api/store-profile", method="PUT"),
+        payload=StoreProfileUpdateRequest(
+            store_name="Cobertura Rotisería",
+            bot_name="Cobertura Bot",
+            store_location="Alta Gracia",
+            store_description="Cobertura de dashboard.",
+            assistant_personality="Helpful and brief.",
+            transfer_alias="cobertura.rotiseria",
+        ),
+    )
+
+    store_hours_response = await get_route_endpoint(ordering_app, "/api/store-hours", "PUT")(
+        request=build_request(ordering_app, path="/api/store-hours", method="PUT"),
+        payload=StoreBusinessHoursUpdateRequest(
+            hours=[
+                StoreBusinessHoursUpdateEntry(
+                    weekday=1,
+                    slot_index=0,
+                    opens_at="11:30",
+                    closes_at="15:00",
+                    closed=False,
+                )
+            ]
+        ),
+    )
+
+    notifications_response = await get_route_endpoint(ordering_app, "/api/dev/notifications", "GET")(
+        request=build_request(ordering_app, path="/api/dev/notifications"),
+        external_user_id="coverage-user",
+        phone_number=None,
+        use_phone_identity=False,
+    )
+    scoped_notifications_response = await get_route_endpoint(
+        municipal_app,
+        "/api/dev/notifications/{store_slug}",
+        "GET",
+    )(
+        request=build_request(municipal_app, path=f"/api/dev/notifications/{municipal_slug}"),
+        store_slug=municipal_slug,
+        external_user_id="coverage-user",
+        phone_number=None,
+        use_phone_identity=False,
+    )
+
+    return {
+        "dashboard_home_response": dashboard_home_response,
+        "dashboard_customers_response": dashboard_customers_response,
+        "ordering_menu_response": ordering_menu_response,
+        "municipal_menu_response": municipal_menu_response,
+        "create_area_response": create_area_response,
+        "create_category_response": create_category_response,
+        "profile_response": profile_response,
+        "agent_get_response": agent_get_response,
+        "agent_post_response": agent_post_response,
+        "channel_response": channel_response,
+        "hours_get_response": hours_get_response,
+        "users_get_response": users_get_response,
+        "hours_post_response": hours_post_response,
+        "store_profile_response": store_profile_response,
+        "store_hours_response": store_hours_response,
+        "notifications_response": notifications_response,
+        "scoped_notifications_response": scoped_notifications_response,
+    }
+
+
+def test_dashboard_direct_route_calls_cover_shared_controller_success_paths(tmp_path: Path):
+    """Direct endpoint calls cover shared dashboard success paths under Python 3.13 coverage."""
+    (tmp_path / "ordering").mkdir()
+    (tmp_path / "municipal").mkdir()
+    ordering_settings = build_settings(tmp_path / "ordering")
+    municipal_settings = build_settings(
+        tmp_path / "municipal",
+        store_vertical=StoreVertical.MUNICIPAL,
+        store_slug="mi-muni",
+    )
+    ordering_app = create_app(ordering_settings)
+    municipal_app = create_app(municipal_settings)
+
+    with TestClient(ordering_app), TestClient(municipal_app):
+        responses = anyio.run(
+            exercise_dashboard_success_routes,
+            ordering_app,
+            municipal_app,
+            municipal_settings.store_slug,
+        )
+
+    assert responses["dashboard_home_response"].status_code == HTTP_OK
+    assert responses["dashboard_customers_response"].status_code == HTTP_OK
+    assert responses["ordering_menu_response"].status_code == HTTP_OK
+    assert responses["municipal_menu_response"].status_code == HTTP_OK
+    assert (
+        responses["create_area_response"].headers["location"] == "/dashboard/settings/menu?flash=municipal-area-created"
+    )
+    assert (
+        responses["create_category_response"].headers["location"]
+        == "/dashboard/settings/menu?flash=municipal-category-created"
+    )
+    assert responses["profile_response"].headers["location"] == "/dashboard/settings/profile?flash=profile-updated"
+    assert responses["agent_get_response"].status_code == HTTP_OK
+    assert responses["agent_post_response"].headers["location"] == "/dashboard/settings/agent?flash=agent-updated"
+    assert responses["channel_response"].headers["location"] == "/dashboard/settings/agent?flash=agent-updated"
+    assert responses["hours_get_response"].status_code == HTTP_OK
+    assert responses["users_get_response"].status_code == HTTP_OK
+    assert responses["hours_post_response"].headers["location"] == "/dashboard/settings/hours?flash=hours-updated"
+    assert responses["store_profile_response"].store_name == "Cobertura Rotisería"
+    assert len(responses["store_hours_response"]) == DEFAULT_WEEKLY_HOURS
+    assert responses["notifications_response"] == []
+    assert responses["scoped_notifications_response"] == []
+
+
+async def exercise_dashboard_error_routes(app):
+    """Drive direct dashboard error branches that coverage misses in Python 3.13."""
+    runtime = app.state.runtime
+    async with runtime.database.session_factory() as session:
+        repository = BusinessRepository(session)
+        staff_user = await repository.get_staff_user_by_email("staff@example.com")
+        assert staff_user is not None
+        session_data = {"dashboard_staff_user_id": staff_user.id, "dashboard_store_id": 1}
+
+    duplicate_request = build_request(
+        app,
+        path="/signup",
+        method="POST",
+        headers={"accept": "text/html"},
+    )
+    duplicate_request = with_request_form(
+        duplicate_request,
+        {
+            "store_name": "Otro Tenant",
+            "full_name": "Staff Duplicado",
+            "email": "staff@example.com",
+            "password": "super-secret-123",
+            "vertical": StoreVertical.ORDERING.value,
+        },
+    )
+    duplicate_response = await get_route_endpoint(app, "/signup", "POST")(request=duplicate_request)
+
+    missing_membership_response = None
+    try:
+        role_request = build_request(
+            app,
+            path="/dashboard/settings/users/999/role",
+            method="POST",
+            session=session_data,
+        )
+        role_request = with_request_form(role_request, {"role": StaffRole.MANAGER.value})
+        await get_route_endpoint(app, "/dashboard/settings/users/{membership_id}/role", "POST")(
+            request=role_request,
+            membership_id=999,
+        )
+    except HTTPException as error:
+        missing_membership_response = error
+
+    missing_order_response = None
+    try:
+        order_request = build_request(
+            app,
+            path="/dashboard/orders/999/status",
+            method="POST",
+            session=session_data,
+        )
+        order_request = with_request_form(order_request, {"status": OrderStatus.CONFIRMED.value})
+        await get_route_endpoint(app, "/dashboard/orders/{order_id}/status", "POST")(
+            request=order_request,
+            order_id=999,
+        )
+    except HTTPException as error:
+        missing_order_response = error
+
+    missing_api_order_response = None
+    try:
+        await get_route_endpoint(app, "/api/orders/{order_id}/status", "PATCH")(
+            request=build_request(app, path="/api/orders/999/status", method="PATCH"),
+            order_id=999,
+            payload=OrderStatusUpdateRequest(status=OrderStatus.CONFIRMED),
+        )
+    except HTTPException as error:
+        missing_api_order_response = error
+
+    return duplicate_response, missing_membership_response, missing_order_response, missing_api_order_response
+
+
+def test_dashboard_direct_route_calls_cover_shared_controller_error_paths(tmp_path: Path):
+    """Direct endpoint calls cover shared dashboard error handling branches too."""
+    settings = build_settings(tmp_path)
+    app = create_app(settings)
+
+    with TestClient(app):
+        duplicate_response, missing_membership_response, missing_order_response, missing_api_order_response = anyio.run(
+            exercise_dashboard_error_routes,
+            app,
+        )
+
+    assert duplicate_response.status_code == HTTP_CONFLICT
+    assert missing_membership_response is not None
+    assert missing_membership_response.status_code == HTTP_NOT_FOUND
+    assert missing_order_response is not None
+    assert missing_order_response.status_code == HTTP_NOT_FOUND
+    assert missing_api_order_response is not None
+    assert missing_api_order_response.status_code == HTTP_NOT_FOUND
+
+
+def test_dashboard_category_route_covers_non_municipal_and_missing_area_errors(tmp_path: Path):
+    """Municipal category creation fails cleanly for wrong verticals and unknown areas."""
+    (tmp_path / "ordering").mkdir()
+    (tmp_path / "municipal").mkdir()
+    ordering_app = create_app(build_settings(tmp_path / "ordering"))
+    municipal_app = create_app(build_settings(tmp_path / "municipal", store_vertical=StoreVertical.MUNICIPAL))
+
+    async def exercise_category_errors():
+        ordering_runtime = ordering_app.state.runtime
+        municipal_runtime = municipal_app.state.runtime
+        async with ordering_runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            staff_user = await repository.get_staff_user_by_email("staff@example.com")
+            assert staff_user is not None
+            ordering_session = {"dashboard_staff_user_id": staff_user.id, "dashboard_store_id": 1}
+        async with municipal_runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            staff_user = await repository.get_staff_user_by_email("staff@example.com")
+            assert staff_user is not None
+            municipal_session = {"dashboard_staff_user_id": staff_user.id, "dashboard_store_id": 1}
+
+        ordering_request = build_request(
+            ordering_app,
+            path="/dashboard/settings/municipal/categories",
+            method="POST",
+            session=ordering_session,
+        )
+        ordering_request = with_request_form(
+            ordering_request,
+            {
+                "area_id": "1",
+                "name": "Consulta",
+                "description": "",
+                "request_kind": MunicipalRequestKind.REQUEST.value,
+                "display_order": "1",
+            },
+        )
+        municipal_request = build_request(
+            municipal_app,
+            path="/dashboard/settings/municipal/categories",
+            method="POST",
+            session=municipal_session,
+        )
+        municipal_request = with_request_form(
+            municipal_request,
+            {
+                "area_id": "999",
+                "name": "Consulta",
+                "description": "",
+                "request_kind": MunicipalRequestKind.REQUEST.value,
+                "display_order": "1",
+            },
+        )
+        category_endpoint = get_route_endpoint(municipal_app, "/dashboard/settings/municipal/categories", "POST")
+        with pytest.raises(HTTPException) as non_municipal_error:
+            await get_route_endpoint(ordering_app, "/dashboard/settings/municipal/categories", "POST")(
+                request=ordering_request,
+            )
+        with pytest.raises(HTTPException) as missing_area_error:
+            await category_endpoint(request=municipal_request)
+        return non_municipal_error.value, missing_area_error.value
+
+    with TestClient(ordering_app), TestClient(municipal_app):
+        non_municipal_error, missing_area_error = anyio.run(exercise_category_errors)
+
+    assert non_municipal_error.status_code == HTTP_NOT_FOUND
+    assert missing_area_error.status_code == HTTP_NOT_FOUND
+
+
+def test_dashboard_profile_and_agent_routes_cover_validation_errors(tmp_path: Path):
+    """Direct profile handlers raise 422 responses when required form fields are missing."""
+    settings = build_settings(tmp_path)
+    app = create_app(settings)
+
+    async def exercise_validation_errors():
+        runtime = app.state.runtime
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            staff_user = await repository.get_staff_user_by_email("staff@example.com")
+            assert staff_user is not None
+            session_data = {"dashboard_staff_user_id": staff_user.id, "dashboard_store_id": 1}
+
+        profile_request = build_request(
+            app,
+            path="/dashboard/settings/profile",
+            method="POST",
+            session=session_data,
+        )
+        profile_request = with_request_form(
+            profile_request,
+            {
+                "store_name": "",
+                "store_location": "Alta Gracia",
+                "store_description": "Cobertura de dashboard.",
+                "transfer_alias": "cobertura.rotiseria",
+            },
+        )
+        agent_request = build_request(
+            app,
+            path="/dashboard/settings/agent",
+            method="POST",
+            session=session_data,
+        )
+        agent_request = with_request_form(agent_request, {"bot_name": "", "assistant_personality": ""})
+        with pytest.raises(HTTPException) as profile_error:
+            await get_route_endpoint(app, "/dashboard/settings/profile", "POST")(request=profile_request)
+        with pytest.raises(HTTPException) as agent_error:
+            await get_route_endpoint(app, "/dashboard/settings/agent", "POST")(request=agent_request)
+        return profile_error.value, agent_error.value
+
+    with TestClient(app):
+        profile_error, agent_error = anyio.run(exercise_validation_errors)
+
+    assert profile_error.status_code == HTTP_UNPROCESSABLE_ENTITY
+    assert agent_error.status_code == HTTP_UNPROCESSABLE_ENTITY
+
+
+def test_dashboard_role_and_order_status_routes_cover_success_commits(tmp_path: Path):
+    """Direct role/order handlers cover their successful commit paths."""
+    settings = build_settings(tmp_path)
+    app = create_app(settings)
+
+    async def exercise_success_commits():
+        runtime = app.state.runtime
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            owner = await repository.get_staff_user_by_email("staff@example.com")
+            assert owner is not None
+            extra_user = await repository.ensure_staff_user(
+                email="team@example.com",
+                full_name="Equipo Local",
+                password="team-secret",
+                store_id=1,
+                role=StaffRole.STAFF,
+            )
+            memberships = await repository.list_staff_memberships_for_store(store_id=1)
+            extra_membership = next(m for m in memberships if m.staff_user_id == extra_user.id)
+            customer = await repository.get_or_create_customer(
+                channel=Channel.DEV,
+                external_id="order-coverage",
+            )
+            conversation = await repository.get_or_create_conversation(
+                channel=Channel.DEV,
+                external_id="order-coverage",
+                customer_id=customer.id,
+            )
+            await repository.add_item_to_current_order(
+                customer_id=customer.id,
+                conversation_id=conversation.id,
+                sku="hamburguesa-doble",
+                quantity=1,
+            )
+            await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.PICKUP)
+            await repository.set_order_payment_method(customer.id, conversation.id, PaymentMethod.CASH)
+            confirmed_order = await repository.confirm_current_order(customer.id, conversation.id)
+            await session.commit()
+            session_data = {"dashboard_staff_user_id": owner.id, "dashboard_store_id": 1}
+
+        role_request = build_request(
+            app,
+            path=f"/dashboard/settings/users/{extra_membership.membership_id}/role",
+            method="POST",
+            session=session_data,
+        )
+        role_request = with_request_form(role_request, {"role": StaffRole.MANAGER.value})
+        order_request = build_request(
+            app,
+            path=f"/dashboard/orders/{confirmed_order.id}/status",
+            method="POST",
+            session=session_data,
+        )
+        order_request = with_request_form(order_request, {"status": OrderStatus.ALMOST_READY.value})
+        api_response = await get_route_endpoint(app, "/api/orders/{order_id}/status", "PATCH")(
+            request=build_request(app, path=f"/api/orders/{confirmed_order.id}/status", method="PATCH"),
+            order_id=confirmed_order.id,
+            payload=OrderStatusUpdateRequest(status=OrderStatus.READY_FOR_PICKUP),
+        )
+        role_response = await get_route_endpoint(app, "/dashboard/settings/users/{membership_id}/role", "POST")(
+            request=role_request,
+            membership_id=extra_membership.membership_id,
+        )
+        order_response = await get_route_endpoint(app, "/dashboard/orders/{order_id}/status", "POST")(
+            request=order_request,
+            order_id=confirmed_order.id,
+        )
+
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            memberships = await repository.list_staff_memberships_for_store(store_id=1)
+            updated_membership = next(m for m in memberships if m.staff_user_id == extra_user.id)
+            stored_order = await repository.get_order(confirmed_order.id)
+        return role_response, order_response, api_response, updated_membership, stored_order
+
+    with TestClient(app):
+        role_response, order_response, api_response, updated_membership, stored_order = anyio.run(
+            exercise_success_commits
+        )
+
+    assert role_response.headers["location"] == "/dashboard/settings/users?flash=role-updated"
+    assert order_response.headers["location"] == "/dashboard?flash=order-updated"
+    assert api_response.status == OrderStatus.READY_FOR_PICKUP
+    assert updated_membership.role == StaffRole.MANAGER
+    assert stored_order.status == OrderStatus.ALMOST_READY
+
+
+def test_dashboard_route_smoke_covers_shared_ordering_controller_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A signed-in ordering tenant can exercise the shared dashboard controller glue."""
+    monkeypatch.setattr("ruperto.assistant.build_google_model", lambda settings: FunctionModel(dev_message_model))
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        root_json = client.get("/")
+        root_html = client.get("/", headers={"accept": "text/html"})
+        login_dashboard(client)
+        home = client.get("/dashboard")
+        customers = client.get("/dashboard/customers")
+        menu = client.get("/dashboard/settings/menu")
+        profile = client.post(
+            "/dashboard/settings/profile",
+            data={
+                "store_name": "Cobertura Rotisería",
+                "store_location": "Alta Gracia",
+                "store_description": "Cobertura de dashboard.",
+                "transfer_alias": "cobertura.rotiseria",
+            },
+            follow_redirects=False,
+        )
+        agent = client.post(
+            "/dashboard/settings/agent",
+            data={"bot_name": "Cobertura Bot", "assistant_personality": "Helpful and brief."},
+            follow_redirects=False,
+        )
+        channel = client.post(
+            "/dashboard/settings/agent/channel",
+            data={
+                "kapso_phone_number_id": "597907523413541",
+                "kapso_api_key": "kapso-key",
+                "kapso_webhook_secret": "kapso-secret",
+                "kapso_is_active": "on",
+            },
+            follow_redirects=False,
+        )
+        hours = client.post(
+            "/dashboard/settings/hours",
+            data={"opens_at_1_0": "11:30", "closes_at_1_0": "15:00"},
+            follow_redirects=False,
+        )
+        users = client.get("/dashboard/settings/users")
+        client.post(
+            "/api/dev/messages",
+            json={"external_user_id": "coverage-user", "message_text": "Hola, quiero pedir"},
+        )
+        client.post("/api/dev/messages", json={"external_user_id": "coverage-user", "message_text": "Martina"})
+        created = client.post(
+            "/api/dev/messages",
+            json={"external_user_id": "coverage-user", "message_text": "Quiero una hamburguesa"},
+        )
+        client.post(
+            "/api/dev/messages",
+            json={"external_user_id": "coverage-user", "message_text": "Confirmá el pedido"},
+        )
+        order_id = created.json()["current_order"]["id"]
+        api_status = client.patch(f"/api/orders/{order_id}/status", json={"status": OrderStatus.ALMOST_READY.value})
+        store_profile = client.put(
+            "/api/store-profile",
+            json={
+                "store_name": "Cobertura Rotisería",
+                "bot_name": "Cobertura Bot",
+                "store_location": "Alta Gracia",
+                "store_description": "Cobertura de dashboard.",
+                "assistant_personality": "Helpful and brief.",
+                "transfer_alias": "cobertura.rotiseria",
+            },
+        )
+        store_hours = client.put(
+            "/api/store-hours",
+            json={
+                "hours": [
+                    {
+                        "weekday": 1,
+                        "slot_index": 0,
+                        "opens_at": "11:30",
+                        "closes_at": "15:00",
+                        "closed": False,
+                    }
+                ]
+            },
+        )
+        dashboard_status = client.post(
+            f"/dashboard/orders/{order_id}/status",
+            data={"status": OrderStatus.READY_FOR_PICKUP.value},
+            follow_redirects=False,
+        )
+        notifications = client.get("/api/dev/notifications", params={"external_user_id": "coverage-user"})
+
+    assert root_json.status_code == HTTP_OK
+    assert root_html.status_code == HTTP_OK
+    assert home.status_code == HTTP_OK
+    assert customers.status_code == HTTP_OK
+    assert menu.status_code == HTTP_OK
+    assert profile.headers["location"] == "/dashboard/settings/profile?flash=profile-updated"
+    assert agent.headers["location"] == "/dashboard/settings/agent?flash=agent-updated"
+    assert channel.headers["location"] == "/dashboard/settings/agent?flash=agent-updated"
+    assert hours.headers["location"] == "/dashboard/settings/hours?flash=hours-updated"
+    assert users.status_code == HTTP_OK
+    assert api_status.status_code == HTTP_OK
+    assert store_profile.status_code == HTTP_OK
+    assert store_hours.status_code == HTTP_OK
+    assert dashboard_status.headers["location"] == "/dashboard?flash=order-updated"
+    assert notifications.status_code == HTTP_OK
+
+
+def test_dashboard_route_smoke_covers_shared_municipal_controller_paths(tmp_path: Path):
+    """A signed-in municipal tenant can exercise the municipal dashboard controller glue."""
+    settings = build_settings(tmp_path, store_vertical=StoreVertical.MUNICIPAL, store_slug="mi-muni")
+    app = create_app(settings)
+    case_id = anyio.run(lambda: create_dev_municipal_case(settings, external_user_id="coverage-muni"))
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        home = client.get("/dashboard")
+        customers = client.get("/dashboard/customers")
+        menu = client.get("/dashboard/settings/menu")
+        create_area = client.post(
+            "/dashboard/settings/municipal/areas",
+            data={"name": "Arbolado", "description": "Árboles", "display_order": "4"},
+            follow_redirects=False,
+        )
+        create_category = client.post(
+            "/dashboard/settings/municipal/categories",
+            data={
+                "area_id": "1",
+                "name": "Consulta",
+                "description": "Consulta general",
+                "request_kind": "request",
+                "display_order": "4",
+            },
+            follow_redirects=False,
+        )
+        profile = client.post(
+            "/dashboard/settings/profile",
+            data={
+                "store_name": "Mi muni",
+                "store_location": "Córdoba",
+                "store_description": "Municipio de prueba",
+                "transfer_alias": "",
+            },
+            follow_redirects=False,
+        )
+        agent = client.get("/dashboard/settings/agent")
+        hours = client.get("/dashboard/settings/hours")
+        users = client.get("/dashboard/settings/users")
+        status = client.patch(
+            f"/api/kanban/municipal/cases/{case_id}/status",
+            json=MunicipalCaseStatusUpdateRequest(status=MunicipalCaseStatus.TRIAGED).model_dump(mode="json"),
+        )
+        notifications = client.get(
+            f"/api/dev/notifications/{settings.store_slug}",
+            params={"external_user_id": "coverage-muni"},
+        )
+
+    assert home.status_code == HTTP_OK
+    assert customers.status_code == HTTP_OK
+    assert menu.status_code == HTTP_OK
+    assert create_area.headers["location"] == "/dashboard/settings/menu?flash=municipal-area-created"
+    assert create_category.headers["location"] == "/dashboard/settings/menu?flash=municipal-category-created"
+    assert profile.headers["location"] == "/dashboard/settings/profile?flash=profile-updated"
+    assert agent.status_code == HTTP_OK
+    assert hours.status_code == HTTP_OK
+    assert users.status_code == HTTP_OK
+    assert status.status_code == HTTP_OK
+    assert notifications.status_code == HTTP_OK
 
 
 def test_dashboard_falls_back_to_the_default_store_when_session_store_is_invalid(tmp_path: Path):
