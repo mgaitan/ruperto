@@ -81,6 +81,9 @@ async def build_repository(tmp_path: Path) -> tuple[BusinessRepository, Database
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'repo.db'}",
         store_name="Rotisería Test",
         bot_name="Ruperto Test",
+        kapso_api_key=None,
+        kapso_phone_number_id=None,
+        kapso_webhook_secret=None,
     )
     runtime = create_database_runtime(settings)
     await init_database(settings=settings, runtime=runtime)
@@ -97,6 +100,9 @@ async def build_municipal_repository(tmp_path: Path) -> tuple[BusinessRepository
         store_name="Municipio Test",
         bot_name="Moony Test",
         store_vertical=StoreVertical.MUNICIPAL,
+        kapso_api_key=None,
+        kapso_phone_number_id=None,
+        kapso_webhook_secret=None,
     )
     runtime = create_database_runtime(settings)
     await init_database(settings=settings, runtime=runtime)
@@ -207,6 +213,84 @@ async def test_store_channel_connection_can_be_created_and_loaded(tmp_path: Path
     assert runtime_config.phone_number_id == "phone-id-1"
     assert by_phone is not None
     assert by_phone.store_id == 1
+
+    await close_repository(repository, runtime)
+
+
+async def test_order_and_case_target_helpers_cover_store_filters_and_success_paths(tmp_path: Path):
+    """Order helpers expose snapshots and conversation targets for existing records."""
+    repository, runtime = await build_repository(tmp_path)
+
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="target-user")
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="target-user",
+        customer_id=customer.id,
+    )
+    await repository.add_item_to_current_order(
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        sku="hamburguesa-doble",
+        quantity=1,
+    )
+    await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.PICKUP)
+    await repository.set_order_payment_method(customer.id, conversation.id, PaymentMethod.CASH)
+    confirmed = await repository.confirm_current_order(customer.id, conversation.id)
+    await repository.session.commit()
+
+    listed_orders = await repository.list_orders(limit=10, store_id=1)
+    loaded_order = await repository.get_order(confirmed.id)
+    order_target = await repository.get_order_conversation_target(confirmed.id)
+
+    assert any(order.id == confirmed.id for order in listed_orders)
+    assert loaded_order.id == confirmed.id
+    assert order_target is not None
+    assert order_target.conversation_id == conversation.id
+    assert order_target.external_id == "target-user"
+
+    await close_repository(repository, runtime)
+
+
+async def test_municipal_case_target_helper_returns_existing_conversation_target(tmp_path: Path):
+    """Municipal case targets resolve to the linked conversation when it exists."""
+    repository, runtime = await build_municipal_repository(tmp_path)
+
+    customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="case-target-user", store_id=1)
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.DEV,
+        external_id="case-target-user",
+        customer_id=customer.id,
+        store_id=1,
+    )
+    area = next(iter(await repository.list_municipal_areas(store_id=1)))
+    category = next(iter(await repository.list_municipal_categories(store_id=1, area_id=area.id)))
+    created_case = await repository.create_municipal_case(
+        store_id=1,
+        payload=MunicipalCaseCreateRequest(
+            area_id=area.id,
+            category_id=category.id,
+            customer_id=customer.id,
+            conversation_id=conversation.id,
+            title="Caso objetivo",
+            description="Descripción objetivo",
+        ),
+    )
+    await repository.session.commit()
+
+    target = await repository.get_municipal_case_conversation_target(created_case.id)
+
+    assert target is not None
+    assert target.conversation_id == conversation.id
+    assert target.external_id == "case-target-user"
+
+    await close_repository(repository, runtime)
+
+
+async def test_municipal_case_target_helper_returns_none_for_missing_cases(tmp_path: Path):
+    """Missing municipal cases do not resolve an outbound conversation target."""
+    repository, runtime = await build_municipal_repository(tmp_path)
+
+    assert await repository.get_municipal_case_conversation_target(9999) is None
 
     await close_repository(repository, runtime)
 

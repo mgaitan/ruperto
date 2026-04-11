@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import SecretStr
+from pydantic_ai import RunContext
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -24,6 +25,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from ruperto.assistant import (
     MODEL_UNAVAILABLE_REPLY,
+    AssistantDeps,
     InformationalTurnMutationError,
     MissingConfirmationSignalError,
     OrderingAssistantService,
@@ -36,6 +38,7 @@ from ruperto.assistant import (
     set_order_delivery_address,
     set_order_delivery_type,
     set_order_payment_method,
+    with_repository,
 )
 from ruperto.config import Settings
 from ruperto.db import create_database_runtime, init_database
@@ -882,6 +885,247 @@ async def test_assistant_can_answer_delay_after_confirming_an_order(tmp_path: Pa
     assert follow_up.reply.next_step == AssistantNextStep.COMPLETE
 
     await runtime.engine.dispose()
+
+
+async def test_assistant_can_answer_order_status_follow_up_without_calling_the_model(tmp_path: Path):
+    """Order-status follow-ups should resolve deterministically from stored order state."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    baseline_service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        baseline_service,
+        channel=Channel.DEV,
+        external_user_id="cliente-seguimiento",
+        name="Martina",
+    )
+    await baseline_service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-seguimiento",
+        message_text="Hola, quiero una hamburguesa",
+        model=FunctionModel(transactional_model),
+    )
+    confirmed = await baseline_service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-seguimiento",
+        message_text="Confirmá el pedido.",
+        model=FunctionModel(explicit_confirmation_model),
+    )
+    assert confirmed.current_order is not None
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        await repository.update_order_status(confirmed.current_order.id, OrderStatus.OUT_FOR_DELIVERY)
+        await session.commit()
+
+    class ImpossibleAgent:
+        async def run(self, *args: Any, **kwargs: Any):
+            raise AssertionError
+
+    service = OrderingAssistantService(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        agent=cast(Any, ImpossibleAgent()),
+    )
+    follow_up = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-seguimiento",
+        message_text="¿Cómo va mi pedido?",
+        model="stub",
+    )
+
+    assert follow_up.reply.next_step == AssistantNextStep.COMPLETE
+    assert follow_up.reply.reply_text == f"Tu pedido #{confirmed.current_order.id} ya salió y va en camino 🚚"
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.DEV,
+            external_id="cliente-seguimiento",
+            customer_id=follow_up.customer.id,
+        )
+        history = await repository.load_conversation_messages(conversation.id)
+
+    assert any(
+        isinstance(message, ModelRequest)
+        and any(isinstance(part, UserPromptPart) and part.content == "¿Cómo va mi pedido?" for part in message.parts)
+        for message in history
+    )
+    assert any(
+        isinstance(message, ModelResponse)
+        and any(
+            isinstance(part, TextPart)
+            and part.content == f"Tu pedido #{confirmed.current_order.id} ya salió y va en camino 🚚"
+            for part in message.parts
+        )
+        for message in history
+    )
+
+    await runtime.engine.dispose()
+
+
+async def test_assistant_order_status_follow_up_surfaces_draft_checkout_step(tmp_path: Path):
+    """Status follow-ups on draft orders should explain the missing checkout step."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    baseline_service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        baseline_service,
+        channel=Channel.DEV,
+        external_user_id="cliente-borrador",
+        name="Martina",
+    )
+    await baseline_service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-borrador",
+        message_text="Hola, quiero una hamburguesa",
+        model=FunctionModel(transactional_model),
+    )
+
+    class ImpossibleAgent:
+        async def run(self, *args: Any, **kwargs: Any):
+            raise AssertionError
+
+    service = OrderingAssistantService(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        agent=cast(Any, ImpossibleAgent()),
+    )
+    follow_up = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-borrador",
+        message_text="¿Cómo va mi pedido?",
+        model="stub",
+    )
+
+    assert follow_up.reply.next_step == AssistantNextStep.CONFIRM_ORDER
+    assert "todavía está en borrador" in follow_up.reply.reply_text.lower()
+
+    await runtime.engine.dispose()
+
+
+async def test_assistant_order_status_follow_up_handles_missing_recent_orders(tmp_path: Path):
+    """Status follow-ups should guide the customer back to a new order when nothing exists yet."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    service = OrderingAssistantService(session_factory=runtime.session_factory, settings=settings)
+    await seed_named_customer(
+        service,
+        channel=Channel.DEV,
+        external_user_id="cliente-sin-pedido",
+        name="Martina",
+    )
+
+    class ImpossibleAgent:
+        async def run(self, *args: Any, **kwargs: Any):
+            raise AssertionError
+
+    follow_up_service = OrderingAssistantService(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        agent=cast(Any, ImpossibleAgent()),
+    )
+    follow_up = await follow_up_service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="cliente-sin-pedido",
+        message_text="¿Cómo va mi pedido?",
+        model="stub",
+    )
+
+    assert follow_up.reply.next_step == AssistantNextStep.CHOOSE_ITEMS
+    assert "todavía no veo un pedido reciente" in follow_up.reply.reply_text.lower()
+
+    await runtime.engine.dispose()
+
+
+async def test_order_status_follow_up_helpers_cover_remaining_draft_branches(tmp_path: Path):
+    """Draft follow-up helpers keep each missing checkout field distinct."""
+    service = OrderingAssistantService(
+        session_factory=cast(Any, None),
+        settings=build_settings(tmp_path),
+    )
+    empty_draft = OrderSnapshot(
+        id=1,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=None,
+        delivery_address=None,
+        payment_method=None,
+        total_amount_cents=0,
+        total_amount_display="$ 0",
+        items=[],
+    )
+    delivery_choice_draft = OrderSnapshot(
+        id=11,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=None,
+        delivery_address=None,
+        payment_method=None,
+        total_amount_cents=1500,
+        total_amount_display="$ 15",
+        items=[
+            OrderItemSnapshot(
+                menu_item_id=1,
+                name="Empanada",
+                quantity=1,
+                unit_price_cents=1500,
+                unit_price_display="$ 15",
+                notes=None,
+            )
+        ],
+    )
+    delivery_draft = OrderSnapshot(
+        id=2,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=DeliveryType.DELIVERY,
+        delivery_address=None,
+        payment_method=None,
+        total_amount_cents=1500,
+        total_amount_display="$ 15",
+        items=[
+            OrderItemSnapshot(
+                menu_item_id=1,
+                name="Empanada",
+                quantity=1,
+                unit_price_cents=1500,
+                unit_price_display="$ 15",
+                notes=None,
+            )
+        ],
+    )
+    payment_draft = OrderSnapshot(
+        id=3,
+        customer_id=1,
+        conversation_id=1,
+        status=OrderStatus.DRAFT,
+        delivery_type=DeliveryType.PICKUP,
+        delivery_address=None,
+        payment_method=None,
+        total_amount_cents=1500,
+        total_amount_display="$ 15",
+        items=[
+            OrderItemSnapshot(
+                menu_item_id=1,
+                name="Empanada",
+                quantity=1,
+                unit_price_cents=1500,
+                unit_price_display="$ 15",
+                notes=None,
+            )
+        ],
+    )
+
+    assert "todavía no veo un pedido armado" in service._build_draft_order_follow_up_reply(empty_draft).lower()
+    assert "envío o retiro" in service._build_draft_order_follow_up_reply(delivery_choice_draft).lower()
+    assert "dirección de envío" in service._build_draft_order_follow_up_reply(delivery_draft).lower()
+    assert "medio de pago" in service._build_draft_order_follow_up_reply(payment_draft).lower()
 
 
 async def test_assistant_asks_for_name_before_taking_the_first_order(tmp_path: Path):
@@ -4273,3 +4517,36 @@ async def test_recover_large_order_after_model_failure_skips_existing_draft_orde
     assert result is None
 
     await runtime.engine.dispose()
+
+
+async def test_with_repository_commit_flag_commits_the_session(tmp_path: Path):
+    """Repository helpers can opt into committing their short-lived session."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    ctx = RunContext[AssistantDeps](
+        deps=AssistantDeps(
+            session_factory=runtime.session_factory,
+            settings=settings,
+            store_id=settings.default_store_id,
+            customer_id=1,
+            conversation_id=1,
+        ),
+        model=cast(Any, None),
+        usage=cast(Any, None),
+        prompt="",
+    )
+
+    async def create_customer(repository: BusinessRepository) -> int:
+        customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="commit-helper")
+        return customer.id
+
+    customer_id = await with_repository(ctx, create_customer, commit=True)
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="commit-helper")
+
+    await runtime.engine.dispose()
+
+    assert customer.id == customer_id

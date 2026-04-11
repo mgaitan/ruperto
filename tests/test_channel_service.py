@@ -18,7 +18,7 @@ from ruperto.channels.service import (
 )
 from ruperto.config import Settings
 from ruperto.db import create_database_runtime, init_database
-from ruperto.models import Channel, ChannelProvider
+from ruperto.models import Channel, ChannelProvider, DeliveryType, OrderStatus, PaymentMethod
 from ruperto.repository import BusinessRepository
 from ruperto.schemas import StoreChannelConnectionUpdateRequest
 
@@ -44,6 +44,9 @@ async def test_build_channel_gateway_returns_none_when_kapso_is_not_configured(t
         environment="test",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'channels.db'}",
         auto_init_db=True,
+        kapso_api_key=None,
+        kapso_phone_number_id=None,
+        kapso_webhook_secret=None,
     )
 
     assert build_channel_gateway(channel=Channel.DEV, settings=settings) is None
@@ -222,6 +225,100 @@ async def test_build_whatsapp_gateway_for_phone_number_prefers_store_connection(
     assert store_id == settings.default_store_id
 
 
+async def test_build_whatsapp_gateway_for_phone_number_uses_matching_fallback_runtime_settings(tmp_path: Path):
+    """Fallback runtime settings still resolve one tenant when the phone id matches."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+
+    gateway, store_id = await build_whatsapp_gateway_for_phone_number(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        phone_number_id=settings.kapso_phone_number_id,
+    )
+
+    await runtime.engine.dispose()
+
+    assert gateway is not None
+    assert store_id == settings.default_store_id
+
+
+async def test_build_whatsapp_gateway_for_phone_number_uses_fallback_without_inbound_number(tmp_path: Path):
+    """Fallback runtime settings also resolve when the webhook omits the phone id."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+
+    gateway, store_id = await build_whatsapp_gateway_for_phone_number(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        phone_number_id=None,
+    )
+
+    await runtime.engine.dispose()
+
+    assert gateway is not None
+    assert gateway.phone_number_id == settings.kapso_phone_number_id
+    assert store_id == settings.default_store_id
+
+
+async def test_deliver_pending_notifications_marks_sent_rows_as_delivered(tmp_path: Path):
+    """Successful delivery commits the delivered marker for pending notifications."""
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(settings)
+    await init_database(settings=settings, runtime=runtime)
+    sent_payloads: list[str] = []
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(
+            channel=Channel.WHATSAPP,
+            external_id="+5493513308454",
+            phone_number="+5493513308454",
+        )
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.WHATSAPP,
+            external_id="+5493513308454",
+            customer_id=customer.id,
+        )
+        await repository.add_item_to_current_order(
+            customer_id=customer.id,
+            conversation_id=conversation.id,
+            sku="hamburguesa-doble",
+            quantity=1,
+        )
+        await repository.set_order_delivery_type(customer.id, conversation.id, DeliveryType.PICKUP)
+        await repository.set_order_payment_method(customer.id, conversation.id, PaymentMethod.CASH)
+        order = await repository.confirm_current_order(customer.id, conversation.id)
+        await repository.update_order_status(order.id, OrderStatus.READY_FOR_PICKUP)
+        await session.commit()
+
+    async def fake_send_text(self, message):
+        sent_payloads.append(message.message_text)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("ruperto.channels.kapso_whatsapp.KapsoWhatsAppGateway.send_text", fake_send_text)
+        delivered = await deliver_pending_notifications(
+            session_factory=runtime.session_factory,
+            settings=settings,
+            store_id=settings.default_store_id,
+            channel=Channel.WHATSAPP,
+            external_user_id="+5493513308454",
+        )
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        pending = await repository.peek_pending_notifications(
+            channel=Channel.WHATSAPP,
+            external_id="+5493513308454",
+        )
+
+    await runtime.engine.dispose()
+
+    assert delivered == 1
+    assert pending == []
+    assert sent_payloads == ["Tu pedido ya está listo para retirar 🙌"]
+
+
 async def test_build_whatsapp_gateway_for_phone_number_rejects_unknown_fallback_number(tmp_path: Path):
     """Fallback env config is ignored when the inbound phone number points elsewhere."""
     settings = build_settings(tmp_path)
@@ -262,6 +359,33 @@ async def test_build_whatsapp_gateway_for_phone_number_uses_fallback_when_number
 
     assert gateway is not None
     assert gateway.phone_number_id == settings.kapso_phone_number_id
+    assert store_id == settings.default_store_id
+
+
+async def test_build_whatsapp_gateway_for_phone_number_uses_fallback_without_explicit_number(tmp_path: Path):
+    """Fallback env credentials still work when the webhook payload omits the phone number id."""
+    runtime_settings = Settings(
+        environment="test",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'channels.db'}",
+        auto_init_db=True,
+        dashboard_session_secret="test-session-secret",
+        kapso_api_key=None,
+        kapso_phone_number_id=None,
+        kapso_webhook_secret=None,
+    )
+    settings = build_settings(tmp_path)
+    runtime = create_database_runtime(runtime_settings)
+    await init_database(settings=runtime_settings, runtime=runtime)
+
+    gateway, store_id = await build_whatsapp_gateway_for_phone_number(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        phone_number_id=None,
+    )
+
+    await runtime.engine.dispose()
+
+    assert gateway is not None
     assert store_id == settings.default_store_id
 
 

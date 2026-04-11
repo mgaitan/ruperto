@@ -182,6 +182,9 @@ When that order belongs to a WhatsApp conversation handled through Kapso, the
 backend now tries to deliver the matching proactive customer notification
 automatically through the same channel instead of waiting for the next inbound
 message.
+If the customer writes back asking "¿cómo va mi pedido?", the same chat can now
+answer from the stored order state without waiting for another operational
+update first.
 
 You can also replace the weekly opening-hours schedule. Each weekday accepts
 zero or more slots, so leaving a day without open ranges means the store stays
