@@ -29,7 +29,14 @@ from ruperto.municipal import (
     municipal_business_context,
 )
 from ruperto.repository import BusinessRepository, MunicipalCaseNotFoundError
-from ruperto.schemas import AssistantNextStep, CustomerSnapshot, MunicipalCaseDraftSnapshot, MunicipalCaseSnapshot
+from ruperto.schemas import (
+    AssistantNextStep,
+    CustomerSnapshot,
+    MunicipalCaseCreateRequest,
+    MunicipalCaseDraftSnapshot,
+    MunicipalCaseSnapshot,
+    MunicipalCaseStatusUpdateRequest,
+)
 
 pytestmark = pytest.mark.anyio
 MAX_CASE_TITLE_LENGTH = 160
@@ -658,6 +665,228 @@ async def test_municipal_request_kind_changes_review_and_completion_copy(tmp_pat
 
     assert "ingreso la solicitud" in review_text.lower()
     assert "reclamo" not in review_text.lower()
+
+    await runtime.engine.dispose()
+
+
+async def test_municipal_service_answers_case_follow_up_for_latest_owned_case(tmp_path: Path):
+    """Citizens can ask for the status of their latest municipal case through chat."""
+    settings, runtime = await build_municipal_runtime(tmp_path)
+    store_id, areas, categories = await load_municipal_catalog(runtime)
+    water_area = next(area for area in areas if area.name == "Solicitud de agua")
+    water_category = next(category for category in categories if category.name == "Falta de agua")
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        customer = await repository.get_or_create_customer(channel=Channel.WHATSAPP, external_id="3515559000")
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.WHATSAPP,
+            external_id="3515559000",
+            customer_id=customer.id,
+            store_id=store_id,
+        )
+        created_case = await repository.create_municipal_case(
+            store_id=store_id,
+            payload=MunicipalCaseCreateRequest(
+                area_id=water_area.id,
+                category_id=water_category.id,
+                customer_id=customer.id,
+                conversation_id=conversation.id,
+                title="Necesito un camión cisterna",
+                description="No tenemos agua desde ayer.",
+                location_text="9 de Julio 1302",
+            ),
+        )
+        await repository.update_municipal_case_status(
+            created_case.id,
+            payload=MunicipalCaseStatusUpdateRequest(status=MunicipalCaseStatus.IN_PROGRESS),
+        )
+        await session.commit()
+
+    service = MunicipalAssistantService(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        agent=StubMunicipalAgent(),
+    )
+    result = await service.handle_customer_message(
+        channel=Channel.WHATSAPP,
+        external_user_id="3515559000",
+        message_text="¿Cómo va mi solicitud?",
+        model="stub",
+        store_id=store_id,
+    )
+
+    assert result.reply.next_step == AssistantNextStep.COMPLETE
+    assert "tu solicitud" in result.reply.reply_text.lower()
+    assert f"#{created_case.id}" in result.reply.reply_text
+    assert "ya está en gestión" in result.reply.reply_text.lower()
+
+    await runtime.engine.dispose()
+
+
+async def test_municipal_service_answers_explicit_case_number_and_rejects_foreign_cases(tmp_path: Path):
+    """Explicit case-number follow-ups only expose cases owned by the same citizen."""
+    settings, runtime = await build_municipal_runtime(tmp_path)
+    store_id, areas, categories = await load_municipal_catalog(runtime)
+    lighting_area = next(area for area in areas if area.name == "Alumbrado público")
+    lighting_category = next(category for category in categories if category.name == "Lámpara apagada")
+
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        owner = await repository.get_or_create_customer(channel=Channel.WHATSAPP, external_id="3515559100")
+        stranger = await repository.get_or_create_customer(channel=Channel.WHATSAPP, external_id="3515559200")
+        owner_conversation = await repository.get_or_create_conversation(
+            channel=Channel.WHATSAPP,
+            external_id="3515559100",
+            customer_id=owner.id,
+            store_id=store_id,
+        )
+        stranger_conversation = await repository.get_or_create_conversation(
+            channel=Channel.WHATSAPP,
+            external_id="3515559200",
+            customer_id=stranger.id,
+            store_id=store_id,
+        )
+        owned_case = await repository.create_municipal_case(
+            store_id=store_id,
+            payload=MunicipalCaseCreateRequest(
+                area_id=lighting_area.id,
+                category_id=lighting_category.id,
+                customer_id=owner.id,
+                conversation_id=owner_conversation.id,
+                title="Lámpara apagada en la esquina",
+                description="No prende desde anoche.",
+                location_text="Belgrano 100",
+            ),
+        )
+        other_case = await repository.create_municipal_case(
+            store_id=store_id,
+            payload=MunicipalCaseCreateRequest(
+                area_id=lighting_area.id,
+                category_id=lighting_category.id,
+                customer_id=stranger.id,
+                conversation_id=stranger_conversation.id,
+                title="Otra lámpara apagada",
+                description="También está sin luz.",
+                location_text="Belgrano 200",
+            ),
+        )
+        await repository.update_municipal_case_status(
+            owned_case.id,
+            payload=MunicipalCaseStatusUpdateRequest(status=MunicipalCaseStatus.TRIAGED),
+        )
+        await session.commit()
+
+    service = MunicipalAssistantService(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        agent=StubMunicipalAgent(),
+    )
+    owned_reply = await service.handle_customer_message(
+        channel=Channel.WHATSAPP,
+        external_user_id="3515559100",
+        message_text=f"¿Qué pasó con mi caso #{owned_case.id}?",
+        model="stub",
+        store_id=store_id,
+    )
+    foreign_reply = await service.handle_customer_message(
+        channel=Channel.WHATSAPP,
+        external_user_id="3515559100",
+        message_text=f"¿Qué pasó con mi caso #{other_case.id}?",
+        model="stub",
+        store_id=store_id,
+    )
+
+    assert "ya está en revisión" in owned_reply.reply.reply_text.lower()
+    assert f"#{owned_case.id}" in owned_reply.reply.reply_text
+    assert foreign_reply.reply.next_step == AssistantNextStep.CHOOSE_AREA
+    assert f"#{other_case.id}" in foreign_reply.reply.reply_text
+    assert "no encuentro un caso tuyo" in foreign_reply.reply.reply_text.lower()
+
+    await runtime.engine.dispose()
+
+
+async def test_municipal_case_follow_up_does_not_override_an_active_intake_draft(tmp_path: Path):
+    """Generic status questions should not hijack an intake draft already in progress."""
+    settings, runtime = await build_municipal_runtime(tmp_path)
+    store_id, areas, categories = await load_municipal_catalog(runtime)
+    streets_area = next(area for area in areas if area.name == "Mantenimiento de calles")
+    pothole_category = next(category for category in categories if category.name == "Bache")
+
+    service = MunicipalAssistantService(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        agent=StubMunicipalAgent(
+            MunicipalTurnIntent(area_id=streets_area.id),
+            MunicipalTurnIntent(category_id=pothole_category.id),
+        ),
+    )
+    await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="vecino-borrador",
+        message_text="Es por calles",
+        model="stub",
+        store_id=store_id,
+    )
+    reply = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="vecino-borrador",
+        message_text="¿Cómo va mi reclamo?",
+        model="stub",
+        store_id=store_id,
+    )
+
+    assert reply.reply.next_step == AssistantNextStep.DESCRIBE_REQUEST
+    assert "contame brevemente" in reply.reply.reply_text.lower()
+
+    await runtime.engine.dispose()
+
+
+async def test_municipal_case_follow_up_handles_missing_cases_and_unknown_category_copy(tmp_path: Path):
+    """Follow-up copy stays safe when no case exists or when a case lacks category metadata."""
+    settings, runtime = await build_municipal_runtime(tmp_path)
+    store_id, areas, _categories = await load_municipal_catalog(runtime)
+    area = next(area for area in areas if area.name == "Higiene urbana")
+
+    service = MunicipalAssistantService(
+        session_factory=runtime.session_factory,
+        settings=settings,
+        agent=StubMunicipalAgent(),
+    )
+    missing = await service.handle_customer_message(
+        channel=Channel.DEV,
+        external_user_id="vecino-sin-casos",
+        message_text="¿Cómo va mi reclamo?",
+        model="stub",
+        store_id=store_id,
+    )
+    generic_tracking = service._build_case_tracking_reply(
+        case_snapshot=MunicipalCaseSnapshot(
+            id=8,
+            store_id=store_id,
+            area_id=area.id,
+            category_id=None,
+            customer_id=1,
+            conversation_id=1,
+            assignee_staff_user_id=None,
+            title="Limpieza pendiente",
+            description="Hace falta barrer la cuadra.",
+            reporter_name="Nora",
+            reporter_phone_number=None,
+            location_text="San Martín 500",
+            location_reference=None,
+            latitude=None,
+            longitude=None,
+            status=MunicipalCaseStatus.NEW,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        ),
+        categories=[],
+    )
+
+    assert missing.reply.next_step == AssistantNextStep.CHOOSE_AREA
+    assert "todavía no encuentro un caso tuyo" in missing.reply.reply_text.lower()
+    assert generic_tracking.startswith("Tu caso #8 ")
 
     await runtime.engine.dispose()
 

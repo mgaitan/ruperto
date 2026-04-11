@@ -212,7 +212,9 @@ catalog with municipal areas and categories, and the shared chat endpoint
 guides neighbors through a first complaint/request intake before creating the
 municipal case. That intake only accepts a usable location before submission,
 asks for a respectful rephrase if the message becomes insulting, and keeps the
-final confirmation brief by addressing the citizen by first name.
+final confirmation brief by addressing the citizen by first name. Once a case
+already exists, the same chat can also answer proactive follow-up questions
+about the latest case or an explicit `caso #<n>` reference.
 
 If one dashboard user belongs to more than one store, the header lets staff
 switch the active store. That switch already scopes the editable store profile
