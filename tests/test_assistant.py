@@ -934,6 +934,30 @@ async def test_assistant_can_answer_order_status_follow_up_without_calling_the_m
     assert follow_up.reply.next_step == AssistantNextStep.COMPLETE
     assert follow_up.reply.reply_text == f"Tu pedido #{confirmed.current_order.id} ya salió y va en camino 🚚"
 
+    async with runtime.session_factory() as session:
+        repository = BusinessRepository(session)
+        conversation = await repository.get_or_create_conversation(
+            channel=Channel.DEV,
+            external_id="cliente-seguimiento",
+            customer_id=follow_up.customer.id,
+        )
+        history = await repository.load_conversation_messages(conversation.id)
+
+    assert any(
+        isinstance(message, ModelRequest)
+        and any(isinstance(part, UserPromptPart) and part.content == "¿Cómo va mi pedido?" for part in message.parts)
+        for message in history
+    )
+    assert any(
+        isinstance(message, ModelResponse)
+        and any(
+            isinstance(part, TextPart)
+            and part.content == f"Tu pedido #{confirmed.current_order.id} ya salió y va en camino 🚚"
+            for part in message.parts
+        )
+        for message in history
+    )
+
     await runtime.engine.dispose()
 
 

@@ -996,18 +996,25 @@ class OrderingAssistantService:
 
             customer = name_handling.customer
             resumed_pending_message = name_handling.resumed_pending_message
+            effective_message_text = resumed_pending_message or message_text
             order_status_follow_up = self._maybe_build_order_status_follow_up_result(
                 conversation_id=conversation.id,
                 customer=customer,
                 current_order=current_order_before_run,
                 latest_order=latest_order_before_run,
-                message_text=resumed_pending_message or message_text,
+                message_text=effective_message_text,
             )
             if order_status_follow_up is not None:
+                await self._persist_direct_reply(
+                    repository=repository,
+                    conversation_id=conversation.id,
+                    user_text=effective_message_text,
+                    reply_text=order_status_follow_up.reply.reply_text,
+                )
                 await session.commit()
                 return order_status_follow_up
             turn_policy = self._analyze_turn_policy(
-                resumed_pending_message or message_text,
+                effective_message_text,
                 current_order=current_order_before_run,
             )
             deps = AssistantDeps(
