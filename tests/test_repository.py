@@ -28,10 +28,12 @@ from ruperto.models import (
     Order,
     OrderStatus,
     OutboundNotification,
+    PasswordResetToken,
     PaymentMethod,
     StaffRole,
     StaffUser,
     StoreVertical,
+    utc_now,
 )
 from ruperto.repository import (
     STORE_HOURS_SLOT_ORDER_MESSAGE,
@@ -2977,6 +2979,155 @@ async def test_staff_user_refresh_rehashes_password_and_updates_role(tmp_path: P
     assert by_id.full_name == "Staff Updated"
     assert invalid_login is None
     assert memberships[0].role == StaffRole.MANAGER
+
+    await close_repository(repository, runtime)
+
+
+async def test_create_staff_password_reset_token_returns_one_active_token(tmp_path: Path):
+    """Creating a new reset token invalidates any previous unused token for that user."""
+    repository, runtime = await build_repository(tmp_path)
+    await repository.ensure_staff_user(
+        email="staff@example.com",
+        full_name="Staff One",
+        password="first-secret",
+        store_id=1,
+        role=StaffRole.STAFF,
+    )
+
+    first_result = await repository.create_staff_password_reset_token(email="staff@example.com")
+    second_result = await repository.create_staff_password_reset_token(email="staff@example.com")
+    assert first_result is not None
+    assert second_result is not None
+
+    first_lookup = await repository.get_staff_user_by_password_reset_token(token=first_result[1])
+    second_lookup = await repository.get_staff_user_by_password_reset_token(token=second_result[1])
+
+    assert first_lookup is None
+    assert second_lookup is not None
+    assert second_lookup.email == "staff@example.com"
+
+    await close_repository(repository, runtime)
+
+
+async def test_create_staff_password_reset_token_ignores_unknown_staff(tmp_path: Path):
+    """Unknown staff emails do not produce reset tokens."""
+    repository, runtime = await build_repository(tmp_path)
+
+    result = await repository.create_staff_password_reset_token(email="missing@example.com")
+
+    assert result is None
+
+    await close_repository(repository, runtime)
+
+
+async def test_reset_staff_user_password_consumes_token_and_rehashes_password(tmp_path: Path):
+    """Resetting a password consumes the token and replaces the previous credential."""
+    repository, runtime = await build_repository(tmp_path)
+    await repository.ensure_staff_user(
+        email="staff@example.com",
+        full_name="Staff One",
+        password="first-secret",
+        store_id=1,
+        role=StaffRole.STAFF,
+    )
+    token_result = await repository.create_staff_password_reset_token(email="staff@example.com")
+    assert token_result is not None
+
+    reset_user = await repository.reset_staff_user_password(token=token_result[1], password="second-secret")
+    old_login = await repository.authenticate_staff_user(email="staff@example.com", password="first-secret")
+    new_login = await repository.authenticate_staff_user(email="staff@example.com", password="second-secret")
+    reused_token = await repository.get_staff_user_by_password_reset_token(token=token_result[1])
+
+    assert reset_user is not None
+    assert old_login is None
+    assert new_login is not None
+    assert reused_token is None
+
+    await close_repository(repository, runtime)
+
+
+async def test_expired_password_reset_token_is_rejected(tmp_path: Path):
+    """Expired password-reset tokens cannot be used for lookup or password changes."""
+    repository, runtime = await build_repository(tmp_path)
+    created = await repository.ensure_staff_user(
+        email="staff@example.com",
+        full_name="Staff One",
+        password="first-secret",
+        store_id=1,
+        role=StaffRole.STAFF,
+    )
+    token_result = await repository.create_staff_password_reset_token(email="staff@example.com")
+    assert token_result is not None
+
+    token_row = await repository.session.scalar(select(PasswordResetToken))
+    assert token_row is not None
+    token_row.expires_at = utc_now() - timedelta(minutes=1)
+    await repository.session.flush()
+
+    lookup = await repository.get_staff_user_by_password_reset_token(token=token_result[1])
+    reset = await repository.reset_staff_user_password(token=token_result[1], password="second-secret")
+    unchanged_login = await repository.authenticate_staff_user(email=created.email, password="first-secret")
+
+    assert lookup is None
+    assert reset is None
+    assert unchanged_login is not None
+
+    await close_repository(repository, runtime)
+
+
+async def test_reset_staff_user_password_rejects_inactive_users(tmp_path: Path):
+    """Reset tokens stop working once the target staff user is deactivated."""
+    repository, runtime = await build_repository(tmp_path)
+    created = await repository.ensure_staff_user(
+        email="staff@example.com",
+        full_name="Staff One",
+        password="first-secret",
+        store_id=1,
+        role=StaffRole.STAFF,
+    )
+    token_result = await repository.create_staff_password_reset_token(email="staff@example.com")
+    assert token_result is not None
+
+    row = await repository.session.get(StaffUser, created.id)
+    assert row is not None
+    row.is_active = False
+    await repository.session.flush()
+
+    lookup = await repository.get_staff_user_by_password_reset_token(token=token_result[1])
+    reset = await repository.reset_staff_user_password(token=token_result[1], password="second-secret")
+
+    assert lookup is None
+    assert reset is None
+
+    await close_repository(repository, runtime)
+
+
+async def test_reset_staff_user_password_consumes_any_other_outstanding_tokens(tmp_path: Path):
+    """Completing a reset invalidates any other outstanding token for the same user."""
+    repository, runtime = await build_repository(tmp_path)
+    created = await repository.ensure_staff_user(
+        email="staff@example.com",
+        full_name="Staff One",
+        password="first-secret",
+        store_id=1,
+        role=StaffRole.STAFF,
+    )
+    primary_token = await repository.create_staff_password_reset_token(email="staff@example.com")
+    assert primary_token is not None
+    extra_token = PasswordResetToken(
+        staff_user_id=created.id,
+        token_hash=repository_module.hash_password_reset_token("manual-extra-token"),
+        expires_at=utc_now() + timedelta(hours=1),
+    )
+    repository.session.add(extra_token)
+    await repository.session.flush()
+
+    reset = await repository.reset_staff_user_password(token=primary_token[1], password="second-secret")
+    extra_token_lookup = await repository.get_staff_user_by_password_reset_token(token="manual-extra-token")
+
+    assert reset is not None
+    assert extra_token.used_at is not None
+    assert extra_token_lookup is None
 
     await close_repository(repository, runtime)
 

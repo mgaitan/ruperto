@@ -24,6 +24,13 @@ class HandoffEmailDeliveryError(RuntimeError):
         super().__init__("Could not deliver handoff alert email.")
 
 
+class PasswordResetEmailDeliveryError(RuntimeError):
+    """Raised when the password-reset email cannot be delivered."""
+
+    def __init__(self) -> None:
+        super().__init__("Could not deliver password reset email.")
+
+
 def _vertical_label(vertical: StoreVertical) -> str:
     """Return the human label used in signup emails."""
     if vertical == StoreVertical.MUNICIPAL:
@@ -66,6 +73,58 @@ def build_signup_welcome_email(  # noqa: PLR0913
     return message
 
 
+def build_password_reset_email(
+    *,
+    sender_email: str,
+    recipient_email: str,
+    recipient_name: str,
+    reset_url: str,
+) -> EmailMessage:
+    """Build the staff-facing password-reset email."""
+    message = EmailMessage()
+    message["Subject"] = "Restablecé tu contraseña de Ruperto"
+    message["From"] = sender_email
+    message["To"] = recipient_email
+    message.set_content(
+        "\n".join(
+            [
+                f"Hola {recipient_name},",
+                "",
+                "Recibimos un pedido para restablecer tu contraseña del panel.",
+                "Usá este enlace para elegir una nueva contraseña:",
+                reset_url,
+                "",
+                "Si no pediste este cambio, podés ignorar este correo.",
+                "El enlace vence en 2 horas.",
+            ]
+        )
+    )
+    return message
+
+
+def _send_smtp_message(
+    *,
+    smtp_server: str,
+    smtp_port: int,
+    smtp_user: str,
+    smtp_password: str,
+    message: EmailMessage,
+) -> None:
+    """Deliver one transactional email through the configured SMTP account."""
+    if smtp_port == SMTP_SSL_PORT:
+        with smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=10) as client:
+            client.login(smtp_user, smtp_password)
+            client.send_message(message)
+        return
+
+    with smtplib.SMTP(smtp_server, smtp_port, timeout=10) as client:
+        client.ehlo()
+        client.starttls()
+        client.ehlo()
+        client.login(smtp_user, smtp_password)
+        client.send_message(message)
+
+
 def send_signup_welcome_email(  # noqa: PLR0913
     *,
     smtp_server: str,
@@ -92,18 +151,13 @@ def send_signup_welcome_email(  # noqa: PLR0913
         demo_chat_url=demo_chat_url,
     )
     try:
-        if smtp_port == SMTP_SSL_PORT:
-            with smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=10) as client:
-                client.login(smtp_user, smtp_password)
-                client.send_message(message)
-            return
-
-        with smtplib.SMTP(smtp_server, smtp_port, timeout=10) as client:
-            client.ehlo()
-            client.starttls()
-            client.ehlo()
-            client.login(smtp_user, smtp_password)
-            client.send_message(message)
+        _send_smtp_message(
+            smtp_server=smtp_server,
+            smtp_port=smtp_port,
+            smtp_user=smtp_user,
+            smtp_password=smtp_password,
+            message=message,
+        )
     except (OSError, smtplib.SMTPException) as error:
         raise SignupEmailDeliveryError() from error
 
@@ -168,17 +222,41 @@ def send_handoff_alert_email(  # noqa: PLR0913
         handoff_reason=handoff_reason,
     )
     try:
-        if smtp_port == SMTP_SSL_PORT:
-            with smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=10) as client:
-                client.login(smtp_user, smtp_password)
-                client.send_message(message)
-            return
-
-        with smtplib.SMTP(smtp_server, smtp_port, timeout=10) as client:
-            client.ehlo()
-            client.starttls()
-            client.ehlo()
-            client.login(smtp_user, smtp_password)
-            client.send_message(message)
+        _send_smtp_message(
+            smtp_server=smtp_server,
+            smtp_port=smtp_port,
+            smtp_user=smtp_user,
+            smtp_password=smtp_password,
+            message=message,
+        )
     except (OSError, smtplib.SMTPException) as error:
         raise HandoffEmailDeliveryError() from error
+
+
+def send_password_reset_email(  # noqa: PLR0913
+    *,
+    smtp_server: str,
+    smtp_port: int,
+    smtp_user: str,
+    smtp_password: str,
+    recipient_email: str,
+    recipient_name: str,
+    reset_url: str,
+) -> None:
+    """Send the password-reset email through the configured SMTP account."""
+    message = build_password_reset_email(
+        sender_email=smtp_user,
+        recipient_email=recipient_email,
+        recipient_name=recipient_name,
+        reset_url=reset_url,
+    )
+    try:
+        _send_smtp_message(
+            smtp_server=smtp_server,
+            smtp_port=smtp_port,
+            smtp_user=smtp_user,
+            smtp_password=smtp_password,
+            message=message,
+        )
+    except (OSError, smtplib.SMTPException) as error:
+        raise PasswordResetEmailDeliveryError() from error

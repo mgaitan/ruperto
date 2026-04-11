@@ -32,7 +32,12 @@ from ruperto.channels.service import (
 )
 from ruperto.config import Settings
 from ruperto.db import DatabaseRuntime, create_database_runtime, init_database, ping_database, seed_store_bootstrap_data
-from ruperto.mail import SignupEmailDeliveryError, send_signup_welcome_email
+from ruperto.mail import (
+    PasswordResetEmailDeliveryError,
+    SignupEmailDeliveryError,
+    send_password_reset_email,
+    send_signup_welcome_email,
+)
 from ruperto.models import (
     Channel,
     ChannelProvider,
@@ -80,6 +85,8 @@ DASHBOARD_FLASH_MESSAGES = {
     "hours-updated": "Horarios actualizados.",
     "login-required": "Iniciá sesión para acceder al panel.",
     "logged-out": "Sesión cerrada.",
+    "password-reset-complete": "Ya podés entrar con tu nueva contraseña.",
+    "password-reset-sent": "Si el correo existe, te enviamos un enlace para restablecer la contraseña.",
     "order-updated": "Estado del pedido actualizado.",
     "profile-updated": "Perfil del local actualizado.",
     "municipal-area-created": "Area creada.",
@@ -148,6 +155,7 @@ DASHBOARD_WEEKDAYS = {
     5: "Sábado",
     6: "Domingo",
 }
+PASSWORD_MIN_LENGTH = 8
 
 
 class DashboardNavItem(TypedDict):
@@ -395,6 +403,34 @@ def dashboard_login_context(
         "error_message": error_message,
         "flash_message": DASHBOARD_FLASH_MESSAGES.get(flash or ""),
         "email": email,
+    }
+
+
+def dashboard_password_reset_request_context(
+    *,
+    request: Request,
+    error_message: str | None = None,
+    email: str = "",
+) -> dict[str, Any]:
+    """Build the template context for the password-reset request form."""
+    return {
+        "request": request,
+        "error_message": error_message,
+        "email": email,
+    }
+
+
+def dashboard_password_reset_form_context(
+    *,
+    request: Request,
+    token: str,
+    error_message: str | None = None,
+) -> dict[str, Any]:
+    """Build the template context for the password-reset confirmation form."""
+    return {
+        "request": request,
+        "token": token,
+        "error_message": error_message,
     }
 
 
@@ -1014,6 +1050,164 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901, PLR0
         request.session[SESSION_STAFF_USER_ID_KEY] = staff_user.id
         request.session[SESSION_STORE_ID_KEY] = memberships[0].store_id
         return RedirectResponse(url=next_url, status_code=303)
+
+    @app.get("/dashboard/forgot-password", response_class=HTMLResponse)
+    async def get_dashboard_forgot_password(request: Request) -> Response:
+        identity = await load_dashboard_identity(request)
+        if identity is not None:
+            return dashboard_redirect()
+        context = dashboard_password_reset_request_context(request=request)
+        return TEMPLATES.TemplateResponse(
+            request=request,
+            name="dashboard_forgot_password.html",
+            context=context,
+        )
+
+    @app.post("/dashboard/forgot-password", response_class=HTMLResponse)
+    async def post_dashboard_forgot_password(request: Request) -> Response:
+        identity = await load_dashboard_identity(request)
+        if identity is not None:
+            return dashboard_redirect()
+
+        runtime = get_runtime(request)
+        form = await request.form()
+        email = normalize_email(str(form.get("email", "")))
+        if not runtime.settings.smtp_configured:
+            context = dashboard_password_reset_request_context(
+                request=request,
+                error_message="La recuperación por correo no está disponible en esta instancia.",
+                email=email,
+            )
+            return TEMPLATES.TemplateResponse(
+                request=request,
+                name="dashboard_forgot_password.html",
+                context=context,
+                status_code=503,
+            )
+
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            token_result = await repository.create_staff_password_reset_token(email=email)
+            if token_result is not None:
+                staff_user, token = token_result
+                reset_url = f"{request.url_for('get_dashboard_reset_password')}?token={token}"
+                assert runtime.settings.smtp_server is not None
+                assert runtime.settings.smtp_port is not None
+                assert runtime.settings.smtp_user is not None
+                assert runtime.settings.smtp_password is not None
+                try:
+                    await asyncio.to_thread(
+                        send_password_reset_email,
+                        smtp_server=runtime.settings.smtp_server,
+                        smtp_port=runtime.settings.smtp_port,
+                        smtp_user=runtime.settings.smtp_user,
+                        smtp_password=runtime.settings.smtp_password.get_secret_value(),
+                        recipient_email=staff_user.email,
+                        recipient_name=staff_user.full_name,
+                        reset_url=reset_url,
+                    )
+                except PasswordResetEmailDeliveryError:
+                    context = dashboard_password_reset_request_context(
+                        request=request,
+                        error_message=(
+                            "No pudimos enviar el correo de recuperación. "
+                            "Revisá la configuración SMTP e intentá de nuevo."
+                        ),
+                        email=email,
+                    )
+                    return TEMPLATES.TemplateResponse(
+                        request=request,
+                        name="dashboard_forgot_password.html",
+                        context=context,
+                        status_code=503,
+                    )
+            await session.commit()
+
+        return dashboard_login_redirect(flash="password-reset-sent")
+
+    @app.get("/dashboard/reset-password", response_class=HTMLResponse)
+    async def get_dashboard_reset_password(request: Request, token: str = "") -> Response:
+        identity = await load_dashboard_identity(request)
+        if identity is not None:
+            return dashboard_redirect()
+
+        runtime = get_runtime(request)
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            staff_user = await repository.get_staff_user_by_password_reset_token(token=token) if token else None
+
+        if staff_user is None:
+            context = dashboard_password_reset_form_context(
+                request=request,
+                token=token,
+                error_message="El enlace no es válido o ya venció.",
+            )
+            return TEMPLATES.TemplateResponse(
+                request=request,
+                name="dashboard_reset_password.html",
+                context=context,
+                status_code=400,
+            )
+
+        context = dashboard_password_reset_form_context(request=request, token=token)
+        return TEMPLATES.TemplateResponse(request=request, name="dashboard_reset_password.html", context=context)
+
+    @app.post("/dashboard/reset-password", response_class=HTMLResponse)
+    async def post_dashboard_reset_password(request: Request) -> Response:
+        identity = await load_dashboard_identity(request)
+        if identity is not None:
+            return dashboard_redirect()
+
+        runtime = get_runtime(request)
+        form = await request.form()
+        token = str(form.get("token", ""))
+        password = str(form.get("password", ""))
+        confirm_password = str(form.get("confirm_password", ""))
+
+        if len(password) < PASSWORD_MIN_LENGTH:
+            context = dashboard_password_reset_form_context(
+                request=request,
+                token=token,
+                error_message=f"La contraseña debe tener al menos {PASSWORD_MIN_LENGTH} caracteres.",
+            )
+            return TEMPLATES.TemplateResponse(
+                request=request,
+                name="dashboard_reset_password.html",
+                context=context,
+                status_code=422,
+            )
+
+        if password != confirm_password:
+            context = dashboard_password_reset_form_context(
+                request=request,
+                token=token,
+                error_message="Las contraseñas no coinciden.",
+            )
+            return TEMPLATES.TemplateResponse(
+                request=request,
+                name="dashboard_reset_password.html",
+                context=context,
+                status_code=422,
+            )
+
+        async with runtime.database.session_factory() as session:
+            repository = BusinessRepository(session)
+            staff_user = await repository.reset_staff_user_password(token=token, password=password)
+            if staff_user is None:
+                context = dashboard_password_reset_form_context(
+                    request=request,
+                    token=token,
+                    error_message="El enlace no es válido o ya venció.",
+                )
+                return TEMPLATES.TemplateResponse(
+                    request=request,
+                    name="dashboard_reset_password.html",
+                    context=context,
+                    status_code=400,
+                )
+            await session.commit()
+
+        return dashboard_login_redirect(flash="password-reset-complete")
 
     @app.post("/dashboard/logout")
     async def post_dashboard_logout(request: Request) -> RedirectResponse:

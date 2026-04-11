@@ -207,6 +207,8 @@ agent behavior, flexible weekly opening hours, and user roles.
 The store profile page shows the tenant vertical and public slug as read-only
 identity fields, so the same installation can host different tenant types
 without converting one tenant into another from the dashboard.
+When SMTP is configured, the same login screen also lets staff request a
+password-reset email and choose a new password from a time-limited link.
 If you bootstrap a municipal tenant, `init-db` now also seeds a first service
 catalog with municipal areas and categories, and the shared chat endpoint
 guides neighbors through a first complaint/request intake before creating the

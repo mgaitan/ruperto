@@ -51,6 +51,8 @@ export RUPERTO_DASHBOARD_ADMIN_NAME="Store Admin"
 If you plan to send transactional email from the same backend, the SMTP
 settings are now also recognized through `RUPERTO_SMTP_SERVER`,
 `RUPERTO_SMTP_PORT`, `RUPERTO_SMTP_USER`, and `RUPERTO_SMTP_PASSWORD`.
+That same SMTP configuration is reused for welcome emails, password recovery,
+and human-handoff alerts.
 
 The bootstrap store can also start on another business vertical through
 `RUPERTO_STORE_VERTICAL`. The current accepted values are `ordering`

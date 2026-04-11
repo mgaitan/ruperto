@@ -136,6 +136,19 @@ class StaffUser(Base):
     updated_at: Mapped[datetime] = mapped_column(default=utc_now, onupdate=utc_now)
 
 
+class PasswordResetToken(Base):
+    """One one-time password-reset token issued to a dashboard user."""
+
+    __tablename__ = "password_reset_token"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    staff_user_id: Mapped[int] = mapped_column(ForeignKey("staff_user.id", ondelete="CASCADE"))
+    token_hash: Mapped[str] = mapped_column(String(length=64), unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=utc_now)
+
+
 class StoreMembership(Base):
     """Map one dashboard user to one store and role."""
 

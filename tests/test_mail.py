@@ -8,10 +8,13 @@ import pytest
 
 from ruperto.mail import (
     HandoffEmailDeliveryError,
+    PasswordResetEmailDeliveryError,
     SignupEmailDeliveryError,
     build_handoff_alert_email,
+    build_password_reset_email,
     build_signup_welcome_email,
     send_handoff_alert_email,
+    send_password_reset_email,
     send_signup_welcome_email,
 )
 from ruperto.models import StoreVertical
@@ -138,6 +141,20 @@ def test_build_handoff_alert_email_contains_customer_context():
     assert "Necesito hablar con una persona." in message.get_content()
 
 
+def test_build_password_reset_email_contains_reset_link():
+    """Password-reset emails include the reset URL and expiry hint."""
+    message = build_password_reset_email(
+        sender_email="mailer@example.com",
+        recipient_email="owner@example.com",
+        recipient_name="Nora",
+        reset_url="https://example.com/dashboard/reset-password?token=abc123",
+    )
+
+    assert message["Subject"] == "Restablecé tu contraseña de Ruperto"
+    assert "abc123" in message.get_content()
+    assert "vence en 2 horas" in message.get_content()
+
+
 def test_send_handoff_alert_email_uses_ssl_for_port_465():
     """Operator handoff emails also honor SMTP over SSL on port 465."""
     with patch("ruperto.mail.smtplib.SMTP_SSL") as smtp_ssl:
@@ -205,3 +222,37 @@ def test_send_handoff_alert_email_uses_starttls_for_non_ssl_ports():
     smtp_client.starttls.assert_called_once()
     smtp_client.login.assert_called_once_with("mailer@example.com", "smtp-secret")
     smtp_client.send_message.assert_called_once()
+
+
+def test_send_password_reset_email_uses_ssl_for_port_465():
+    """Password-reset delivery uses SMTP over SSL on port 465."""
+    with patch("ruperto.mail.smtplib.SMTP_SSL") as smtp_ssl:
+        send_password_reset_email(
+            smtp_server="smtp.example.com",
+            smtp_port=465,
+            smtp_user="mailer@example.com",
+            smtp_password="smtp-secret",
+            recipient_email="owner@example.com",
+            recipient_name="Nora",
+            reset_url="https://example.com/dashboard/reset-password?token=abc123",
+        )
+
+    smtp_ssl.assert_called_once()
+    smtp_ssl.return_value.__enter__.return_value.login.assert_called_once_with("mailer@example.com", "smtp-secret")
+
+
+def test_send_password_reset_email_wraps_smtp_errors():
+    """SMTP transport errors are exposed as domain-specific password-reset failures."""
+    with (
+        patch("ruperto.mail.smtplib.SMTP", side_effect=OSError("boom")),
+        pytest.raises(PasswordResetEmailDeliveryError),
+    ):
+        send_password_reset_email(
+            smtp_server="smtp.example.com",
+            smtp_port=587,
+            smtp_user="mailer@example.com",
+            smtp_password="smtp-secret",
+            recipient_email="owner@example.com",
+            recipient_name="Nora",
+            reset_url="https://example.com/dashboard/reset-password?token=abc123",
+        )

@@ -5,10 +5,13 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+from datetime import timedelta
 
 PBKDF2_ALGORITHM = "pbkdf2_sha256"
 PBKDF2_ITERATIONS = 600_000
 SALT_BYTES = 16
+PASSWORD_RESET_TOKEN_BYTES = 24
+PASSWORD_RESET_TOKEN_TTL = timedelta(hours=2)
 
 
 def normalize_email(value: str) -> str:
@@ -43,3 +46,13 @@ def verify_password(password: str, encoded_hash: str) -> bool:
         int(iterations_text),
     ).hex()
     return hmac.compare_digest(derived_key, expected_hash)
+
+
+def create_password_reset_token() -> str:
+    """Return one random opaque token suitable for password-reset links."""
+    return secrets.token_urlsafe(PASSWORD_RESET_TOKEN_BYTES)
+
+
+def hash_password_reset_token(token: str) -> str:
+    """Hash one reset token before persisting it in the database."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()

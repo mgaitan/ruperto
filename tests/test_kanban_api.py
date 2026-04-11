@@ -230,7 +230,7 @@ async def test_kanban_api_returns_not_found_when_updating_unknown_case(tmp_path)
 
 
 async def test_kanban_route_endpoint_commits_success_and_not_found_paths(tmp_path):
-    """Direct route calls cover the kanban commit and not-found branches under Python 3.13."""
+    """Direct route calls cover the kanban commit and not-found branches explicitly."""
     settings = build_kanban_settings(tmp_path, "kanban-direct-coverage.db")
     app = create_app(settings)
 

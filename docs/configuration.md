@@ -80,7 +80,8 @@ RUPERTO_DASHBOARD_ADMIN_NAME
 
 RUPERTO_SMTP_SERVER
   SMTP hostname used for transactional emails sent by the backend, such as
-  signup welcomes and human-handoff alerts for store staff.
+  signup welcomes, password-reset links, and human-handoff alerts for store
+  staff.
 
 RUPERTO_SMTP_PORT
   SMTP port used together with {term}`RUPERTO_SMTP_SERVER`.

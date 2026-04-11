@@ -16,7 +16,14 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
-from ruperto.auth import hash_password, normalize_email, verify_password
+from ruperto.auth import (
+    PASSWORD_RESET_TOKEN_TTL,
+    create_password_reset_token,
+    hash_password,
+    hash_password_reset_token,
+    normalize_email,
+    verify_password,
+)
 from ruperto.models import (
     Channel,
     ChannelProvider,
@@ -37,6 +44,7 @@ from ruperto.models import (
     OrderItem,
     OrderStatus,
     OutboundNotification,
+    PasswordResetToken,
     PaymentMethod,
     StaffRole,
     StaffUser,
@@ -515,6 +523,84 @@ class BusinessRepository:
             return None
         if not verify_password(password, row.password_hash):
             return None
+        return StaffUserSnapshot.model_validate(row)
+
+    async def create_staff_password_reset_token(self, *, email: str) -> tuple[StaffUserSnapshot, str] | None:
+        """Create one new password-reset token for an active dashboard user."""
+        row = await self.session.scalar(select(StaffUser).where(StaffUser.email == normalize_email(email)))
+        if row is None or not row.is_active:
+            return None
+
+        existing_tokens = (
+            await self.session.scalars(
+                select(PasswordResetToken).where(
+                    PasswordResetToken.staff_user_id == row.id,
+                    PasswordResetToken.used_at.is_(None),
+                )
+            )
+        ).all()
+        for token_row in existing_tokens:
+            token_row.used_at = utc_now()
+
+        raw_token = create_password_reset_token()
+        self.session.add(
+            PasswordResetToken(
+                staff_user_id=row.id,
+                token_hash=hash_password_reset_token(raw_token),
+                expires_at=utc_now() + PASSWORD_RESET_TOKEN_TTL,
+            )
+        )
+        await self.session.flush()
+        return StaffUserSnapshot.model_validate(row), raw_token
+
+    async def get_staff_user_by_password_reset_token(self, *, token: str) -> StaffUserSnapshot | None:
+        """Resolve one active dashboard user from a valid password-reset token."""
+        row = await self.session.scalar(
+            select(StaffUser)
+            .join(PasswordResetToken, PasswordResetToken.staff_user_id == StaffUser.id)
+            .where(
+                PasswordResetToken.token_hash == hash_password_reset_token(token),
+                PasswordResetToken.used_at.is_(None),
+                PasswordResetToken.expires_at > utc_now(),
+                StaffUser.is_active.is_(True),
+            )
+        )
+        if row is None:
+            return None
+        return StaffUserSnapshot.model_validate(row)
+
+    async def reset_staff_user_password(self, *, token: str, password: str) -> StaffUserSnapshot | None:
+        """Reset one dashboard user's password from a valid reset token."""
+        token_row = await self.session.scalar(
+            select(PasswordResetToken).where(
+                PasswordResetToken.token_hash == hash_password_reset_token(token),
+                PasswordResetToken.used_at.is_(None),
+                PasswordResetToken.expires_at > utc_now(),
+            )
+        )
+        if token_row is None:
+            return None
+
+        row = await self.session.get(StaffUser, token_row.staff_user_id)
+        if row is None or not row.is_active:
+            return None
+
+        row.password_hash = hash_password(password)
+        row.updated_at = utc_now()
+        token_row.used_at = utc_now()
+        sibling_tokens = (
+            await self.session.scalars(
+                select(PasswordResetToken).where(
+                    PasswordResetToken.staff_user_id == row.id,
+                    PasswordResetToken.id != token_row.id,
+                    PasswordResetToken.used_at.is_(None),
+                )
+            )
+        ).all()
+        for sibling_token in sibling_tokens:
+            sibling_token.used_at = utc_now()
+
+        await self.session.flush()
         return StaffUserSnapshot.model_validate(row)
 
     async def list_store_memberships_for_staff_user(self, staff_user_id: int) -> list[StoreMembershipSnapshot]:

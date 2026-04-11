@@ -42,7 +42,7 @@ from ruperto.app import (
 from ruperto.channels.base import ChannelDeliveryError
 from ruperto.config import Settings
 from ruperto.db import create_database_runtime, init_database
-from ruperto.mail import SignupEmailDeliveryError
+from ruperto.mail import PasswordResetEmailDeliveryError, SignupEmailDeliveryError
 from ruperto.models import (
     Channel,
     ChannelProvider,
@@ -107,6 +107,10 @@ def build_settings(
         dashboard_admin_email="staff@example.com",
         dashboard_admin_password=SecretStr("super-secret"),
         dashboard_admin_name="Staff User",
+        smtp_server=None,
+        smtp_port=None,
+        smtp_user=None,
+        smtp_password=None,
         kapso_api_key=None,
         kapso_phone_number_id=None,
         kapso_webhook_secret=None,
@@ -636,7 +640,7 @@ def test_home_signup_sends_welcome_email_when_smtp_is_configured(tmp_path: Path)
 
 
 def test_home_signup_direct_route_call_covers_smtp_success_branch(tmp_path: Path):
-    """Direct signup handler calls cover the SMTP success branch under Python 3.13 coverage."""
+    """Direct signup handler calls cover the SMTP success branch in route-level tests."""
     settings = build_settings(tmp_path).model_copy(
         update={
             "smtp_server": "smtp.example.com",
@@ -2037,6 +2041,287 @@ def test_dashboard_login_rejects_invalid_credentials(tmp_path: Path):
     assert "Credenciales inválidas." in response.text
 
 
+def test_dashboard_login_page_links_to_password_reset(tmp_path: Path):
+    """The login page exposes the password-reset entry point."""
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.get("/dashboard/login")
+
+    assert response.status_code == HTTP_OK
+    assert 'href="/dashboard/forgot-password"' in response.text
+
+
+def test_dashboard_forgot_password_page_renders_for_anonymous_staff(tmp_path: Path):
+    """Anonymous staff can open the password-reset request screen."""
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.get("/dashboard/forgot-password")
+
+    assert response.status_code == HTTP_OK
+    assert "Recuperá tu contraseña" in response.text
+
+
+def test_dashboard_forgot_password_sends_email_when_smtp_is_configured(tmp_path: Path):
+    """Known staff users receive a password-reset email when SMTP is available."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "smtp_server": "smtp.example.com",
+            "smtp_port": SMTP_PORT,
+            "smtp_user": "mailer@example.com",
+            "smtp_password": SecretStr("smtp-secret"),
+        }
+    )
+    app = create_app(settings)
+
+    with patch("ruperto.app.send_password_reset_email") as send_reset_email, TestClient(app) as client:
+        response = client.post(
+            "/dashboard/forgot-password",
+            data={"email": "staff@example.com"},
+            follow_redirects=False,
+        )
+
+    assert response.status_code == HTTP_FOUND
+    assert "flash=password-reset-sent" in response.headers["location"]
+    send_reset_email.assert_called_once()
+    call = send_reset_email.call_args.kwargs
+    assert call["recipient_email"] == "staff@example.com"
+    assert call["recipient_name"] == "Staff User"
+    assert "/dashboard/reset-password?token=" in call["reset_url"]
+
+
+def test_dashboard_forgot_password_returns_generic_success_for_unknown_email(tmp_path: Path):
+    """Unknown staff emails should not reveal whether the account exists."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "smtp_server": "smtp.example.com",
+            "smtp_port": SMTP_PORT,
+            "smtp_user": "mailer@example.com",
+            "smtp_password": SecretStr("smtp-secret"),
+        }
+    )
+    app = create_app(settings)
+
+    with patch("ruperto.app.send_password_reset_email") as send_reset_email, TestClient(app) as client:
+        response = client.post(
+            "/dashboard/forgot-password",
+            data={"email": "missing@example.com"},
+            follow_redirects=False,
+        )
+
+    assert response.status_code == HTTP_FOUND
+    assert "flash=password-reset-sent" in response.headers["location"]
+    send_reset_email.assert_not_called()
+
+
+def test_dashboard_forgot_password_requires_smtp_configuration(tmp_path: Path):
+    """Password reset is unavailable when the instance has no SMTP settings."""
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/dashboard/forgot-password",
+            data={"email": "staff@example.com"},
+            follow_redirects=False,
+        )
+
+    assert response.status_code == HTTP_SERVICE_UNAVAILABLE
+    assert "La recuperación por correo no está disponible" in response.text
+
+
+def test_dashboard_reset_password_page_rejects_invalid_token(tmp_path: Path):
+    """Invalid or expired reset links render a friendly error page."""
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.get("/dashboard/reset-password", params={"token": "invalid-token"})
+
+    assert response.status_code == HTTP_BAD_REQUEST
+    assert "El enlace no es válido o ya venció." in response.text
+
+
+def test_dashboard_reset_password_flow_updates_credentials(tmp_path: Path):
+    """Staff can choose a new password from a valid reset link and log in afterwards."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "smtp_server": "smtp.example.com",
+            "smtp_port": SMTP_PORT,
+            "smtp_user": "mailer@example.com",
+            "smtp_password": SecretStr("smtp-secret"),
+        }
+    )
+    app = create_app(settings)
+
+    with patch("ruperto.app.send_password_reset_email") as send_reset_email, TestClient(app) as client:
+        forgot_response = client.post(
+            "/dashboard/forgot-password",
+            data={"email": "staff@example.com"},
+            follow_redirects=False,
+        )
+        reset_url = send_reset_email.call_args.kwargs["reset_url"]
+        token = reset_url.split("token=", maxsplit=1)[1]
+        reset_response = client.post(
+            "/dashboard/reset-password",
+            data={
+                "token": token,
+                "password": "new-secret-123",
+                "confirm_password": "new-secret-123",
+            },
+            follow_redirects=False,
+        )
+        old_login = client.post(
+            "/dashboard/login",
+            data={"email": "staff@example.com", "password": "super-secret", "next": "/dashboard"},
+        )
+        new_login = client.post(
+            "/dashboard/login",
+            data={"email": "staff@example.com", "password": "new-secret-123", "next": "/dashboard"},
+            follow_redirects=False,
+        )
+
+    assert forgot_response.status_code == HTTP_FOUND
+    assert reset_response.status_code == HTTP_FOUND
+    assert "flash=password-reset-complete" in reset_response.headers["location"]
+    assert old_login.status_code == HTTP_UNAUTHORIZED
+    assert new_login.status_code == HTTP_FOUND
+    assert new_login.headers["location"] == "/dashboard"
+
+
+def test_dashboard_reset_password_rejects_short_passwords(tmp_path: Path):
+    """The reset form validates minimum password length before changing credentials."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "smtp_server": "smtp.example.com",
+            "smtp_port": SMTP_PORT,
+            "smtp_user": "mailer@example.com",
+            "smtp_password": SecretStr("smtp-secret"),
+        }
+    )
+    app = create_app(settings)
+
+    with patch("ruperto.app.send_password_reset_email") as send_reset_email, TestClient(app) as client:
+        client.post("/dashboard/forgot-password", data={"email": "staff@example.com"}, follow_redirects=False)
+        token = send_reset_email.call_args.kwargs["reset_url"].split("token=", maxsplit=1)[1]
+        response = client.post(
+            "/dashboard/reset-password",
+            data={"token": token, "password": "short", "confirm_password": "short"},
+        )
+
+    assert response.status_code == HTTP_UNPROCESSABLE_ENTITY
+    assert "La contraseña debe tener al menos 8 caracteres." in response.text
+
+
+def test_dashboard_password_reset_routes_redirect_authenticated_staff(tmp_path: Path):
+    """Signed-in staff should not see anonymous password-reset screens."""
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        forgot_get = client.get("/dashboard/forgot-password", follow_redirects=False)
+        forgot_post = client.post(
+            "/dashboard/forgot-password",
+            data={"email": "staff@example.com"},
+            follow_redirects=False,
+        )
+        reset_get = client.get("/dashboard/reset-password", params={"token": "whatever"}, follow_redirects=False)
+        reset_post = client.post(
+            "/dashboard/reset-password",
+            data={"token": "whatever", "password": "new-secret-123", "confirm_password": "new-secret-123"},
+            follow_redirects=False,
+        )
+
+    assert forgot_get.status_code == HTTP_FOUND
+    assert forgot_get.headers["location"] == "/dashboard"
+    assert forgot_post.status_code == HTTP_FOUND
+    assert forgot_post.headers["location"] == "/dashboard"
+    assert reset_get.status_code == HTTP_FOUND
+    assert reset_get.headers["location"] == "/dashboard"
+    assert reset_post.status_code == HTTP_FOUND
+    assert reset_post.headers["location"] == "/dashboard"
+
+
+def test_dashboard_forgot_password_reports_email_delivery_failures(tmp_path: Path):
+    """SMTP delivery failures keep the request form and show a friendly error."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "smtp_server": "smtp.example.com",
+            "smtp_port": SMTP_PORT,
+            "smtp_user": "mailer@example.com",
+            "smtp_password": SecretStr("smtp-secret"),
+        }
+    )
+    app = create_app(settings)
+
+    with (
+        patch("ruperto.app.send_password_reset_email", side_effect=PasswordResetEmailDeliveryError()),
+        TestClient(app) as client,
+    ):
+        response = client.post("/dashboard/forgot-password", data={"email": "staff@example.com"})
+
+    assert response.status_code == HTTP_SERVICE_UNAVAILABLE
+    assert "No pudimos enviar el correo de recuperación." in response.text
+
+
+def test_dashboard_reset_password_page_accepts_valid_token(tmp_path: Path):
+    """A valid token renders the form for choosing a new password."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "smtp_server": "smtp.example.com",
+            "smtp_port": SMTP_PORT,
+            "smtp_user": "mailer@example.com",
+            "smtp_password": SecretStr("smtp-secret"),
+        }
+    )
+    app = create_app(settings)
+
+    with patch("ruperto.app.send_password_reset_email") as send_reset_email, TestClient(app) as client:
+        client.post("/dashboard/forgot-password", data={"email": "staff@example.com"}, follow_redirects=False)
+        token = send_reset_email.call_args.kwargs["reset_url"].split("token=", maxsplit=1)[1]
+        response = client.get("/dashboard/reset-password", params={"token": token})
+
+    assert response.status_code == HTTP_OK
+    assert 'name="confirm_password"' in response.text
+
+
+def test_dashboard_reset_password_rejects_mismatched_passwords(tmp_path: Path):
+    """The reset form keeps the user on the page when both passwords differ."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "smtp_server": "smtp.example.com",
+            "smtp_port": SMTP_PORT,
+            "smtp_user": "mailer@example.com",
+            "smtp_password": SecretStr("smtp-secret"),
+        }
+    )
+    app = create_app(settings)
+
+    with patch("ruperto.app.send_password_reset_email") as send_reset_email, TestClient(app) as client:
+        client.post("/dashboard/forgot-password", data={"email": "staff@example.com"}, follow_redirects=False)
+        token = send_reset_email.call_args.kwargs["reset_url"].split("token=", maxsplit=1)[1]
+        response = client.post(
+            "/dashboard/reset-password",
+            data={"token": token, "password": "new-secret-123", "confirm_password": "other-secret-123"},
+        )
+
+    assert response.status_code == HTTP_UNPROCESSABLE_ENTITY
+    assert "Las contraseñas no coinciden." in response.text
+
+
+def test_dashboard_reset_password_rejects_invalid_token_on_submit(tmp_path: Path):
+    """Submitting an invalid token keeps the user on the reset form with a clear error."""
+    app = create_app(build_settings(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/dashboard/reset-password",
+            data={"token": "missing-token", "password": "new-secret-123", "confirm_password": "new-secret-123"},
+        )
+
+    assert response.status_code == HTTP_BAD_REQUEST
+    assert "El enlace no es válido o ya venció." in response.text
+
+
 def test_dashboard_login_rejects_staff_without_store_memberships(tmp_path: Path):
     """Staff users without memberships cannot open a dashboard session."""
     app = create_app(build_settings(tmp_path))
@@ -2943,7 +3228,7 @@ def test_load_dashboard_identity_clears_sessions_without_memberships_directly(tm
 
 
 async def exercise_dashboard_success_routes(ordering_app, municipal_app, municipal_slug: str):
-    """Drive direct dashboard route calls that coverage misses in Python 3.13."""
+    """Drive direct dashboard route calls that coverage misses in browser-level tests."""
     ordering_runtime = ordering_app.state.runtime
     municipal_runtime = municipal_app.state.runtime
     async with ordering_runtime.database.session_factory() as session:
@@ -3173,7 +3458,7 @@ async def exercise_dashboard_success_routes(ordering_app, municipal_app, municip
 
 
 def test_dashboard_direct_route_calls_cover_shared_controller_success_paths(tmp_path: Path):
-    """Direct endpoint calls cover shared dashboard success paths under Python 3.13 coverage."""
+    """Direct endpoint calls cover shared dashboard success paths across verticals."""
     (tmp_path / "ordering").mkdir()
     (tmp_path / "municipal").mkdir()
     ordering_settings = build_settings(tmp_path / "ordering")
@@ -3218,7 +3503,7 @@ def test_dashboard_direct_route_calls_cover_shared_controller_success_paths(tmp_
 
 
 async def exercise_dashboard_error_routes(app):
-    """Drive direct dashboard error branches that coverage misses in Python 3.13."""
+    """Drive direct dashboard error branches that coverage misses in browser-level tests."""
     runtime = app.state.runtime
     async with runtime.database.session_factory() as session:
         repository = BusinessRepository(session)
