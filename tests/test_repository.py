@@ -13,6 +13,7 @@ from pydantic import SecretStr
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 from sqlalchemy import create_engine, func, select, text
 
+import ruperto.repository as repository_module
 from ruperto.config import Settings
 from ruperto.db import DatabaseRuntime, _ensure_schema_columns, create_database_runtime, init_database, ping_database
 from ruperto.models import (
@@ -594,9 +595,18 @@ async def test_order_lifecycle_and_customer_memory(tmp_path: Path):
     await close_repository(repository, runtime)
 
 
-async def test_set_order_requested_ready_at_persists_schedule_and_updates_prep_start(tmp_path: Path):
+async def test_set_order_requested_ready_at_persists_schedule_and_updates_prep_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     """Scheduled orders keep the requested ready time and derived preparation start."""
     repository, runtime = await build_repository(tmp_path)
+    fixed_now = datetime(2026, 4, 10, 15, 0, tzinfo=UTC)
+
+    def fake_utc_now() -> datetime:
+        return fixed_now
+
+    monkeypatch.setattr(repository_module, "utc_now", fake_utc_now)
     customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="schedule-ok")
     conversation = await repository.get_or_create_conversation(
         channel=Channel.DEV,
@@ -623,7 +633,7 @@ async def test_set_order_requested_ready_at_persists_schedule_and_updates_prep_s
         quantity=1,
     )
 
-    local_ready = datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(hours=2)
+    local_ready = fixed_now.astimezone(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(hours=2)
     scheduled = await repository.set_order_requested_ready_at(
         customer.id,
         conversation.id,
@@ -1430,9 +1440,18 @@ async def test_legacy_customer_tables_gain_store_id_columns(tmp_path: Path):
     assert identity_row == (1,)
 
 
-async def test_schedule_validation_helpers_cover_past_missing_prep_and_relative_day_text(tmp_path: Path):
+async def test_schedule_validation_helpers_cover_past_missing_prep_and_relative_day_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     """Scheduling validation rejects past times and the local-text helper covers tomorrow and weekdays."""
     repository, runtime = await build_repository(tmp_path)
+    fixed_now = datetime(2026, 4, 10, 15, 0, tzinfo=UTC)
+
+    def fake_utc_now() -> datetime:
+        return fixed_now
+
+    monkeypatch.setattr(repository_module, "utc_now", fake_utc_now)
     customer = await repository.get_or_create_customer(channel=Channel.DEV, external_id="schedule-helper")
     conversation = await repository.get_or_create_conversation(
         channel=Channel.DEV,
@@ -1453,28 +1472,31 @@ async def test_schedule_validation_helpers_cover_past_missing_prep_and_relative_
         ]
     )
 
+    requested_ready_at = (
+        fixed_now.astimezone(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(hours=2)
+    ).astimezone(UTC)
     created = await repository.set_order_requested_ready_at(
         customer.id,
         conversation.id,
-        (datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(hours=2)).astimezone(UTC),
+        requested_ready_at,
         timezone_name=STORE_TIMEZONE,
     )
     assert created.requested_ready_at is not None
 
     order = await repository._require_current_order(customer.id, conversation.id)
     order.requested_ready_at = (
-        datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) - timedelta(minutes=5)
+        fixed_now.astimezone(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) - timedelta(minutes=5)
     ).astimezone(UTC)
     with pytest.raises(ValueError, match="ya pasó"):
         await repository._validate_requested_ready_at(order, timezone_name=STORE_TIMEZONE, store_id=1)
 
     order.requested_ready_at = (
-        datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(hours=3)
+        fixed_now.astimezone(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0) + timedelta(hours=3)
     ).astimezone(UTC)
     order.preparation_starts_at = None
     await repository._validate_requested_ready_at(order, timezone_name=STORE_TIMEZONE, store_id=1)
 
-    local_now = datetime.now(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0)
+    local_now = fixed_now.astimezone(ZoneInfo(STORE_TIMEZONE)).replace(second=0, microsecond=0)
     assert repository._describe_local_datetime(local_now, local_now).startswith("hoy")
     assert repository._describe_local_datetime(local_now + timedelta(days=1), local_now).startswith("mañana")
     assert repository._describe_local_datetime(local_now + timedelta(days=2), local_now).startswith("el ")
@@ -2503,10 +2525,7 @@ async def test_customer_scoped_municipal_case_helpers_return_none_without_owned_
     store = await repository.get_store_profile()
     customer = await repository.get_or_create_customer(channel=Channel.WHATSAPP, external_id="3510000003")
 
-    assert (
-        await repository.get_customer_municipal_case(999, customer_id=customer.id, store_id=store.id)
-        is None
-    )
+    assert await repository.get_customer_municipal_case(999, customer_id=customer.id, store_id=store.id) is None
     assert await repository.get_latest_customer_municipal_case(customer_id=customer.id, store_id=store.id) is None
 
     await close_repository(repository, runtime)
