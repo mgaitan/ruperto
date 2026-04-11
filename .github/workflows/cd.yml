@@ -74,6 +74,8 @@ jobs:
             echo "docs_subdir=_preview/pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
           fi
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true
       - uses: astral-sh/setup-uv@v7
       - run: make docs
       - name: Stage documentation artifact
