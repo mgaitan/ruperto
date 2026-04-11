@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import anyio
 import pytest
@@ -54,6 +54,7 @@ from ruperto.models import (
     StaffRole,
     StaffUser,
     StoreMembership,
+    StoreProfile,
     StoreVertical,
 )
 from ruperto.repository import BusinessRepository
@@ -769,10 +770,47 @@ def test_home_signup_reports_smtp_delivery_errors_as_json(tmp_path: Path):
                 "password": "super-secret-123",
                 "vertical": StoreVertical.ORDERING.value,
             },
+            headers={"accept": "application/json"},
         )
 
     assert response.status_code == HTTP_SERVICE_UNAVAILABLE
     assert response.json() == {"detail": "Could not deliver signup email."}
+
+
+def test_home_signup_direct_route_raises_http_exception_for_json_email_failures(tmp_path: Path):
+    """The signup endpoint raises the JSON HTTP exception branch outside HTML form flows."""
+    settings = build_settings(tmp_path).model_copy(
+        update={
+            "smtp_server": "smtp.example.com",
+            "smtp_port": SMTP_PORT,
+            "smtp_user": "mailer@example.com",
+            "smtp_password": SecretStr("smtp-secret"),
+        }
+    )
+    app = create_app(settings)
+
+    async def run_signup():
+        request = with_request_form(
+            build_request(app, path="/signup", method="POST", headers={"accept": "application/json"}),
+            {
+                "store_name": "Tenant JSON Directo",
+                "full_name": "Falla Directa",
+                "email": "falla-directa@example.com",
+                "password": "super-secret-123",
+                "vertical": StoreVertical.ORDERING.value,
+            },
+        )
+        return await get_route_endpoint(app, "/signup", "POST")(request=request)
+
+    with (
+        patch("ruperto.app.send_signup_welcome_email", side_effect=SignupEmailDeliveryError()),
+        TestClient(app),
+        pytest.raises(HTTPException) as error,
+    ):
+        anyio.run(run_signup)
+
+    assert error.value.status_code == HTTP_SERVICE_UNAVAILABLE
+    assert error.value.detail == "Could not deliver signup email."
 
 
 def test_demo_chat_page_renders_municipal_prompts_per_slug(tmp_path: Path):
@@ -1977,6 +2015,38 @@ def test_dashboard_login_rejects_invalid_credentials(tmp_path: Path):
     assert "Credenciales inválidas." in response.text
 
 
+def test_dashboard_login_rejects_staff_without_store_memberships(tmp_path: Path):
+    """Staff users without memberships cannot open a dashboard session."""
+    app = create_app(build_settings(tmp_path))
+    authenticated_staff = StaffUser(
+        id=999,
+        email="staff@example.com",
+        full_name="Staff Demo",
+        password_hash="hashed",
+    )
+
+    with (
+        patch.object(
+            BusinessRepository,
+            "authenticate_staff_user",
+            new=AsyncMock(return_value=authenticated_staff),
+        ),
+        patch.object(
+            BusinessRepository,
+            "list_store_memberships_for_staff_user",
+            new=AsyncMock(return_value=[]),
+        ),
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            "/dashboard/login",
+            data={"email": "staff@example.com", "password": "secret123", "next": "/dashboard"},
+        )
+
+    assert response.status_code == HTTP_UNAUTHORIZED
+    assert "Credenciales inválidas." in response.text
+
+
 def test_dashboard_login_page_redirects_when_already_authenticated(tmp_path: Path):
     """The login page redirects authenticated staff back to the dashboard."""
     settings = build_settings(tmp_path)
@@ -2170,6 +2240,20 @@ def test_dashboard_customers_page_supports_handoff_reply_and_release(tmp_path: P
     anyio.run(runtime.engine.dispose)
 
 
+def test_dashboard_handoff_release_succeeds_for_known_conversations(tmp_path: Path):
+    """Operators can release a handoff directly from the dashboard queue."""
+    settings = build_settings(tmp_path)
+    conversation_id = anyio.run(lambda: create_whatsapp_handoff_conversation(settings))
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        login_dashboard(client)
+        response = client.post(f"/dashboard/handoffs/{conversation_id}/release", follow_redirects=False)
+
+    assert response.status_code == HTTP_FOUND
+    assert response.headers["location"] == "/dashboard/customers?flash=handoff-released"
+
+
 def test_dashboard_handoff_reply_validates_missing_message_and_unknown_conversation(tmp_path: Path):
     """Handoff reply routes surface validation and missing conversation errors."""
     settings = build_settings(tmp_path)
@@ -2187,6 +2271,21 @@ def test_dashboard_handoff_reply_validates_missing_message_and_unknown_conversat
     assert missing_reply_response.json()["detail"] == "Conversation not found."
     assert missing_release_response.status_code == HTTP_NOT_FOUND
     assert missing_release_response.json()["detail"] == "Conversation not found."
+
+
+def test_dashboard_handoff_reply_surfaces_unknown_conversations_from_repository(tmp_path: Path):
+    """The reply form returns 404 when the repository cannot resolve the conversation target."""
+    app = create_app(build_settings(tmp_path))
+
+    with (
+        patch.object(BusinessRepository, "get_conversation_target", new=AsyncMock(return_value=None)),
+        TestClient(app) as client,
+    ):
+        login_dashboard(client)
+        response = client.post("/dashboard/handoffs/123/reply", data={"message_text": "Hola"})
+
+    assert response.status_code == HTTP_NOT_FOUND
+    assert response.json()["detail"] == "Conversation not found."
 
 
 def test_dashboard_handoff_reply_rejects_conversations_not_waiting_for_human(tmp_path: Path):
@@ -2224,6 +2323,55 @@ def test_dashboard_handoff_reply_rejects_conversations_not_waiting_for_human(tmp
     assert response.status_code == HTTP_CONFLICT
     assert response.json()["detail"] == "Conversation is not waiting for a human."
     anyio.run(runtime.engine.dispose)
+
+
+def test_dashboard_handoff_reply_checks_awaiting_human_after_resolving_the_target(tmp_path: Path):
+    """The reply route still blocks operator messages until the handoff is active."""
+    app = create_app(build_settings(tmp_path))
+    target = type("Target", (), {"channel": Channel.WHATSAPP, "external_id": "+5493513308454"})()
+
+    with (
+        patch.object(BusinessRepository, "get_conversation_target", new=AsyncMock(return_value=target)),
+        patch.object(BusinessRepository, "conversation_is_awaiting_human", new=AsyncMock(return_value=False)),
+        TestClient(app) as client,
+    ):
+        login_dashboard(client)
+        response = client.post("/dashboard/handoffs/123/reply", data={"message_text": "Hola"})
+
+    assert response.status_code == HTTP_CONFLICT
+    assert response.json()["detail"] == "Conversation is not waiting for a human."
+
+
+def test_dashboard_handoff_release_surfaces_unknown_conversations_from_repository(tmp_path: Path):
+    """The release form returns 404 when the conversation target is no longer available."""
+    app = create_app(build_settings(tmp_path))
+
+    with (
+        patch.object(BusinessRepository, "get_conversation_target", new=AsyncMock(return_value=None)),
+        TestClient(app) as client,
+    ):
+        login_dashboard(client)
+        response = client.post("/dashboard/handoffs/123/release")
+
+    assert response.status_code == HTTP_NOT_FOUND
+    assert response.json()["detail"] == "Conversation not found."
+
+
+def test_dashboard_handoff_release_commits_successful_releases(tmp_path: Path):
+    """Known conversations can leave the handoff queue cleanly."""
+    app = create_app(build_settings(tmp_path))
+    target = type("Target", (), {"channel": Channel.WHATSAPP, "external_id": "+5493513308454"})()
+
+    with (
+        patch.object(BusinessRepository, "get_conversation_target", new=AsyncMock(return_value=target)),
+        patch.object(BusinessRepository, "release_conversation_handoff", new=AsyncMock(return_value=True)),
+        TestClient(app) as client,
+    ):
+        login_dashboard(client)
+        response = client.post("/dashboard/handoffs/123/release", follow_redirects=False)
+
+    assert response.status_code == HTTP_FOUND
+    assert response.headers["location"] == "/dashboard/customers?flash=handoff-released"
 
 
 def test_dashboard_handoff_reply_requires_channel_delivery_configuration(tmp_path: Path):
@@ -2360,6 +2508,47 @@ def test_dashboard_kanban_page_renders_for_municipal_staff(tmp_path: Path):
     assert "Todas las áreas" in response.text
 
 
+def test_dashboard_kanban_page_redirects_anonymous_staff_to_login(tmp_path: Path):
+    """The municipal Kanban page keeps the usual dashboard auth guard."""
+    settings = build_settings(tmp_path, store_vertical=StoreVertical.MUNICIPAL, store_slug="mi-muni")
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.get("/dashboard/kanban", follow_redirects=False)
+
+    assert response.status_code == HTTP_FOUND
+    assert response.headers["location"] == "/dashboard/login?next=%2Fdashboard%2Fkanban&flash=login-required"
+
+
+def test_dashboard_kanban_page_loads_municipal_areas_for_the_active_store(tmp_path: Path):
+    """The Kanban page always fetches active municipal areas before rendering."""
+    settings = build_settings(tmp_path, store_vertical=StoreVertical.MUNICIPAL, store_slug="mi-muni")
+    app = create_app(settings)
+    municipal_store = StoreProfile(
+        id=1,
+        slug="mi-muni",
+        store_name="Mi muni",
+        bot_name="Ruperto",
+        store_description="Municipio de prueba",
+        assistant_personality="Amable",
+        vertical=StoreVertical.MUNICIPAL,
+        locale="es-AR",
+        currency_code="ARS",
+    )
+    list_areas = AsyncMock(return_value=[])
+
+    with (
+        patch.object(BusinessRepository, "get_store_profile", new=AsyncMock(return_value=municipal_store)),
+        patch.object(BusinessRepository, "list_municipal_areas", new=list_areas),
+        TestClient(app) as client,
+    ):
+        login_dashboard(client)
+        response = client.get("/dashboard/kanban")
+
+    assert response.status_code == HTTP_OK
+    list_areas.assert_awaited_once_with(store_id=settings.default_store_id, only_active=True)
+
+
 def test_dashboard_municipal_catalog_forms_can_create_areas_and_categories(tmp_path: Path):
     """Municipal dashboard settings can create areas and categories for the active store."""
     settings = build_settings(tmp_path, store_vertical=StoreVertical.MUNICIPAL, store_slug="mi-muni")
@@ -2457,6 +2646,32 @@ def test_dashboard_municipal_area_form_rejects_invalid_payloads_and_non_municipa
         )
 
     assert disabled_response.status_code == HTTP_NOT_FOUND
+
+
+def test_dashboard_municipal_area_form_uses_store_vertical_guard(tmp_path: Path):
+    """Area creation checks the active store vertical before writing municipal data."""
+    app = create_app(build_settings(tmp_path))
+    ordering_store = StoreProfile(
+        id=1,
+        slug="test-rotiseria",
+        store_name="Test Rotisería",
+        bot_name="Ruperto",
+        store_description="Rotisería de prueba",
+        assistant_personality="Amable",
+        vertical=StoreVertical.ORDERING,
+        locale="es-AR",
+        currency_code="ARS",
+    )
+
+    with (
+        patch.object(BusinessRepository, "get_store_profile", new=AsyncMock(return_value=ordering_store)),
+        TestClient(app) as client,
+    ):
+        login_dashboard(client)
+        response = client.post("/dashboard/settings/municipal/areas", data={"name": "Arbolado"})
+
+    assert response.status_code == HTTP_NOT_FOUND
+    assert response.json()["detail"] == "Municipal catalog not enabled."
 
 
 def test_dashboard_municipal_category_form_handles_auth_validation_and_missing_area(tmp_path: Path):

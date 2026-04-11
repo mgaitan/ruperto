@@ -2792,6 +2792,41 @@ async def test_conversation_handoff_helpers_cover_missing_paths(tmp_path: Path):
     await close_repository(repository, runtime)
 
 
+async def test_conversation_handoff_helpers_track_operator_replies_and_release_state(tmp_path: Path):
+    """Handoff helpers persist operator timestamps and clear state on release."""
+    repository, runtime = await build_repository(tmp_path)
+    customer = await repository.get_or_create_customer(
+        channel=Channel.WHATSAPP,
+        external_id="+5493513308454",
+        phone_number="+5493513308454",
+    )
+    conversation = await repository.get_or_create_conversation(
+        channel=Channel.WHATSAPP,
+        external_id="+5493513308454",
+        customer_id=customer.id,
+    )
+
+    await repository.activate_conversation_handoff(
+        conversation_id=conversation.id,
+        reason="Te paso con una persona del equipo.",
+        latest_customer_message="Necesito ayuda urgente.",
+    )
+    await repository.mark_handoff_operator_reply(conversation.id)
+    target = await repository.get_conversation_target(conversation_id=conversation.id, store_id=1)
+    handoffs = await repository.list_active_conversation_handoffs(store_id=1)
+
+    assert target is not None
+    assert target.conversation_id == conversation.id
+    assert target.external_id == "+5493513308454"
+    assert len(handoffs) == 1
+    assert handoffs[0].last_operator_reply_at is not None
+    assert handoffs[0].latest_customer_message == "Necesito ayuda urgente."
+    assert await repository.release_conversation_handoff(conversation.id) is True
+    assert await repository.list_active_conversation_handoffs(store_id=1) == []
+
+    await close_repository(repository, runtime)
+
+
 async def test_list_active_conversation_handoffs_only_returns_whatsapp_conversations(tmp_path: Path):
     """The staff queue only surfaces handoffs that the dashboard can answer."""
     repository, runtime = await build_repository(tmp_path)
