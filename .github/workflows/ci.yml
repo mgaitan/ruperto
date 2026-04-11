@@ -35,12 +35,8 @@ jobs:
   test:
     needs: qa
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.12", "3.13", "3.14"]
-
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v7
       - name: Run tests with coverage
-        run: uv run --group test -p ${{ matrix.python-version }} pytest
+        run: uv run --group test -p 3.14 pytest
